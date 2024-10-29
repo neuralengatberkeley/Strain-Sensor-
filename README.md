@@ -1,1 +1,1 @@
-This repo is for the Liquid Metal Strain Sensor project.  We are trying to make resistive sensitive sensors that correlate to bend angle.  These sensors are intended to be used on the joints of fingers.
+# Strain-Sensor-
