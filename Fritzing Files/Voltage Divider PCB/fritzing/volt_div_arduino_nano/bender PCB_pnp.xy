@@ -1,0 +1,26 @@
+# Pick And Place List
+# Company=
+# Author=
+# eMail=
+#
+# Project=bender PCB
+# Date=09:45:59
+# CreatedBy=Fritzing 1.0.3b.2024-05-30.CD-1995-0-a7811ba0
+#
+#
+# Coordinates in mils, always center of component
+# Origin 0/0=Lower left corner of PCB
+# Rotation in degree (0-360, math. pos.)
+#
+RefDes,Description,Package,X,Y,Rotation,Side,Mount
+Description: resistance;capacitance;inductance;voltage;current;power;mpn;mn;
+GND,";;;;;;;;","THT",1621.77,1212.86,0,Top,THT
+Part1,";;;;;;;;","",521.767,1712.53,0,Top,MANUAL
+5V,";;;;;;;;","THT",1771.77,212.86,90,Top,THT
+I2C (A4 = SDA),";;;;;;;;","THT",1221.77,1262.86,0,Top,THT
+Adafrit Precision Volt. Ref,";;;;;;;;","",2471.77,537.86,0,Top,MANUAL
+100 ohm,"220;;;;;0.25W;;;","THT",2621.77,1312.86,-90,Top,THT
+D9 / A0,";;;;;;;;","THT",471.767,512.86,90,Top,THT
+Adafruit MCP3421 18-Bit ADC1,";;;;;;;;","",4115.29,1432.54,180,Top,MANUAL
+Adafruit Qwiic / Stemma QT 5 Port Hub1,";;;;;;;;","",2171.77,2462.86,0,Top,MANUAL
+Strain Sensor,";;;;;;;;","THT",2978.86,1913.61,180,Top,THT
