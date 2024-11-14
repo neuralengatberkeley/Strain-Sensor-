@@ -24,13 +24,15 @@ or (2) Wheatstone Bridge Circuit (https://www.adafruit.com/product/4538)
 #include <Adafruit_NAU7802.h>
 
 //Adafruit_NAU7802 nau;  // 24 bit ADC object created for wheatstone bridge circuit
-Adafruit_MCP3421 mcp;  // 14 bit ADC object created for voltage divider circuit
+//Adafruit_MCP3421 mcp;  // 14 bit ADC object created for voltage divider circuit
 
 //IMU object with address 0x29....we may need multiple imu's in future and so will need to specify address 
 //of each imu...could also just use a multiplexer
 Adafruit_BNO055 bno = Adafruit_BNO055(55);  //19, 0x29
+Adafruit_BNO055 bno_p = Adafruit_BNO055(56, 0x29, &Wire);  //19, 0x29
 
 sensors_event_t event; 
+sensors_event_t event_p; 
 
 Servo myservo;  // create servo object to control a servo
 int i ; //actual angle setting for servo
@@ -49,6 +51,13 @@ void setup() {
 
     /* Initialise the sensor */
   if(!bno.begin())
+  {
+    /* There was a problem detecting the BNO055 ... check your connections */
+    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+    while(1);
+  }
+
+  if(!bno_p.begin())
   {
     /* There was a problem detecting the BNO055 ... check your connections */
     Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
@@ -76,41 +85,41 @@ The following greyed out code is for the 14 bit adc used for the voltage divider
 */
 
  // Begin can take an optional address and Wire interface
-  if (!mcp.begin(0x68, &Wire)) { 
-    Serial.println("Failed to find MCP3421 chip");
-    while (1) {
-      delay(10); // Avoid a busy-wait loop
-    }
-  }
+  //if (!mcp.begin(0x68, &Wire)) { 
+  //  Serial.println("Failed to find MCP3421 chip");
+  //  while (1) {
+  //    delay(10); // Avoid a busy-wait loop
+    //}
+  //}
 
    // Options: GAIN_1X, GAIN_2X, GAIN_4X, GAIN_8X
-  mcp.setGain(GAIN_4X);
-  Serial.print("Gain set to: ");
-  switch (mcp.getGain()) {
-    case GAIN_1X: Serial.println("1X"); break;
-    case GAIN_2X: Serial.println("2X"); break;
-    case GAIN_4X: Serial.println("4X"); break;
-    case GAIN_8X: Serial.println("8X"); break;
-  }
+ // mcp.setGain(GAIN_4X);
+ // Serial.print("Gain set to: ");
+ // switch (mcp.getGain()) {
+ //   case GAIN_1X: Serial.println("1X"); break;
+ //   case GAIN_2X: Serial.println("2X"); break;
+ //   case GAIN_4X: Serial.println("4X"); break;
+ //   case GAIN_8X: Serial.println("8X"); break;
+  //}
 
   // The resolution affects the sample rate (samples per second, SPS)
   // Other options: RESOLUTION_14_BIT (60 SPS), RESOLUTION_16_BIT (15 SPS), RESOLUTION_18_BIT (3.75 SPS)
-  mcp.setResolution(RESOLUTION_16_BIT); // 240 SPS (12-bit)
-  Serial.print("Resolution set to: ");
-  switch (mcp.getResolution()) {
-    case RESOLUTION_12_BIT: Serial.println("12 bits"); break;
-    case RESOLUTION_14_BIT: Serial.println("14 bits"); break;
-    case RESOLUTION_16_BIT: Serial.println("16 bits"); break;
-    case RESOLUTION_18_BIT: Serial.println("18 bits"); break;
-  }
+  //mcp.setResolution(RESOLUTION_16_BIT); // 240 SPS (12-bit)
+  //Serial.print("Resolution set to: ");
+  //switch (mcp.getResolution()) {
+    //case RESOLUTION_12_BIT: Serial.println("12 bits"); break;
+    //case RESOLUTION_14_BIT: Serial.println("14 bits"); break;
+    //case RESOLUTION_16_BIT: Serial.println("16 bits"); break;
+    //case RESOLUTION_18_BIT: Serial.println("18 bits"); break;
+  //}
 
   // Test setting and getting Mode
-  mcp.setMode(MODE_CONTINUOUS); // Options: MODE_CONTINUOUS, MODE_ONE_SHOT
-  Serial.print("Mode set to: ");
-  switch (mcp.getMode()) {
-    case MODE_CONTINUOUS: Serial.println("Continuous"); break;
-    case MODE_ONE_SHOT: Serial.println("One-shot"); break;
-  }
+  //mcp.setMode(MODE_CONTINUOUS); // Options: MODE_CONTINUOUS, MODE_ONE_SHOT
+  //Serial.print("Mode set to: ");
+  //switch (mcp.getMode()) {
+  //  case MODE_CONTINUOUS: Serial.println("Continuous"); break;
+   // case MODE_ONE_SHOT: Serial.println("One-shot"); break;
+  //}
   
   delay(2000);
 }
@@ -152,10 +161,11 @@ void loop() {
     //if (mcp.isReady()) {
         //int32_t sg = nau.read();
         //Serial.print(sg);
-        adcValue = mcp.readADC(); // Read ADC value
+        //adcValue = mcp.readADC(); // Read ADC value
         //Serial.print("ADC reading: ");
-        Serial.print(adcValue);
-        Serial
+        //Serial.print(adcValue);
+        bno_p.getEvent(&event_p);
+        Serial.print(event_p.orientation.y, 2);
         Serial.print("\t");
         //sampleCount++; // Increment the sample count
     //}
