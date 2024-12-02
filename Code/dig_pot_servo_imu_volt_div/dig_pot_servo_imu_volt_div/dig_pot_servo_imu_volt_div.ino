@@ -155,7 +155,7 @@ void loop() {
         adcValue = mcp.readADC(); // Read ADC value
         //Serial.print("ADC reading: ");
         Serial.print(adcValue);
-        Serial
+      
         Serial.print("\t");
         //sampleCount++; // Increment the sample count
     //}
