@@ -131,7 +131,7 @@ void loop() {
           // 7 produduces an IMU angle of about 0 degrees!!
           i  = (-10*state + 70);  
           myservo.write(i); 
-          delay(300); 
+          delay(1000); 
          }     
         }
 

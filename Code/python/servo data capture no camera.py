@@ -26,17 +26,17 @@ ser.flush()
 # so 1 would mean 0 degrees, 2 -> 10 degrees, etc
 # 7 equals to about 0 degrees pitch for IMU
 #k = [7, 6, 5, 4, 3, 2, 1]
-k = [0, 6]
+k = [0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1, 0]
 
 # collect data down and up 5 times
-for _ in range(3):
+for _ in range(5):
 
     for n in k:
         x = str(n)
         ser.write(x.encode())
 
         # This loop collects p amount of data per each angle
-        p = 5
+        p = 50
         for _ in range(p):
             data = ser.readline().strip().decode()
             # Attempt to split data by tabs and spaces, then take only the relevant parts
@@ -62,7 +62,7 @@ df.columns = ['Theoretical Angle (deg)', 'IMU Angle (deg)', 'ADC Value', 'Rotary
 #df.replace([np.inf, -np.inf], np.nan, inplace=True)
 #df.dropna(how="all", inplace=True)
 
-df.to_csv('dynamic_test.csv', index=False)
+df.to_csv('Bending_data_abs_1p93_0deg_12_18_24.csv', index=False)
 print(df)
 
 
