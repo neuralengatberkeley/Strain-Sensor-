@@ -28,12 +28,13 @@ def read_serial_data(ser):
             # Read data from serial port
             data = ser.readline().strip().decode()
             parts = data.split()
-            if len(parts) == 4:  # Ensure valid data
+            if len(parts) == 1:  # Ensure valid data
                 float_values = [float(x) for x in parts]
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
                 float_values.append(timestamp)  # Add timestamp
                 data_queue.put(float_values)  # Add data to the queue
                 print(f"Serial Data Captured: {float_values}")
+                time.sleep(0.25)  # Wait 5 seconds between frames
         except Exception as e:
             print(f"Error reading serial data: {e}")
             continue
@@ -46,20 +47,20 @@ def capture_images(camera):
         ret, img = camera.read()
         if ret:
             # Generate timestamp and filename
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
             filename = os.path.join(output_folder, f"frame_{i}_{timestamp}.png")
             # Save the image
             cv2.imwrite(filename, img)
             image_queue.put((filename, timestamp))  # Add metadata to the queue
             print(f"Image Captured: {filename}")
             i += 1
-        time.sleep(5)  # Wait 5 seconds between frames
+        time.sleep(0.25)  # Wait 5 seconds between frames
 
 # Main script
 def main():
     # Connect to Arduino and camera
     ser = serial.Serial(port='COM4', baudrate=115200)
-    camera = cv2.VideoCapture(1)
+    camera = cv2.VideoCapture(0)
     time.sleep(2)
     ser.flush()
 
@@ -100,8 +101,8 @@ def process_and_save_data():
         serial_data.append(data_queue.get())
 
     # Save serial data to CSV
-    serial_df = pd.DataFrame(serial_data, columns=['Theoretical Angle (deg)', 'IMU Angle (deg)', 'ADC Value', 'Rotary Encoder', 'Timestamp'])
-    serial_csv = f"Bending_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    serial_df = pd.DataFrame(serial_data, columns=['ADC Value', 'Timestamp'])
+    serial_csv = f"Bending_data_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
     serial_df.to_csv(serial_csv, index=False)
     print(f"Serial data saved to {serial_csv}")
 
@@ -109,12 +110,6 @@ def process_and_save_data():
     image_metadata = []
     while not image_queue.empty():
         image_metadata.append(image_queue.get())
-
-    # Save image metadata to CSV
-    image_df = pd.DataFrame(image_metadata, columns=['Filename', 'Timestamp'])
-    image_csv = f"Image_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    image_df.to_csv(image_csv, index=False)
-    print(f"Image metadata saved to {image_csv}")
 
 if __name__ == "__main__":
     main()
