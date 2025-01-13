@@ -21,7 +21,7 @@ ser.write(x.encode())
 time.sleep(2)
 ser.flush()
 
-# vary the bend angle from 0 to 60 degrees in 10 degree increments.
+# vary the bend angle from 0 to 60 degrees in 15 degree increments.
 # python sends a value, say 1, and arduino reads that value, multiplies the value by 10 and then subrracts 10.
 # so 1 would mean 0 degrees, 2 -> 10 degrees, etc
 # 7 equals to about 0 degrees pitch for IMU
