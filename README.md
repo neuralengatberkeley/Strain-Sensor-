@@ -1,5 +1,10 @@
 # Strain-Sensor-
 
+# AutoBender Sensor Circuit:
+
+![autobender sensor circuit](https://github.com/user-attachments/assets/f643499c-9904-4688-a8c6-9883a8adff69)
+
+
 # Interpreting CSV Data File Columns:
 
 Column A:  Disregard.  It was initially meant to provide the theoretical bend angle, but it is wrong and not used in any calculation.
