@@ -4,6 +4,12 @@
 
 ![autobender sensor circuit](https://github.com/user-attachments/assets/f643499c-9904-4688-a8c6-9883a8adff69)
 
+# AutoBender PCB (which inlcudes sensor circuit and servo circuit):
+
+AutoBender PCB design can be found here in ...Fritzing Files/Voltage Divider PCB/bender PCB.fzz
+
+![PCB](https://github.com/user-attachments/assets/a126f138-78ca-4e72-94fe-fe21de270227)
+
 
 # Interpreting CSV Data File Columns:
 
