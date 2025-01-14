@@ -1,5 +1,22 @@
 # Strain-Sensor-
 
+# Interpreting CSV Data File Columns:
+
+Column A:  Disregard.  It was initially meant to provide the theoretical bend angle, but it is wrong and not used in any calculation.
+
+Column B:  Adafruit BNO055 IMU Pitch Euler Angle (degrees)
+
+Column C:  ADC Value as read from Adafruit Sensor MCP3421 18-Bit ADC (The ADC sensor is in parrallel with the Liquid Metal Strain Gauge (LMSG).  The LMSG is in series 			with a 100 ohm resistor).  Since the code is set to read 14-bits, the possible range of values is from 0 to 2^14 - 1.
+
+Column D:  ADC Value as read from Hall Effect Rotary Encoder (https://p3america.com/erc-series/?srsltid=AfmBOoqSsWeZSXtsMrmoHyB0DRfSCzyFlUfcnEff0gpcv0NyMvrGhVz7).  The 		rotary encoder can rotate from 0 to 320 degrees.  There is a mechanical stop at 0 and 320 degrees.  Since the rotary encoder is connected directly to 			Arduino Uno, the adc output from the Arduino can have values from 0 to 2^10 - 1.  
+
+Note about converting rotary encoder adc value to angle in degrees:  
+
+![rot encoder](https://github.com/user-attachments/assets/7d459cf2-2cbf-4c0e-9d99-0efad03670a0)
+
+As a result of this calculation, the rotatry encoder angle should always start at 0 degrees.  The initial IMU angle in degrees typically starts around ~ 3 degrees.  
+
+
 # Derivation of Change in Resistance Formula as a Function of Axial Strain:
 
 ![formula part 1](https://github.com/user-attachments/assets/0d268b8c-dba1-49ee-b6d9-f33db160800e)
