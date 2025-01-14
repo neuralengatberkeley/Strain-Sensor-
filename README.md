@@ -1,5 +1,11 @@
 # Strain-Sensor-
 
+# Strain Sensor Fabrication Procedure:
+
+# AutoBender Components:
+
+
+
 # AutoBender Sensor Circuit:
 
 ![autobender sensor circuit](https://github.com/user-attachments/assets/f643499c-9904-4688-a8c6-9883a8adff69)
