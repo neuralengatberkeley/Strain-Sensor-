@@ -38,6 +38,8 @@ As a result of this calculation, the rotatry encoder angle should always start a
 
 ![formula part 1](https://github.com/user-attachments/assets/0d268b8c-dba1-49ee-b6d9-f33db160800e)
 
+If an axial load is applied to a solid in the x-direction, the solid's lateral dimensions in the y- and z-directions will typically contract, depending on the material properties. The ratio of lateral contraction (negative strain) to axial extension (positive strain) is called Poisson's ratio. The definition includes a negative sign, ensuring that Poisson's ratio is a positive value for materials that contract laterally when stretched axially. 
+
 ![Poisson's Ratio](https://github.com/user-attachments/assets/228fb441-45f0-472e-9315-fb1b07e9e67f)
 
 ![formula part 2](https://github.com/user-attachments/assets/ca11f255-4441-4958-ac1b-f0a5a4bc7124)
