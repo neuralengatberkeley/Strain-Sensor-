@@ -14,9 +14,6 @@
 
 AutoBender PCB design can be found here in ...Fritzing Files/Voltage Divider PCB/bender PCB.fzz
 
-![PCB](https://github.com/user-attachments/assets/a126f138-78ca-4e72-94fe-fe21de270227)
-
-
 # Interpreting CSV Data File Columns:
 
 Column A:  Disregard.  It was initially meant to provide the theoretical bend angle, but it is wrong and not used in any calculation.
