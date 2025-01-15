@@ -42,7 +42,7 @@ As a result of this calculation, the rotatry encoder angle should always start a
 ![Poisson's Ratio](https://github.com/user-attachments/assets/21063726-7ad0-4903-adce-4f93755d61b2)
 
 
-![formula part 2](https://github.com/user-attachments/assets/61505956-694a-480d-be09-1cd1001e062b)
+![formula part 2](https://github.com/user-attachments/assets/db0bb0ac-fc99-46fc-a2a4-ba847697f28f)
 
 
 References:  
