@@ -1,5 +1,8 @@
 # Strain-Sensor-
 
+![abs_100](https://github.com/user-attachments/assets/ebbc0826-1470-41b7-9cf9-2cae60e10a00)
+
+
 # Strain Sensor Fabrication Procedure:
 
 # AutoBender Components:
