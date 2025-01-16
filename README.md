@@ -23,10 +23,6 @@ All Structural parts (e.g. plates, shaft collars, fasteners) were purchased from
 ![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
 
 
-# AutoBender Components:
-
-
-
 # AutoBender Sensor Circuit:
 
 ![autobender sensor circuit](https://github.com/user-attachments/assets/f643499c-9904-4688-a8c6-9883a8adff69)
