@@ -1,5 +1,8 @@
 # Strain-Sensor-
 
+![LMSG](https://github.com/user-attachments/assets/12f5835c-98f8-4c0c-8122-8ed8af9a0eb3)
+
+
 # ABS Filmanent LM Channels
 
 3D printed ABS channels to be dissolved in acetone:  
