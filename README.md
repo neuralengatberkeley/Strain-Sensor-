@@ -15,6 +15,9 @@ CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/bas
 
 ![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
 
+![wire insertion and sealing](https://github.com/user-attachments/assets/7717cacd-0953-4280-b267-3447df87364b)
+
+
 #  Auto Bender:
 
 All Structural parts (e.g. plates, shaft collars, fasteners) were purchased from goBILDA:  https://www.gobilda.com/
