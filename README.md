@@ -3,7 +3,7 @@
 ![LMSG](https://github.com/user-attachments/assets/12f5835c-98f8-4c0c-8122-8ed8af9a0eb3)
 
 
-# ABS Filmanent LM Channels
+# ABS Filmanent LM Channels:
 
 3D printed ABS channels to be dissolved in acetone:  
 
@@ -11,7 +11,7 @@
 
 CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/basic strain gauge 0p02.ipt
 
-#  Auto Bender
+#  Auto Bender:
 
 All Structural parts (e.g. plates, shaft collars, fasteners) were purchased from goBILDA:  https://www.gobilda.com/
 
