@@ -8,6 +8,11 @@
 
 CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/basic strain gauge 0p02.ipt
 
+#  Auto Bender
+
+![auto bender parts](https://github.com/user-attachments/assets/b4aeed2e-ea4c-4d33-b1a1-e9932a8000fc)
+
+
 # Strain Sensor Fabrication Procedure:
 
 ![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
