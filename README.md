@@ -5,6 +5,9 @@
 
 # Strain Sensor Fabrication Procedure:
 
+![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
+
+
 # AutoBender Components:
 
 
