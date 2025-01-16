@@ -95,6 +95,10 @@ The plot below shows theoretical curves of normalized resistance versus axial st
 
 ![res vs strain trends](https://github.com/user-attachments/assets/f88a247b-96f5-4efe-886f-15be79454da8)
 
+# "Gluing" LMSG on to fingers:
+
+"paint" Derma-Tac (https://www.smooth-on.com/products/derma-tac/) AND Skin-Tite (https://www.smooth-on.com/products/skin-tite/) onto finger, place sensor on finger for a couple minutes until cross-linking occurs
+
 
 
 
