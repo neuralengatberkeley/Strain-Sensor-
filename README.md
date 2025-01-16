@@ -1,7 +1,12 @@
 # Strain-Sensor-
 
-![abs_100](https://github.com/user-attachments/assets/ebbc0826-1470-41b7-9cf9-2cae60e10a00)
+# ABS Filmanent LM Channels
 
+3D printed ABS channels to be dissolved in acetone:  
+
+![abs filaments](https://github.com/user-attachments/assets/2eabfff1-c124-45fa-aace-cf96298053ce)
+
+CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/basic strain gauge 0p02.ipt
 
 # Strain Sensor Fabrication Procedure:
 
