@@ -1,12 +1,28 @@
 # Strain-Sensor-
 
-![abs_100](https://github.com/user-attachments/assets/ebbc0826-1470-41b7-9cf9-2cae60e10a00)
+![LMSG](https://github.com/user-attachments/assets/12f5835c-98f8-4c0c-8122-8ed8af9a0eb3)
 
+
+# ABS Filmanent LM Channels:
+
+3D printed ABS channels to be dissolved in acetone:  
+
+![abs filaments](https://github.com/user-attachments/assets/2eabfff1-c124-45fa-aace-cf96298053ce)
+
+CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/basic strain gauge 0p02.ipt
 
 # Strain Sensor Fabrication Procedure:
 
-# AutoBender Components:
+![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
 
+![wire insertion and sealing](https://github.com/user-attachments/assets/7717cacd-0953-4280-b267-3447df87364b)
+
+
+#  Auto Bender:
+
+All Structural parts (e.g. plates, shaft collars, fasteners) were purchased from goBILDA:  https://www.gobilda.com/
+
+![auto bender parts](https://github.com/user-attachments/assets/b4aeed2e-ea4c-4d33-b1a1-e9932a8000fc)
 
 
 # AutoBender Sensor Circuit:
@@ -37,6 +53,8 @@ As a result of this calculation, the rotatry encoder angle should always start a
 # Derivation of Change in Resistance Formula as a Function of Axial Strain:
 
 ![formula part 1](https://github.com/user-attachments/assets/0d268b8c-dba1-49ee-b6d9-f33db160800e)
+
+If an axial load is applied to a solid in the x-direction, the solid's lateral dimensions in the y- and z-directions will typically contract, depending on the material properties. The ratio of lateral contraction (negative strain) to axial extension (positive strain) is called Poisson's ratio. The definition includes a negative sign, ensuring that Poisson's ratio is a positive value for materials that contract laterally when stretched axially. 
 
 ![Poisson's Ratio](https://github.com/user-attachments/assets/228fb441-45f0-472e-9315-fb1b07e9e67f)
 
@@ -77,6 +95,10 @@ The plot below shows theoretical curves of normalized resistance versus axial st
 4.  As bend radius (R in this case, not r as indicated in human knuckle model image :/) increases, axial strain also increases for the same bend angle. For example, a strain sensor on a larger knuckle would experience greater axial strain compared to one on a smaller knuckle.  
 
 ![res vs strain trends](https://github.com/user-attachments/assets/f88a247b-96f5-4efe-886f-15be79454da8)
+
+# "Gluing" LMSG on to fingers:
+
+"paint" Derma-Tac (https://www.smooth-on.com/products/derma-tac/) AND Skin-Tite (https://www.smooth-on.com/products/skin-tite/) onto finger, place sensor on finger for a couple minutes until cross-linking occurs
 
 
 
