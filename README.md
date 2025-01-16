@@ -11,6 +11,8 @@
 
 CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/basic strain gauge 0p02.ipt
 
+3D printer used -> Original Prusa MK4s
+
 # Strain Sensor Fabrication Procedure:
 
 ![LMSG fab process](https://github.com/user-attachments/assets/2a36e296-50d9-46c9-a4cc-2bd47d94766a)
