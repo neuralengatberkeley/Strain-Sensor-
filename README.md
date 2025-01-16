@@ -10,6 +10,8 @@ CAD file for 3d prints shown in image above:  ...CAD Files/abs_lofted_insert/bas
 
 #  Auto Bender
 
+All Structural parts (e.g. plates, shaft collars, fasteners) were purchased from goBILDA:  https://www.gobilda.com/
+
 ![auto bender parts](https://github.com/user-attachments/assets/b4aeed2e-ea4c-4d33-b1a1-e9932a8000fc)
 
 
