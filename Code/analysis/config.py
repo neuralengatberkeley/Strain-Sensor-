@@ -1,0 +1,1 @@
+path_to_repository = '/Users/preeyakhanna/code_khannalab/Strain-Sensor-/'
