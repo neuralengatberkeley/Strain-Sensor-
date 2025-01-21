@@ -1,1 +1,1 @@
-path_to_repository = '/Users/preeyakhanna/code_khannalab/Strain-Sensor-/'
+path_to_repository = 'C:/Users/toppenheim/Desktop/UCSF/Preeya UCB/Strain-Sensor-/Strain-Sensor-'

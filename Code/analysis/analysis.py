@@ -65,7 +65,7 @@ class bender_class:
         csv_files = glob.glob(regex_path)
         print(csv_files)
 
-        # Chekc that csv_files is not empty
+        # Check that csv_files is not empty
         if not csv_files:
             raise FileNotFoundError(f"No CSV files found in the specified path: {regex_path}")
     
@@ -84,20 +84,17 @@ class bender_class:
                     f"Error: The file {f} does not contain exactly 4 columns. It has {df.shape[1]} columns.")
             
             # Remove rows where all columns equal "100" (usually first few rows)
-            ix_ok = (df.iloc[:, 0] != 100) & (df.iloc[:, 1] != 100) & (df.iloc[:, 2] != 100)  & (df.iloc[:, 3] != 100)  
+            ix_ok = (df.iloc[:, 0] != 100) & (df.iloc[:, 1] != 100) & (df.iloc[:, 2] != 100) & (df.iloc[:, 3] != 100)
             df = df[ix_ok]
             
             # Convert rotary encoder to angle (degrees) -> ADC is Arduino Uno 10 bit (2**10 = 1024), rotary encoder has 320 degrees of rotation
             df['Rotary Encoder'] = df['Rotary Encoder'] * 320 / 1024
 
             # Shift rotary encoder angles to start tests at 0 degrees
-            df['Rotary Encoder'] = df['Rotary Encoder'] - df['Rotary Encoder'].values[0] 
+            df['Rotary Encoder'] = df['Rotary Encoder'] - df['Rotary Encoder'].values[0]
 
-            '''
-            ### TODO TOM
-            ### Add code abs value of ADC 
-            ### Deal with any negative signs if needed here 
-            '''
+            # make all rotary encoder angles > 0 so when plate is bent, it is at + 90 deg...if left alone angles go from 0 to -90 deg
+            df['Rotary Encoder'] = df['Rotary Encoder'] * -1
 
             # Append the DataFrame to the list
             dataframes.append(df)
@@ -165,10 +162,10 @@ class bender_class:
         # Plotting Rotary Encoder data
         if scatter:
             # Set color equal to data.index 
-            ax.scatter(self.data['Rotary Encoder'], -1 * self.data['ADC Value'], c=self.data.index, cmap='viridis', s=5,
+            ax.scatter(self.data['Rotary Encoder'], self.data['ADC Value'], c=self.data.index, cmap='viridis', s=5,
                     label='Rotary Encoder')
         else:
-            ax.plot(self.data['Rotary Encoder'], -1 * self.data['ADC Value'], 'b.', markersize=5,
+            ax.plot(self.data['Rotary Encoder'], self.data['ADC Value'], 'b.', markersize=5,
                  label='Rotary Encoder')  # Blue dots for Rotary Encoder
         
         # Setting labels
@@ -227,7 +224,7 @@ class bender_class:
 
     def train_model_test_accuracy(self, perc_train=0.8, niter = 10):
         """
-        class method that trains a linear model to predit rotary encoder angles from normalized ADC values
+        class method that trains a linear model to predict rotary encoder angles from normalized ADC values
         """
 
         if self.data is None:
@@ -327,6 +324,51 @@ class bender_class:
 
         
         return accuracy
+
+
+    def dynamic_data(self, period):
+        """
+        Code used to extract timestamp info from dynamic autobending test.  After plate would bend 90 deg,
+        'period' seconds wait before collecting 15 data points. Same when going back to 0 degrees.
+        Test was conducted over 100 cycles.
+
+        """
+        # Add timestamp column
+        num_rows = self.data.shape[0]  # Get the number of rows
+        timestamps = pd.Series(range(num_rows)) * period  # 0.3 seconds (300 ms)
+        self.data['Timestamp'] = timestamps
+
+        # Ensure no mismatch in lengths
+        self.data['ADC Value'] = self.data['ADC Value'].dropna()  # Remove NaN values in the y-data
+        self.data['Timestamp'] = self.data['Timestamp'][:len(self.data['ADC Value'])]  # Match the lengths of x and y
+
+    def plot_dynamic(self, time):
+
+        """
+        Code used to plot data from dynamic autobending test.
+        'time' is the time domain to plot in 2nd subplot.
+
+        """
+
+        # Create subplots (1 row, 2 columns)
+        fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+
+        # Plot the full range on the first subplot
+        ax[0].plot(self.data['Timestamp'], self.data['ADC Value'], 'b')
+        ax[0].set_xlabel('Time (sec)')
+        ax[0].set_ylabel('$\Delta R/R_o$')
+        ax[0].set_title('Full Plot')
+
+        # Zoomed-in plot for time range between 0 and 4 seconds
+        ax[1].plot(self.data['Timestamp'], self.data['ADC Value'], 'b')
+        ax[1].set_xlim(0, time)  # Set x-axis to zoom between 0 and 4 seconds
+        ax[1].set_xlabel('Time (sec)')
+        ax[1].set_ylabel('$\Delta R/R_o$')
+        ax[1].set_title('Zoomed-in Plot')
+
+        # Display the subplots
+        plt.tight_layout()  # Adjust the spacing
+        plt.show()
 
 
 
