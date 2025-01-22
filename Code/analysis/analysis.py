@@ -27,8 +27,10 @@ class bender_class:
         self.model = None  # To store the trained model
         self.poly_features = None  # To store polynomial features
         self.model_types = None # model-ftting type
+        self.all_accuracies = []  # Initialize as an empty list for collecting accuracies
+        self.accuracy_angle = np.arange(1, 16)  # Angle thresholds for accuracy calculations
 
-        if path is None: 
+        if path is None:
             self.repo_path = path_to_repository
         else: 
             self.repo_path = path
@@ -267,6 +269,9 @@ class bender_class:
             for j, angle_accuracy in enumerate(self.accuracy_angle):
                 self.accuracy[i, j] = self.accuracy_by_angle(Y_test, Y_pred, angle_accuracy)
 
+            # Add this run's accuracy to the list
+            self.all_accuracies.append(self.accuracy)
+
     def accuracy_by_angle(self, y_true, y_pred, angle_accuracy):
         '''
         Method to calculate the accuracy of the model for specific thresholds of angle accuracy
@@ -322,9 +327,34 @@ class bender_class:
         for j, angle_accuracy in enumerate(self.accuracy_angle):
             accuracy[j] = self.accuracy_by_angle(y_new, y_pred_new, angle_accuracy)
 
-        
         return accuracy
 
+    def plot_combined_accuracy(self, title='Combined Accuracy vs Angle'):
+        """
+        Combine all accuracy plots into one showing average accuracy and standard deviation as a plot with error bars
+        """
+        if not self.all_accuracies or len(self.all_accuracies) == 0:
+            raise ValueError("No accuracy data available. Train and test the model first.")
+
+        # Concatenate all accuracy arrays
+        all_accuracies_combined = np.vstack(self.all_accuracies)  # Shape: (runs * niter, len(accuracy_angle))
+
+        # Calculate mean and standard deviation
+        mean_accuracy = np.mean(all_accuracies_combined, axis=0)
+        std_dev = np.std(all_accuracies_combined, axis=0)
+
+        # Plot
+        f, ax = plt.subplots()
+        accuracy_angle = self.accuracy_angle  # Use angle thresholds from the class
+        ax.plot(self.accuracy_angle, mean_accuracy, 'k-', label='Average Accuracy')  # Mean accuracy as a blue line
+        ax.errorbar(self.accuracy_angle, mean_accuracy, std_dev,  marker='|', color='k')  # Mean + STD
+        ax.set_xlabel('Angle Accuracy (degrees)')
+        ax.set_ylabel('Percent Accurate')
+        ax.set_ylim([0, 100])
+        ax.set_title(title)
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
 
     def dynamic_data(self, period):
         """
