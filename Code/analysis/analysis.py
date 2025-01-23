@@ -263,7 +263,7 @@ class bender_class:
         if self.adc_normalized == False:
             raise ValueError("ADC data not normalized. Please normalize data first.")
 
-        self.accuracy_angle = np.arange(1, 16)
+        self.accuracy_angle = np.arange(1, 16) # accuracy tested up to 15 deg
         self.accuracy = np.zeros((niter, len(self.accuracy_angle)))
 
         for i in range(niter): 
@@ -366,6 +366,7 @@ class bender_class:
 
         # Concatenate all accuracy arrays
         all_accuracies_combined = np.vstack(self.all_accuracies)  # Shape: (runs * niter, len(accuracy_angle))
+        print(len(all_accuracies_combined))
 
         # Calculate mean and standard deviation
         mean_accuracy = np.mean(all_accuracies_combined, axis=0)
