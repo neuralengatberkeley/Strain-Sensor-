@@ -54,7 +54,7 @@ class bender_class:
                 f"model={self.model.__class__.__name__ if self.model else 'None'}, "
                 f"poly_features={self.poly_features.__class__.__name__ if self.poly_features else 'None'})")
 
-    def load_data(self, regex_path): 
+    def load_data(self, regex_path):
         '''
         method to load data from csv files that match the regular expression string "regex_path"
         '''
@@ -70,8 +70,8 @@ class bender_class:
         # Check that csv_files is not empty
         if not csv_files:
             raise FileNotFoundError(f"No CSV files found in the specified path: {regex_path}")
-    
-        # Load all the data 
+
+        # Load all the data
         dataframes = []
         for f in csv_files:
             try:
@@ -84,11 +84,11 @@ class bender_class:
             if df.shape[1] != 4:
                 raise ValueError(
                     f"Error: The file {f} does not contain exactly 4 columns. It has {df.shape[1]} columns.")
-            
+
             # Remove rows where all columns equal "100" (usually first few rows)
             ix_ok = (df.iloc[:, 0] != 100) & (df.iloc[:, 1] != 100) & (df.iloc[:, 2] != 100) & (df.iloc[:, 3] != 100)
             df = df[ix_ok]
-            
+
             # Convert rotary encoder to angle (degrees) -> ADC is Arduino Uno 10 bit (2**10 = 1024), rotary encoder has 320 degrees of rotation
             df['Rotary Encoder'] = df['Rotary Encoder'] * 320 / 1024
 
@@ -107,10 +107,10 @@ class bender_class:
         # Add column names to make it so we dont need to remember the column numbers
         self.columns = self.data.columns
 
-        # Have not yet normalized ADC data 
+        # Have not yet normalized ADC data
         self.adc_normalized = False
 
-    def normalize_adc_bw_01(self): 
+    def normalize_adc_bw_01(self):
         '''
         normalized ADC values to be between 0 and 1
         '''
@@ -128,24 +128,32 @@ class bender_class:
             self.adc_normalized = True
             self.normalize_type = 'MinMax --> 0-1'
             print('ADC normalized bw 0-1. ADC max: ', max, 'ADC min: ', min)
-    
+
     def normalize_adc_over_R0(self):
-        '''
-        normalized ADC values to be over R0
-        '''
-        
-        if self.data is None: 
+        """
+        Normalize ADC values to (R - R₀) / R₀ where R₀ is the initial resistance at the first strain value.
+        This ensures normalized resistance starts near zero at strain = 0.
+        """
+        if self.data is None:
             raise ValueError("No data loaded. Please load data first.")
-        
-        if self.adc_normalized == True: 
+
+        if self.adc_normalized:
             raise ValueError("ADC data already normalized.")
-        
-        else:
-            min = self.data['ADC Value'].min()
-            self.data['ADC Value'] = (self.data['ADC Value'] - min) / min
-            self.adc_normalized = True
-            self.normalize_type = '(R-R0)/R0'
-            print('ADC normalized (R-R0) / R0. ADC min: ', min)
+
+        # Use the first ADC value as R₀
+        R0 = self.data['ADC Value'].iloc[0]
+
+        # Ensure R₀ is not zero to avoid division errors
+        if R0 == 0:
+            raise ValueError("Initial ADC value (R₀) is zero. Cannot normalize.")
+
+        # Normalize the ADC values
+        self.data['ADC Value'] = (self.data['ADC Value'] - R0) / R0
+
+        # Mark as normalized
+        self.adc_normalized = True
+        self.normalize_type = '(R - R₀) / R₀'
+        print(f"ADC normalized with initial value R₀: {R0}")
 
     def plot_data(self, scatter=False, title=''):
         """
@@ -178,51 +186,71 @@ class bender_class:
         self.data_ax = ax; 
         self.data_fig = f
 
-    def plot_mech_model_data(self, thick, l_ch, l_sam, area, res, scatter=False):
+    def plot_mech_model_data(self, thick, l_ch, l_sam, area, res, scatter=False,
+                             data_color='blue', model_color='green',
+                             data_label='Experimental Data', model_label='Theoretical Model', ax=None):
         """
-        Class method to plot normalized data (delta R / Ro) vs bend angle as well as theoretical curve  based on mechanics model .
+        Class method to plot normalized data (delta R / R₀) vs strain (ε) for both experimental data
+        and a theoretical mechanics model. Supports custom legend names and plotting on the same axes.
+
+        Args:
+            thick (float): Thickness of the plate (inches).
+            l_ch (float): Length of the channel (inches).
+            l_sam (float): Length of the sample (inches).
+            area (float): Cross-sectional area (m²).
+            res (float): Initial resistance (ohms).
+            scatter (bool): Whether to plot experimental data as a scatter plot.
+            data_color (str): Color for the experimental data plot.
+            model_color (str): Color for the theoretical model plot.
+            data_label (str): Legend label for the experimental data.
+            model_label (str): Legend label for the theoretical model.
+            ax (matplotlib.axes.Axes): Existing axes object to plot on. If None, creates a new figure and axes.
+
+        Raises:
+            ValueError: If no data is loaded or the data is not normalized.
         """
+        # Ensure data is loaded
         if self.data is None:
-            raise ValueError("Data not available. Please read the data first.")
-            
-        if self.adc_normalized == False:
-            raise ValueError("ADC data not normalized. Please normalize data first.")
+            raise ValueError("No data loaded. Please load data using the load_data method.")
 
-        if self.normalize_type is not '(R-R0)/R0':
-            raise TypeError("ADC data not normalized using (R-R0)/R0 method. Model doesn't work for min/max normalization.")
+        # Ensure data is normalized
+        if not self.adc_normalized:
+            raise ValueError("Data not normalized. Please normalize the data using normalize_adc_over_R0().")
 
-        # See if a plot already exists: 
-        if hasattr(self, 'data_ax') and hasattr(self, 'data_fig'):
-            pass
-        else: 
-            # Make plot and plot the adc data 
-            self.plot_data(scatter=scatter)
+        # Compute strain (ε) for experimental data
+        self.data['Strain (ε)'] = (thick * 0.0254) * (self.data['Rotary Encoder'] * np.pi / 180) / (l_sam * 0.0254)
 
-        ## Model data: 
-        theta = np.arange(0, np.pi / 2 + 0.1, 0.1)  # Include 90 by adding increment
-        rho = 29.4 * 10 ** -8 # what is this? 
-        eps = (thick * 0.0254) * theta / (l_sam * 0.0254)
-        dr = (rho * eps * (l_ch * 0.0254) * (8 - eps) / ((area * 0.000645) * (2 - eps) ** 2))
-        drrt = dr / res
+        # Prepare theoretical model data
+        theta = np.arange(0, np.pi / 2 + 0.1, 0.1)  # Include up to 90 degrees
+        rho = 29.4 * 10 ** -8  # Electrical resistivity of galinstan
+        eps_model = (thick * 0.0254) * theta / (l_sam * 0.0254)  # Strain (ε) for theoretical model
+        dr_model = (rho * eps_model * (l_ch * 0.0254) * (8 - eps_model) /
+                    ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change
+        drrt_model = dr_model / res  # Normalized resistance change for model
 
-        # Plot degrees vs. drrt
-        self.ax.plot(theta * 180 / np.pi, drrt, 'g--', label='Theoretical Model')
-        plt.tight_layout()
+        # Create new plot or add to existing one
+        if ax is None:
+            fig, ax = plt.subplots()  # Create a new figure and axes if none provided
 
-        ### Not sure what this is for: 
-        # Define 5 evenly spaced tick positions for theta
-        # theta_ticks = np.linspace(0, np.pi / 2, 5)  # 5 points from 0 to 90 degrees in radians
-        # eps_ticks = (thick * 0.0254 + 0.00635) * theta_ticks / (l_sam * 0.0254)  # Compute corresponding eps values
+        # Plot experimental data
+        if scatter:
+            ax.scatter(self.data['Strain (ε)'], self.data['ADC Value'], c=data_color, s=5, label=data_label)
+        else:
+            ax.plot(self.data['Strain (ε)'], self.data['ADC Value'], '.', markersize=5, color=data_color,
+                    label=data_label)
 
-        # # Create top x-axis for eps
-        # ax2 = ax1.twiny()  # Twin the x-axis to share the y-axis
-        # ax2.set_xlim(ax1.get_xlim())  # Synchronize with bottom x-axis
+        # Plot theoretical model
+        ax.plot(eps_model, drrt_model, '--', color=model_color, label=model_label)
 
-        # ax1.set_xticks(theta_ticks * 180 / np.pi)  # Set bottom x-axis (theta) ticks in degrees
-        # ax2.set_xticks(theta_ticks * 180 / np.pi)  # Match top x-axis ticks to bottom x-axis
-        # ax2.set_xticklabels([f"{e:.2f}" for e in eps_ticks])  # Set top x-axis labels with eps values
-        # ax2.set_xlabel('$\epsilon$ (strain)')
-        # plt.show()
+        # Set labels and legend only if a new figure was created
+        if ax.get_title() == '':
+            ax.set_xlabel('Strain (ε)')
+            ax.set_ylabel('Normalized ADC (ΔR / R₀)')
+            ax.set_title('Experimental vs Theoretical Model')
+        ax.legend()
+
+        # Return the axes object to allow further plotting
+        return ax
 
     def train_model_test_accuracy(self, perc_train=0.8, niter = 10):
         """
