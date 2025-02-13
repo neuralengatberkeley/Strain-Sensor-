@@ -234,7 +234,7 @@ class bender_class:
 
         # Plot experimental data
         if scatter:
-            ax.scatter(self.data['Strain (ε)'], self.data['ADC Value'], c=data_color, s=5, label=data_label)
+            ax.scatter(self.data['Strain (ε)'], self.data['ADC Value'], c=self.data.index, cmap='viridis', s=5, label=data_label)
         else:
             ax.plot(self.data['Strain (ε)'], self.data['ADC Value'], '.', markersize=5, color=data_color,
                     label=data_label)
@@ -300,6 +300,115 @@ class bender_class:
             # Add this run's accuracy to the list
             self.all_accuracies.append(self.accuracy)
 
+    def plot_trained_model_on_existing(self, ax=None, title=None):
+        """
+        Overlays the trained model predictions on an existing plot (from plot_data).
+
+        - Requires that `plot_data()` has already been run and `ax` is provided.
+        - Requires that `train_model_test_accuracy()` has been run first.
+
+        Parameters:
+        - ax (matplotlib.axes.Axes, optional): The existing plot to overlay the model curve.
+        - title (str): Title of the plot (optional).
+
+        If ax is not provided, it uses the stored `self.data_ax` from plot_data().
+        """
+
+        # Ensure data is available
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+
+        # Ensure ADC values are normalized before plotting
+        if not self.adc_normalized:
+            raise ValueError(
+                "ADC data is not normalized. Please normalize it using normalize_adc_over_R0() or normalize_adc_bw_01().")
+
+        # Ensure model is trained
+        if self.model is None:
+            raise ValueError("Model has not been trained yet. Please run train_model_test_accuracy first.")
+
+        # Use existing plot if no ax is provided
+        if ax is None:
+            if not hasattr(self, 'data_ax') or self.data_ax is None:
+                raise ValueError("No existing plot found. Please run plot_data() first or provide an ax object.")
+            ax = self.data_ax  # Use the stored axis from plot_data()
+
+        # Generate model predictions across a range of ADC values
+        adc_values = np.linspace(self.data['ADC Value'].min(), self.data['ADC Value'].max(), 100).reshape(-1, 1)
+        adc_values = np.hstack((adc_values, np.ones(adc_values.shape)))  # Add intercept term
+
+        # Predict angles using the trained model
+        predicted_angles = self.model.predict(adc_values)
+
+        # Plot the model's predicted curve on the existing ax
+        ax.plot(predicted_angles, adc_values[:, 0], color='red', linestyle='--', linewidth=2, label="Trained Linear Model")
+
+        # Update title if necessary
+        ax.set_title(title)
+
+        # Add legend if not already present
+        ax.legend()
+
+        # Show the updated plot
+        plt.show()
+
+    from sklearn.metrics import mean_squared_error
+    import numpy as np
+
+    def rmse_stats(self, n_runs=10, perc_train=0.8):
+        """
+        Calculates the mean and standard deviation of RMSE over multiple train-test splits.
+
+        Parameters:
+            n_runs (int): Number of times to repeat the train-test split.
+            perc_train (float): Percentage of data to use for training (default 80%).
+
+        Returns:
+            tuple: (mean_rmse, std_rmse, rmse_list)
+        """
+
+        # Ensure data exists
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first.")
+
+        # Ensure data is normalized
+        if not self.adc_normalized:
+            raise ValueError("ADC data is not normalized. Please normalize it first.")
+
+        # List to store RMSE values
+        rmse_list = []
+
+        for _ in range(n_runs):
+            # Split data into train and test
+            data_train, data_test = train_test_split(self.data, test_size=1.0 - perc_train, shuffle=True)
+
+            # Extract training data
+            X_train = data_train['ADC Value'].values.reshape(-1, 1)
+            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add intercept
+            y_train = data_train['Rotary Encoder'].values
+
+            # Train the model
+            model = LinearRegression()
+            model.fit(X_train, y_train)
+
+            # Extract testing data
+            X_test = data_test['ADC Value'].values.reshape(-1, 1)
+            X_test = np.hstack((X_test, np.ones(X_test.shape)))  # Add intercept
+            y_test = data_test['Rotary Encoder'].values
+
+            # Predict angles
+            y_pred = model.predict(X_test)
+
+            # Compute RMSE for this run
+            rmse_value = np.sqrt(mean_squared_error(y_test, y_pred))
+            rmse_list.append(rmse_value)
+
+        # Compute mean and std of RMSE
+        mean_rmse = np.mean(rmse_list)
+        std_rmse = np.std(rmse_list)
+
+        return mean_rmse, std_rmse, rmse_list
+
     def accuracy_by_angle(self, y_true, y_pred, angle_accuracy):
         '''
         Method to calculate the accuracy of the model for specific thresholds of angle accuracy
@@ -331,7 +440,110 @@ class bender_class:
         ax.set_ylabel('Percent Accurate (held out data)')
         ax.set_title(title)
         ax.set_ylim([0, 100])
-        
+
+    def get_min_accuracy_100(self):
+        """
+        Finds the smallest angle threshold where the mean accuracy reaches 100%.
+
+        Returns:
+            tuple: (min_angle_100, accuracy_value)
+                   where min_angle_100 is the smallest angle where accuracy is 100%.
+        """
+
+        # Ensure that accuracy has been calculated
+        if not hasattr(self, 'accuracy') or self.accuracy is None:
+            raise ValueError("Accuracy has not been computed. Please run train_model_test_accuracy first.")
+
+        # Compute mean accuracy across iterations
+        mean_accuracy = np.mean(self.accuracy, axis=0)
+
+        # Find the first occurrence where accuracy reaches 100%
+        indices_100 = np.where(mean_accuracy == 100)[0]
+
+        if len(indices_100) == 0:
+            print("No angle threshold reaches 100% accuracy.")
+            return None, None
+
+        # Get the smallest angle threshold where accuracy is 100%
+        min_angle_100 = self.accuracy_angle[indices_100[0]]
+        accuracy_value = mean_accuracy[indices_100[0]]
+
+        return min_angle_100, accuracy_value
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def plot_double_bar_chart(self, list1, list2, labels,
+                              std1=None, std2=None,
+                              title1="RMSE per Sample", title2="Min Angle for 100% Accuracy",
+                              ylabel1="RMSE (deg)", ylabel2="Min Angle (deg)",
+                              color1='b', color2='r', ylim1=(0, 15), ylim2=(0, 15)):
+        """
+        Creates two stacked bar plots for visualizing RMSE and Min Angle where Mean Accuracy = 100,
+        with optional error bars.
+
+        Parameters:
+        - list1 (list): Data for the first bar plot (e.g., RMSE values).
+        - list2 (list): Data for the second bar plot (e.g., min angle where accuracy is 100%).
+        - labels (list): Labels for the bars (should be the same length as list1 and list2).
+        - std1 (list, optional): Standard deviations for the first bar plot (RMSE) (default: None).
+        - std2 (list, optional): Standard deviations for the second bar plot (Min Angle) (default: None).
+        - title1 (str): Title for the first bar plot.
+        - title2 (str): Title for the second bar plot.
+        - ylabel1 (str): Y-axis label for the first plot.
+        - ylabel2 (str): Y-axis label for the second plot.
+        - color1 (str): Color for the first bar plot (default: 'b' for blue).
+        - color2 (str): Color for the second bar plot (default: 'r' for red).
+        - ylim1 (tuple): Y-axis limits for the first plot (default: (0, 15)).
+        - ylim2 (tuple): Y-axis limits for the second plot (default: (0, 15)).
+        """
+
+        # Ensure input lists have the same length
+        if not (len(list1) == len(list2) == len(labels)):
+            raise ValueError("list1, list2, and labels must have the same length.")
+
+        # Convert std to None if not provided to avoid errors in error bars
+        if std1 is None:
+            std1 = [0] * len(list1)  # No error bars if std1 is not provided
+        if std2 is None:
+            std2 = [0] * len(list2)  # No error bars if std2 is not provided
+
+        # Ensure std lists are the same length as data lists
+        if not (len(std1) == len(list1) and len(std2) == len(list2)):
+            raise ValueError("Standard deviation lists must have the same length as their corresponding data lists.")
+
+        # Set figure size
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        # Define bar positions
+        x_pos = np.arange(len(labels))
+
+        # Create first bar plot (RMSE)
+        axes[0].bar(x_pos, list1, color=color1, alpha=0.7, yerr=std1, capsize=5, error_kw={'elinewidth': 1.5})
+        axes[0].set_ylabel(ylabel1)
+        axes[0].set_title(title1)
+        axes[0].set_ylim(ylim1)  # Customizable y-axis limit
+        axes[0].grid(axis='y', linestyle='--', alpha=0.6)  # Adds grid lines for readability
+
+        # Create second bar plot (Min Angle where Accuracy = 100)
+        axes[1].bar(x_pos, list2, color=color2, alpha=0.7, yerr=std2, capsize=5, error_kw={'elinewidth': 1.5})
+        axes[1].set_xlabel("Sample")
+        axes[1].set_ylabel(ylabel2)
+        axes[1].set_title(title2)
+        axes[1].set_ylim(ylim2)  # Customizable y-axis limit
+        axes[1].grid(axis='y', linestyle='--', alpha=0.6)
+
+        # Set x-axis labels
+        axes[1].set_xticks(x_pos)
+        axes[1].set_xticklabels(labels, rotation=45, ha="right")
+
+        # Adjust layout
+        plt.tight_layout()
+        plt.show()
+
     def predict_new_data(self, new_data_df):
         """
         Uses result from trained model method from single dataset/test to make predictions on new data/test from another bender_class object
