@@ -5,10 +5,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
 from sklearn import preprocessing
-import numpy as np
-import matplotlib.pyplot as plt  # To visualize
 import glob
+import matplotlib.pyplot as plt
+import seaborn as sns
 
+import numpy as np
+from sklearn.model_selection import KFold, train_test_split
 from config import path_to_repository
 
 
@@ -111,23 +113,39 @@ class bender_class:
         self.adc_normalized = False
 
     def normalize_adc_bw_01(self):
-        '''
-        normalized ADC values to be between 0 and 1
-        '''
-        
-        if self.data is None: 
+        """
+        Normalizes ADC values to be between 0 and 1 while ensuring:
+        - The first value starts at 0.
+        - The data increases positively (mirrored if necessary).
+        """
+
+        if self.data is None:
             raise ValueError("No data loaded. Please load data first.")
-        
-        if self.adc_normalized == True: 
+
+        if self.adc_normalized:
             raise ValueError("ADC data already normalized.")
-        
-        else:
-            max = self.data['ADC Value'].max()
-            min = self.data['ADC Value'].min()
-            self.data['ADC Value'] = (self.data['ADC Value'] - min) / (max - min)
-            self.adc_normalized = True
-            self.normalize_type = 'MinMax --> 0-1'
-            print('ADC normalized bw 0-1. ADC max: ', max, 'ADC min: ', min)
+
+        # Get min and max ADC values
+        max_val = self.data['ADC Value'].max()
+        min_val = self.data['ADC Value'].min()
+
+        # Normalize ADC values between 0 and 1
+        self.data['ADC Value'] = (self.data['ADC Value'] - min_val) / (max_val - min_val)
+
+        # Identify ADC at 0° and near 90° (or closest available)
+        adc_at_0 = self.data.loc[self.data['Rotary Encoder'].idxmin(), 'ADC Value']
+        adc_at_90 = self.data.iloc[(self.data['Rotary Encoder'] - 90).abs().idxmin()]['ADC Value']
+
+        # Check if ADC values decrease with increasing angle
+        if adc_at_90 < adc_at_0:
+            self.data['ADC Value'] = 1 - self.data['ADC Value']  # Mirror the dataset
+
+        # Mark as normalized
+        self.adc_normalized = True
+        self.normalize_type = 'MinMax --> 0-1'
+
+        print('ADC normalized bw 0-1. ADC max: ', self.data['ADC Value'].max(), 'ADC min: ',
+              self.data['ADC Value'].min())
 
     def normalize_adc_over_R0(self):
         """
@@ -355,59 +373,203 @@ class bender_class:
     from sklearn.metrics import mean_squared_error
     import numpy as np
 
-    def rmse_stats(self, n_runs=10, perc_train=0.8):
+    def cross_validation_angular_error(self):
         """
-        Calculates the mean and standard deviation of RMSE over multiple train-test splits.
-
-        Parameters:
-            n_runs (int): Number of times to repeat the train-test split.
-            perc_train (float): Percentage of data to use for training (default 80%).
+        Performs 10-fold cross-validation by splitting the data into 10 parts.
+        - Each fold uses 9/10 of the data for training and 1/10 for testing.
+        - Predicts angles for the held-out data points.
+        - Computes the mean and standard deviation of the angular error across all folds.
 
         Returns:
-            tuple: (mean_rmse, std_rmse, rmse_list)
+            mean_error (float): Mean of the absolute angular errors.
+            std_error (float): Standard deviation of the angular errors.
+            predictions_df (pd.DataFrame): DataFrame with actual and predicted angles.
         """
 
-        # Ensure data exists
         if self.data is None:
             raise ValueError("No data loaded. Please load data first.")
 
-        # Ensure data is normalized
         if not self.adc_normalized:
             raise ValueError("ADC data is not normalized. Please normalize it first.")
 
-        # List to store RMSE values
-        rmse_list = []
+        N = len(self.data)
+        num_splits = 10
+        indices = np.arange(N)
+        np.random.shuffle(indices)  # Shuffle the indices for randomness
+        split_size = N // num_splits  # Number of data points per split
 
-        for _ in range(n_runs):
-            # Split data into train and test
-            data_train, data_test = train_test_split(self.data, test_size=1.0 - perc_train, shuffle=True)
+        all_predictions = np.zeros(N)  # Store predictions for each data point
+        all_errors = np.zeros(N)  # Store errors
 
-            # Extract training data
-            X_train = data_train['ADC Value'].values.reshape(-1, 1)
-            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add intercept
-            y_train = data_train['Rotary Encoder'].values
+        for i in range(num_splits):
+            # Define held-out and training indices
+            test_indices = indices[i * split_size:(i + 1) * split_size]
+            train_indices = np.setdiff1d(indices, test_indices)
 
-            # Train the model
+            # Split data
+            train_data = self.data.iloc[train_indices]
+            test_data = self.data.iloc[test_indices]
+
+            # Prepare training and testing inputs
+            X_train = train_data['ADC Value'].values.reshape(-1, 1)
+            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add intercept term
+            y_train = train_data['Rotary Encoder'].values
+
+            X_test = test_data['ADC Value'].values.reshape(-1, 1)
+            X_test = np.hstack((X_test, np.ones(X_test.shape)))  # Add intercept term
+
+            # Train model
             model = LinearRegression()
             model.fit(X_train, y_train)
 
-            # Extract testing data
-            X_test = data_test['ADC Value'].values.reshape(-1, 1)
-            X_test = np.hstack((X_test, np.ones(X_test.shape)))  # Add intercept
-            y_test = data_test['Rotary Encoder'].values
-
-            # Predict angles
+            # Predict for the held-out data
             y_pred = model.predict(X_test)
 
-            # Compute RMSE for this run
-            rmse_value = np.sqrt(mean_squared_error(y_test, y_pred))
-            rmse_list.append(rmse_value)
+            # Store predictions and errors
+            all_predictions[test_indices] = y_pred
+            all_errors[test_indices] = np.abs(y_pred - test_data['Rotary Encoder'].values)
 
-        # Compute mean and std of RMSE
-        mean_rmse = np.mean(rmse_list)
-        std_rmse = np.std(rmse_list)
+        # Compute mean and std of the angular error
+        mean_error = np.mean(all_errors)
+        std_error = np.std(all_errors)
 
-        return mean_rmse, std_rmse, rmse_list
+        # Create DataFrame with actual and predicted values
+        predictions_df = self.data.copy()
+        predictions_df['Predicted Angle'] = all_predictions
+        predictions_df['Absolute Error'] = all_errors
+
+
+        return mean_error, std_error, predictions_df
+
+
+
+    def cross_validation_external_test(self, external_datasets, n_splits=10):
+        """
+        Cross-validation method where:
+        - One dataset is split into 10 parts (9N/10 for training, N/10 for testing).
+        - The trained model is used to predict on the concatenated external datasets.
+        - This process is repeated 10 times to compute mean and std errors.
+
+        Parameters:
+            external_datasets (list of bender_class instances): Other datasets to test on.
+            n_splits (int): Number of cross-validation splits (default: 10).
+
+        Returns:
+            tuple: (mean_error, std_error, predictions_df)
+                   - mean_error: Mean of absolute angular errors.
+                   - std_error: Standard deviation of absolute angular errors.
+                   - predictions_df: DataFrame with true angles and predicted angles.
+        """
+
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first.")
+
+        if self.adc_normalized is False:
+            raise ValueError("ADC data must be normalized before running cross-validation.")
+
+        # Ensure external datasets are loaded and normalized
+        external_data = []
+        for dataset in external_datasets:
+            if dataset.data is None:
+                raise ValueError("One of the external datasets has no data loaded.")
+            if dataset.adc_normalized is False:
+                raise ValueError("All external datasets must be normalized before testing.")
+            external_data.append(dataset.data)
+
+        # Concatenate external datasets
+        external_df = pd.concat(external_data, ignore_index=True)
+
+        # Prepare K-Fold cross-validation
+        kf = KFold(n_splits=n_splits, shuffle=True)
+        errors = []
+
+        predictions_list = []
+
+        for train_idx, test_idx in kf.split(self.data):
+            train_data = self.data.iloc[train_idx]
+            test_data = self.data.iloc[test_idx]  # Held-out test set (N/10)
+
+            # Train the model using the 9N/10 split
+            X_train = train_data['ADC Value'].values.reshape(-1, 1)
+            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add intercept
+            y_train = train_data['Rotary Encoder'].values
+
+            self.model = LinearRegression()
+            self.model.fit(X_train, y_train)
+
+            # Predict on the concatenated external dataset
+            X_external = external_df['ADC Value'].values.reshape(-1, 1)
+            X_external = np.hstack((X_external, np.ones(X_external.shape)))  # Add intercept
+            y_true_external = external_df['Rotary Encoder'].values  # True external angles
+
+            y_pred_external = self.model.predict(X_external)
+
+            # Compute absolute error for this split
+            abs_errors = np.abs(y_pred_external - y_true_external)
+            errors.append(abs_errors)
+
+            # Store predictions
+            predictions_df = pd.DataFrame({
+                'True Angle': y_true_external,
+                'Predicted Angle': y_pred_external,
+                'Absolute Error': abs_errors
+            })
+            predictions_list.append(predictions_df)
+
+        # Combine all predictions into one DataFrame
+        final_predictions_df = pd.concat(predictions_list, ignore_index=True)
+
+        # Compute mean and std error
+        mean_error = np.mean([np.mean(err) for err in errors])
+        std_error = np.std([np.mean(err) for err in errors])
+
+        return mean_error, std_error, final_predictions_df
+
+    def plot_error_violin(self, error_dfs, labels=None):
+        """
+        Creates side-by-side violin plots for angular prediction errors from multiple datasets.
+
+        Parameters:
+            error_dfs (list of pd.DataFrame): List of DataFrames, each containing an 'Absolute Error' column.
+            labels (list of str, optional): List of labels corresponding to each dataset. Default is None.
+
+        Raises:
+            ValueError: If any DataFrame does not contain the expected column.
+        """
+
+        # Check if input is a list of DataFrames
+        if not isinstance(error_dfs, list) or not all(isinstance(df, pd.DataFrame) for df in error_dfs):
+            raise ValueError("error_dfs must be a list of pandas DataFrames.")
+
+        # Ensure all DataFrames contain the 'Absolute Error' column
+        for df in error_dfs:
+            if "Absolute Error" not in df.columns:
+                raise ValueError("Each DataFrame must contain an 'Absolute Error' column.")
+
+        # Create a combined DataFrame for plotting
+        plot_data = []
+        dataset_labels = []
+
+        for i, df in enumerate(error_dfs):
+            plot_data.extend(df["Absolute Error"].tolist())  # Store error values
+            dataset_label = labels[i] if labels and i < len(labels) else f"Dataset {i + 1}"
+            dataset_labels.extend([dataset_label] * len(df))
+
+        # Convert to DataFrame
+        plot_df = pd.DataFrame({"Absolute Error": plot_data, "Dataset": dataset_labels})
+
+        # Create the violin plot
+        plt.figure(figsize=(10, 6))
+        sns.violinplot(x="Dataset", y="Absolute Error", data=plot_df, inner="point", palette="coolwarm")
+
+        # Labels and title
+        plt.xlabel("Datasets")
+        plt.ylabel("Absolute Angular Error (degrees)")
+        plt.title("Distribution of Angular Prediction Errors Across Datasets")
+        plt.ylim(0, 15)
+        # Show the plot
+        plt.show()
+
 
     def accuracy_by_angle(self, y_true, y_pred, angle_accuracy):
         '''
@@ -441,21 +603,26 @@ class bender_class:
         ax.set_title(title)
         ax.set_ylim([0, 100])
 
-    def get_min_accuracy_100(self):
+    def get_min_accuracy_100(self, accuracy_matrix=None):
         """
         Finds the smallest angle threshold where the mean accuracy reaches 100%.
+
+        Parameters:
+            accuracy_matrix (np.array, optional): If provided, uses this external accuracy data instead of self.accuracy.
 
         Returns:
             tuple: (min_angle_100, accuracy_value)
                    where min_angle_100 is the smallest angle where accuracy is 100%.
         """
 
-        # Ensure that accuracy has been calculated
-        if not hasattr(self, 'accuracy') or self.accuracy is None:
-            raise ValueError("Accuracy has not been computed. Please run train_model_test_accuracy first.")
+        # Determine which accuracy matrix to use
+        if accuracy_matrix is None:
+            if not hasattr(self, 'accuracy') or self.accuracy is None:
+                raise ValueError("Accuracy has not been computed. Please run train_model_test_accuracy first.")
+            accuracy_matrix = self.accuracy  # Default to self.accuracy
 
-        # Compute mean accuracy across iterations
-        mean_accuracy = np.mean(self.accuracy, axis=0)
+        # Compute mean accuracy across runs
+        mean_accuracy = np.mean(accuracy_matrix, axis=0)
 
         # Find the first occurrence where accuracy reaches 100%
         indices_100 = np.where(mean_accuracy == 100)[0]
@@ -470,11 +637,41 @@ class bender_class:
 
         return min_angle_100, accuracy_value
 
-    import matplotlib.pyplot as plt
-    import numpy as np
+    def plot_bar_chart(self, values, labels, title="Min Angle for 100% Accuracy", ylabel="Min Angle (deg)", color="b",
+                       ylim=(0, 15)):
+        """
+        Creates a bar chart where you can add as many bars as needed.
 
-    import matplotlib.pyplot as plt
-    import numpy as np
+        Parameters:
+            values (list): Data to plot (e.g., min angle for 100% accuracy).
+            labels (list): Labels corresponding to each dataset.
+            title (str): Title of the plot (default: "Min Angle for 100% Accuracy").
+            ylabel (str): Label for the y-axis (default: "Min Angle (deg)").
+            color (str): Bar color (default: 'b' for blue).
+            ylim (tuple): Y-axis limits (default: (0, 15)).
+        """
+
+        if not (len(values) == len(labels)):
+            raise ValueError("values and labels must have the same length.")
+
+        # Set figure size
+        plt.figure(figsize=(10, 5))
+
+        # Define bar positions
+        x_pos = np.arange(len(labels))
+
+        # Create bar plot
+        plt.bar(x_pos, values, color=color, alpha=0.7)
+
+        # Set labels and title
+        plt.xticks(x_pos, labels, rotation=45, ha="right")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.ylim(ylim)  # Set y-axis range
+
+        # Show plot
+        plt.show()
+
 
     def plot_double_bar_chart(self, list1, list2, labels,
                               std1=None, std2=None,
