@@ -12,6 +12,7 @@ import seaborn as sns
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
 from config import path_to_repository
+from scipy.interpolate import interp1d
 
 
 class bender_class:
@@ -204,28 +205,13 @@ class bender_class:
         self.data_ax = ax; 
         self.data_fig = f
 
+
     def plot_mech_model_data(self, thick, l_ch, l_sam, area, res, scatter=False,
                              data_color='blue', model_color='green',
                              data_label='Experimental Data', model_label='Theoretical Model', ax=None):
         """
         Class method to plot normalized data (delta R / R₀) vs strain (ε) for both experimental data
         and a theoretical mechanics model. Supports custom legend names and plotting on the same axes.
-
-        Args:
-            thick (float): Thickness of the plate (inches).
-            l_ch (float): Length of the channel (inches).
-            l_sam (float): Length of the sample (inches).
-            area (float): Cross-sectional area (m²).
-            res (float): Initial resistance (ohms).
-            scatter (bool): Whether to plot experimental data as a scatter plot.
-            data_color (str): Color for the experimental data plot.
-            model_color (str): Color for the theoretical model plot.
-            data_label (str): Legend label for the experimental data.
-            model_label (str): Legend label for the theoretical model.
-            ax (matplotlib.axes.Axes): Existing axes object to plot on. If None, creates a new figure and axes.
-
-        Raises:
-            ValueError: If no data is loaded or the data is not normalized.
         """
         # Ensure data is loaded
         if self.data is None:
@@ -246,19 +232,30 @@ class bender_class:
                     ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change
         drrt_model = dr_model / res  # Normalized resistance change for model
 
+        # Interpolate the model to get predictions at the experimental strain values
+        f_interp = interp1d(eps_model, drrt_model, kind='linear', fill_value='extrapolate')
+        model_at_data = f_interp(self.data['Strain (ε)'])
+
+        # Compute the R2 value
+        ss_res = np.sum((self.data['ADC Value'] - model_at_data) ** 2)
+        ss_tot = np.sum((self.data['ADC Value'] - np.mean(self.data['ADC Value'])) ** 2)
+        r2 = 1 - (ss_res / ss_tot)
+
         # Create new plot or add to existing one
         if ax is None:
-            fig, ax = plt.subplots()  # Create a new figure and axes if none provided
+            fig, ax = plt.subplots()
 
         # Plot experimental data
         if scatter:
-            ax.scatter(self.data['Strain (ε)'], self.data['ADC Value'], c=self.data.index, cmap='viridis', s=5, label=data_label)
+            ax.scatter(self.data['Strain (ε)'], self.data['ADC Value'], c=self.data.index,
+                       cmap='viridis', s=5, label=data_label)
         else:
-            ax.plot(self.data['Strain (ε)'], self.data['ADC Value'], '.', markersize=5, color=data_color,
-                    label=data_label)
+            ax.plot(self.data['Strain (ε)'], self.data['ADC Value'], '.',
+                    markersize=5, color=data_color, label=data_label)
 
-        # Plot theoretical model
-        ax.plot(eps_model, drrt_model, '--', color=model_color, label=model_label)
+        # Plot theoretical model with the R2 value included in the legend label
+        ax.plot(eps_model, drrt_model, '--', color=model_color,
+                label=f"{model_label} (R2 = {r2:.3f})")
 
         # Set labels and legend only if a new figure was created
         if ax.get_title() == '':
@@ -317,6 +314,100 @@ class bender_class:
 
             # Add this run's accuracy to the list
             self.all_accuracies.append(self.accuracy)
+
+    def plot_pairwise_min_angle_heatmap(self, df_results):
+        """
+        Generate a heatmap showing the minimum angle where accuracy reaches 100%
+        for each train-test dataset combination.
+
+        :param df_results: Pandas DataFrame with columns ["train_dataset", "test_dataset", "min_angle_100"]
+        """
+        if df_results.empty:
+            print("No results to display.")
+            return
+
+        # Convert results into a pivot table
+        df_pivot = df_results.pivot(index="train_dataset", columns="test_dataset", values="min_angle_100")
+
+        # Plot heatmap
+        plt.figure(figsize=(10, 8))
+        ax = sns.heatmap(df_pivot, annot=True, cmap="coolwarm", fmt=".1f", linewidths=0.5, cbar=True)
+
+        # Add labels and title
+        plt.title("Pairwise Min Angle (Accuracy 100%) Heatmap")
+        plt.xlabel("Test Dataset")
+        plt.ylabel("Train Dataset")
+
+        # Show plot
+        plt.show()
+
+    def fig_1_lin_vs_quad(self, perc_train=0.8, random_state=None,
+                          data_color='blue', lin_color='red', quad_color='green'):
+        """
+        Plots test data from a single train/test split along with both a linear and a quadratic model fit,
+        with Rotary Encoder angle on the x-axis and ADC Value on the y-axis.
+
+        The models are trained on the training data from the split, then evaluated on the test data.
+        The R² values for each model (evaluated on the test set) are included in the legend.
+
+        Assumes:
+          - self.data is a Pandas DataFrame containing 'ADC Value' and 'Rotary Encoder'.
+          - self.adc_normalized is True.
+        """
+        # Check that data is available and normalized
+        if self.data is None:
+            raise ValueError("Data not available. Please read the data first.")
+        if not self.adc_normalized:
+            raise ValueError("ADC data not normalized. Please normalize data first.")
+
+        # Create a train/test split (mimicking the first iteration)
+        dataTrain, dataTest = train_test_split(self.data, test_size=(1 - perc_train),
+                                               shuffle=True, random_state=random_state)
+
+        # For plotting: use Rotary Encoder angle as x and ADC Value as y
+        X_train = dataTrain[['Rotary Encoder']]
+        y_train = dataTrain['ADC Value']
+        X_test = dataTest[['Rotary Encoder']]
+        y_test = dataTest['ADC Value']
+
+        # ---- Linear Model ----
+        model_linear = LinearRegression()
+        model_linear.fit(X_train, y_train)
+        y_pred_linear = model_linear.predict(X_test)
+        ss_res_linear = np.sum((y_test - y_pred_linear) ** 2)
+        ss_tot = np.sum((y_test - np.mean(y_test)) ** 2)
+        r2_linear = 1 - (ss_res_linear / ss_tot)
+
+        # ---- Quadratic Model ----
+        # Use np.polyfit to fit a quadratic model on the training data
+        x_train_vals = X_train.values.flatten()  # Rotary Encoder angles (1D array)
+        y_train_vals = y_train.values  # ADC Values
+        p_quad = np.polyfit(x_train_vals, y_train_vals, 2)
+        # Predict on the test data using the quadratic model
+        x_test_vals = X_test.values.flatten()
+        y_pred_quad = np.polyval(p_quad, x_test_vals)
+        ss_res_quad = np.sum((y_test - y_pred_quad) ** 2)
+        r2_quad = 1 - (ss_res_quad / ss_tot)
+
+        # ---- Prepare smooth curves for plotting the model fits ----
+        x_range = np.linspace(np.min(X_test.values), np.max(X_test.values), 200)
+        y_range_linear = model_linear.predict(x_range.reshape(-1, 1))
+        y_range_quad = np.polyval(p_quad, x_range)
+
+        # ---- Plotting ----
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(X_test, y_test, color=data_color, label='Test Data')
+        ax.plot(x_range, y_range_linear, '--', color=lin_color,
+                label=f'Linear Fit (R² = {r2_linear:.3f})')
+        ax.plot(x_range, y_range_quad, '-.', color=quad_color,
+                label=f'Quadratic Fit (R² = {r2_quad:.3f})')
+
+        ax.set_xlabel('Rotary Encoder Angle')
+        ax.set_ylabel('Normalized ADC \n %s' % self.normalize_type)  # state normalization type
+        ax.set_title('Test Data with Linear vs Quadratic Model Fits')
+        ax.legend()
+
+        return ax
 
     def plot_trained_model_on_existing(self, ax=None, title=None):
         """
@@ -571,6 +662,67 @@ class bender_class:
         plt.show()
 
 
+    def plot_box_plot(self, data_dict, group_dict, group_colors, group_names, alpha=0.5, jitter=0.2):
+        """
+        Plot box plots for each sample but group them visually using custom group labels and colors.
+
+        Parameters:
+        - data_dict: A dictionary where keys are sample names and values are lists of data (absolute errors).
+        - group_dict: A dictionary where keys are sample names and values are group labels.
+        - group_colors: A list of colors corresponding to each group.
+        - group_names: A list of custom group labels to display on the x-axis.
+        - alpha: Transparency level for individual data points (default=0.5).
+        - jitter: Jitter amount for individual data points (default=0.2).
+
+        The function plots each sample separately but assigns colors based on their groups.
+        """
+
+        # Convert data_dict into a DataFrame for easier plotting
+        all_samples = []
+        all_values = []
+        all_groups = []
+
+        for sample, values in data_dict.items():
+            all_samples.extend([sample] * len(values))  # Repeat sample name for each data point
+            all_values.extend(values)  # Store values
+            all_groups.extend([group_dict[sample]] * len(values))  # Assign groups
+
+        df = pd.DataFrame({'Sample': all_samples, 'Value': all_values, 'Group': all_groups})
+
+        # Ensure group order is consistent and assign colors
+        unique_groups = sorted(set(group_dict.values()))  # Extract unique groups
+        if len(unique_groups) != len(group_names):
+            raise ValueError("Length of group_names must match the number of unique groups.")
+
+        group_palette = {group: color for group, color in zip(unique_groups, group_colors)}
+
+        # Get sample order
+        sample_order = list(df['Sample'].unique())  # Order of samples as they appear
+
+        # Create figure
+        plt.figure(figsize=(12, 6))
+
+        # Box plot with separate samples but grouped by color
+        ax = sns.boxplot(x='Sample', y='Value', data=df, palette=[group_palette[group_dict[sample]] for sample in sample_order])
+
+        # Add jittered individual data points **inside** each box plot
+        sns.stripplot(x='Sample', y='Value', data=df, hue='Group', palette=group_palette,
+                      jitter=jitter, alpha=alpha, dodge=False, size=4, edgecolor='w', linewidth=0.5)
+
+        # Modify x-axis to show **custom** group labels instead of sample labels
+        group_positions = [np.mean([sample_order.index(sample) for sample in df[df['Group'] == group]['Sample'].unique()]) for group in unique_groups]
+        plt.xticks(group_positions, group_names, rotation=45, ha='right')  # Use custom group names
+
+        # Remove legend (since x-axis already shows groups)
+        plt.legend([], [], frameon=False)
+
+        # Improve layout
+        plt.xlabel('Group')
+        plt.ylabel('Absolute Angular Error (deg)')
+        plt.title('Box Plot of Absolute Errors by Group')
+
+        plt.show()
+
     def accuracy_by_angle(self, y_true, y_pred, angle_accuracy):
         '''
         Method to calculate the accuracy of the model for specific thresholds of angle accuracy
@@ -624,7 +776,7 @@ class bender_class:
         # Compute mean accuracy across runs
         mean_accuracy = np.mean(accuracy_matrix, axis=0)
 
-        # Find the first occurrence where accuracy reaches 100%
+        # Find the first occurrence where accuracy reaches > 99%
         indices_100 = np.where(mean_accuracy == 100)[0]
 
         if len(indices_100) == 0:
@@ -637,41 +789,47 @@ class bender_class:
 
         return min_angle_100, accuracy_value
 
-    def plot_bar_chart(self, values, labels, title="Min Angle for 100% Accuracy", ylabel="Min Angle (deg)", color="b",
-                       ylim=(0, 15)):
+
+    def plot_bar_chart(self, data, labels, title, ylabel, colors, ylim=None):
         """
-        Creates a bar chart where you can add as many bars as needed.
+        Plots grouped bars with different colors for each group.
 
         Parameters:
-            values (list): Data to plot (e.g., min angle for 100% accuracy).
-            labels (list): Labels corresponding to each dataset.
-            title (str): Title of the plot (default: "Min Angle for 100% Accuracy").
-            ylabel (str): Label for the y-axis (default: "Min Angle (deg)").
-            color (str): Bar color (default: 'b' for blue).
-            ylim (tuple): Y-axis limits (default: (0, 15)).
+        - data: List of lists, where each sublist represents values for a group.
+        - labels: List of group names.
+        - title: Chart title.
+        - ylabel: Y-axis label.
+        - colors: List of colors for each group.
+        - ylim: Tuple (ymin, ymax) for y-axis limit.
         """
+        num_groups = len(data)  # Number of groups (e.g., 3)
+        max_bars = max(len(group) for group in data)  # Find the maximum datasets in any group
+        bar_width = 0.2  # Controls spacing between bars in a group
 
-        if not (len(values) == len(labels)):
-            raise ValueError("values and labels must have the same length.")
+        x_positions = np.arange(num_groups)  # X positions for the groups
 
-        # Set figure size
-        plt.figure(figsize=(10, 5))
+        plt.figure(figsize=(8, 6))
 
-        # Define bar positions
-        x_pos = np.arange(len(labels))
+        for i, (group_values, color) in enumerate(zip(data, colors)):
+            num_bars = len(group_values)
+            x_offsets = np.linspace(-bar_width * (num_bars - 1) / 2, bar_width * (num_bars - 1) / 2, num_bars)
 
-        # Create bar plot
-        plt.bar(x_pos, values, color=color, alpha=0.7)
+            # Plot bars for this group, slightly offset from center position
+            for j, (val, offset) in enumerate(zip(group_values, x_offsets)):
+                plt.bar(x_positions[i] + offset, val, width=bar_width, color=color,
+                        label=f"Sample {j + 1}" if i == 0 else "")
 
-        # Set labels and title
-        plt.xticks(x_pos, labels, rotation=45, ha="right")
+        # Set x-ticks to group labels
+        plt.xticks(x_positions, labels)
         plt.ylabel(ylabel)
         plt.title(title)
-        plt.ylim(ylim)  # Set y-axis range
 
-        # Show plot
+        if ylim:
+            plt.ylim(ylim)
+
+
+
         plt.show()
-
 
     def plot_double_bar_chart(self, list1, list2, labels,
                               std1=None, std2=None,
