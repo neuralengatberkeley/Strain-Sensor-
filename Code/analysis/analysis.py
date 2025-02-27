@@ -205,21 +205,33 @@ class bender_class:
         self.data_ax = ax; 
         self.data_fig = f
 
-
     def plot_mech_model_data(self, thick, l_ch, l_sam, area, res, scatter=False,
                              data_color='blue', model_color='green',
-                             data_label='Experimental Data', model_label='Theoretical Model', ax=None):
+                             data_label='Experimental Data', model_label='Theoretical Model',
+                             normalize_by='over_R0', ax=None):
         """
-        Class method to plot normalized data (delta R / R₀) vs strain (ε) for both experimental data
-        and a theoretical mechanics model. Supports custom legend names and plotting on the same axes.
+        Class method to plot normalized data vs strain (ε) for both experimental data
+        and a theoretical mechanics model. Supports normalization by:
+
+        - '01': MinMax scaling between [0,1]
+        - 'over_R0': (R - R₀) / R₀ normalization
+
+        Parameters:
+            normalize_by (str): '01' for MinMax normalization, 'over_R0' for (R - R₀) / R₀.
         """
         # Ensure data is loaded
         if self.data is None:
             raise ValueError("No data loaded. Please load data using the load_data method.")
 
-        # Ensure data is normalized
+        # Ensure data is normalized with the correct method
         if not self.adc_normalized:
-            raise ValueError("Data not normalized. Please normalize the data using normalize_adc_over_R0().")
+            raise ValueError("Data not normalized. Please normalize the data first.")
+
+        if self.normalize_type == 'MinMax --> 0-1' and normalize_by != '01':
+            raise ValueError("Data was normalized using MinMax [0,1], but 'over_R0' normalization was requested.")
+
+        if self.normalize_type == '(R - R₀) / R₀' and normalize_by != 'over_R0':
+            raise ValueError("Data was normalized using (R - R₀) / R₀, but '01' normalization was requested.")
 
         # Compute strain (ε) for experimental data
         self.data['Strain (ε)'] = (thick * 0.0254) * (self.data['Rotary Encoder'] * np.pi / 180) / (l_sam * 0.0254)
@@ -229,14 +241,24 @@ class bender_class:
         rho = 29.4 * 10 ** -8  # Electrical resistivity of galinstan
         eps_model = (thick * 0.0254) * theta / (l_sam * 0.0254)  # Strain (ε) for theoretical model
         dr_model = (rho * eps_model * (l_ch * 0.0254) * (8 - eps_model) /
-                    ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change
-        drrt_model = dr_model / res  # Normalized resistance change for model
+                    ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change ΔR
+
+        # Apply selected normalization method
+        if normalize_by == 'over_R0':
+            model_data = dr_model / res  # ΔR / R₀
+            y_label = 'Normalized ADC (ΔR / R₀)'
+        elif normalize_by == '01':
+            # Normalize theoretical model using MinMax scaling to [0,1]
+            model_data = (dr_model - dr_model.min()) / (dr_model.max() - dr_model.min())
+            y_label = 'Normalized ADC (0-1)'
+        else:
+            raise ValueError("Invalid normalization method. Choose '01' for MinMax scaling or 'over_R0' for ΔR / R₀.")
 
         # Interpolate the model to get predictions at the experimental strain values
-        f_interp = interp1d(eps_model, drrt_model, kind='linear', fill_value='extrapolate')
+        f_interp = interp1d(eps_model, model_data, kind='linear', fill_value='extrapolate')
         model_at_data = f_interp(self.data['Strain (ε)'])
 
-        # Compute the R2 value
+        # Compute the R² value
         ss_res = np.sum((self.data['ADC Value'] - model_at_data) ** 2)
         ss_tot = np.sum((self.data['ADC Value'] - np.mean(self.data['ADC Value'])) ** 2)
         r2 = 1 - (ss_res / ss_tot)
@@ -253,14 +275,14 @@ class bender_class:
             ax.plot(self.data['Strain (ε)'], self.data['ADC Value'], '.',
                     markersize=5, color=data_color, label=data_label)
 
-        # Plot theoretical model with the R2 value included in the legend label
-        ax.plot(eps_model, drrt_model, '--', color=model_color,
-                label=f"{model_label} (R2 = {r2:.3f})")
+        # Plot theoretical model with the R² value included in the legend label
+        ax.plot(eps_model, model_data, '--', color=model_color,
+                label=f"{model_label} (R² = {r2:.3f})")
 
         # Set labels and legend only if a new figure was created
         if ax.get_title() == '':
             ax.set_xlabel('Strain (ε)')
-            ax.set_ylabel('Normalized ADC (ΔR / R₀)')
+            ax.set_ylabel(y_label)
             ax.set_title('Experimental vs Theoretical Model')
         ax.legend()
 
