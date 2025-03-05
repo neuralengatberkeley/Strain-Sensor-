@@ -1,1 +1,3 @@
-path_to_repository = 'C:/Users/toppenheim/Desktop/UCSF/Preeya UCB/Strain-Sensor-/Strain-Sensor-'
+path_to_repository = 'C:/Users/toppe/OneDrive - CSU Maritime Academy/Documents/GitHub/Strain-Sensor-'
+
+

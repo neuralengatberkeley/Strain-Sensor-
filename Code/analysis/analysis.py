@@ -337,12 +337,22 @@ class bender_class:
             # Add this run's accuracy to the list
             self.all_accuracies.append(self.accuracy)
 
-    def plot_pairwise_min_angle_heatmap(self, df_results):
-        """
-        Generate a heatmap showing the minimum angle where accuracy reaches 100%
-        for each train-test dataset combination.
+    import matplotlib.pyplot as plt
+    import seaborn as sns
 
-        :param df_results: Pandas DataFrame with columns ["train_dataset", "test_dataset", "min_angle_100"]
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    def plot_pairwise_min_angle_heatmap(self, df_results, group_dict, group_colors, label):
+        """
+        Generate a heatmap with colored lines around defined groups.
+
+        Parameters:
+        - df_results: Pandas DataFrame with ["train_dataset", "test_dataset", "min_angle_100"]
+        - group_dict: Dictionary mapping dataset names to group labels
+                      Example: {"DS1": "Group 1", "DS2": "Group 1", "DS3": "Group 2", ...}
+        - group_colors: Dictionary mapping group labels to border colors
+                        Example: {"Group 1": "red", "Group 2": "blue", ...}
         """
         if df_results.empty:
             print("No results to display.")
@@ -351,20 +361,105 @@ class bender_class:
         # Convert results into a pivot table
         df_pivot = df_results.pivot(index="train_dataset", columns="test_dataset", values="min_angle_100")
 
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+
         # Plot heatmap
-        plt.figure(figsize=(10, 8))
-        ax = sns.heatmap(df_pivot, annot=True, cmap="coolwarm", fmt=".1f", linewidths=0.5, cbar=True)
+        sns.heatmap(df_pivot, cmap="coolwarm", linewidths=0.5, cbar=True, cbar_kws={'label': label},
+                    ax=ax)
 
-        # Add labels and title
-        plt.title("Pairwise Min Angle (Accuracy 100%) Heatmap")
-        plt.xlabel("Test Dataset")
-        plt.ylabel("Train Dataset")
+        # Get unique datasets in correct order
+        datasets = df_pivot.index.tolist()
 
-        # Show plot
+        # Identify group positions
+        group_positions = {}
+        for dataset, group in group_dict.items():
+            if group not in group_positions:
+                group_positions[group] = []
+            if dataset in datasets:
+                group_positions[group].append(datasets.index(dataset))
+
+        # Draw rectangles around groups
+        for group, indices in group_positions.items():
+            if len(indices) > 1:
+                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include the last dataset
+                color = group_colors.get(group, "black")  # Default to black if no color is specified
+
+                # Horizontal line (above the group)
+                ax.hlines(y=max_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
+                # Horizontal line (below the group)
+                ax.hlines(y=min_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
+                # Vertical line (left of the group)
+                ax.vlines(x=min_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
+                # Vertical line (right of the group)
+                ax.vlines(x=max_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
+
+        # Labels and title
+        ax.set_title("Pairwise Min Angle (Accuracy 100%) Heatmap with Group Outlines")
+        ax.set_xlabel("Test Dataset")
+        ax.set_ylabel("Train Dataset")
+
+        plt.show()
+
+    
+
+    def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
+        """
+        Generate a heatmap with colored lines around defined groups, using mean angular error.
+
+        Parameters:
+        - df_results: Pandas DataFrame with ["train_dataset", "test_dataset", "mean_error"]
+        - group_dict: Dictionary mapping dataset names to group labels
+                      Example: {"DS1": "Group 1", "DS2": "Group 1", "DS3": "Group 2", ...}
+        - group_colors: Dictionary mapping group labels to border colors
+                        Example: {"Group 1": "red", "Group 2": "blue", ...}
+        - label: Label for the color bar, typically "Mean Angular Error (deg)"
+        """
+        if df_results.empty:
+            print("No results to display.")
+            return
+
+        # Convert results into a pivot table
+        df_pivot = df_results.pivot(index="train_dataset", columns="test_dataset", values="mean_error")
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Plot heatmap
+        sns.heatmap(df_pivot, cmap="coolwarm", linewidths=0.5, cbar=True, cbar_kws={'label': label}, ax=ax)
+
+        # Get unique datasets in correct order
+        datasets = df_pivot.index.tolist()
+
+        # Identify group positions
+        group_positions = {}
+        for dataset, group in group_dict.items():
+            if group not in group_positions:
+                group_positions[group] = []
+            if dataset in datasets:
+                group_positions[group].append(datasets.index(dataset))
+
+        # Draw rectangles around groups
+        for group, indices in group_positions.items():
+            if len(indices) > 1:
+                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include the last dataset
+                color = group_colors.get(group, "black")  # Default to black if no color is specified
+
+                # Draw rectangle around the group
+                ax.plot([min_idx, max_idx, max_idx, min_idx, min_idx],
+                        [min_idx, min_idx, max_idx, max_idx, min_idx],
+                        color=color, linewidth=2)
+
+        # Labels and title
+        ax.set_title("Pairwise Mean Angular Error Heatmap with Group Outlines")
+        ax.set_xlabel("Test Dataset")
+        ax.set_ylabel("Train Dataset")
+
         plt.show()
 
     def fig_1_lin_vs_quad(self, perc_train=0.8, random_state=None,
-                          data_color='blue', lin_color='red', quad_color='green'):
+                          data_color='blue', lin_color='red', quad_color='green',
+                          data_label='Test Data', lin_label='Linear Fit', quad_label='Quadratic Fit'):
         """
         Plots test data from a single train/test split along with both a linear and a quadratic model fit,
         with Rotary Encoder angle on the x-axis and ADC Value on the y-axis.
@@ -418,11 +513,11 @@ class bender_class:
 
         # ---- Plotting ----
         fig, ax = plt.subplots(figsize=(8, 6))
-        ax.scatter(X_test, y_test, color=data_color, label='Test Data')
+        ax.scatter(X_test, y_test, color=data_color, label=data_label)
         ax.plot(x_range, y_range_linear, '--', color=lin_color,
-                label=f'Linear Fit (R² = {r2_linear:.3f})')
+                label=f'{lin_label} (R² = {r2_linear:.3f})')
         ax.plot(x_range, y_range_quad, '-.', color=quad_color,
-                label=f'Quadratic Fit (R² = {r2_quad:.3f})')
+                label=f'{quad_label} (R² = {r2_quad:.3f})')
 
         ax.set_xlabel('Rotary Encoder Angle')
         ax.set_ylabel('Normalized ADC \n %s' % self.normalize_type)  # state normalization type
@@ -683,8 +778,8 @@ class bender_class:
         # Show the plot
         plt.show()
 
-
-    def plot_box_plot(self, data_dict, group_dict, group_colors, group_names, alpha=0.5, jitter=0.2):
+    def plot_box_plot(self, data_dict, group_dict, group_colors, group_names,
+                      box_alpha=0.5, data_alpha=0.5, jitter=0.2):
         """
         Plot box plots for each sample but group them visually using custom group labels and colors.
 
@@ -693,7 +788,8 @@ class bender_class:
         - group_dict: A dictionary where keys are sample names and values are group labels.
         - group_colors: A list of colors corresponding to each group.
         - group_names: A list of custom group labels to display on the x-axis.
-        - alpha: Transparency level for individual data points (default=0.5).
+        - box_alpha: Transparency level for the box plots (default=0.5).
+        - data_alpha: Transparency level for individual data points (default=0.5).
         - jitter: Jitter amount for individual data points (default=0.2).
 
         The function plots each sample separately but assigns colors based on their groups.
@@ -724,15 +820,27 @@ class bender_class:
         # Create figure
         plt.figure(figsize=(12, 6))
 
-        # Box plot with separate samples but grouped by color
-        ax = sns.boxplot(x='Sample', y='Value', data=df, palette=[group_palette[group_dict[sample]] for sample in sample_order])
+        # Box plot with adjustable transparency
+        ax = sns.boxplot(
+            x='Sample', y='Value', data=df,
+            palette=[group_palette[group_dict[sample]] for sample in sample_order],
+            boxprops=dict(alpha=box_alpha),  # Set box transparency
+            medianprops=dict(alpha=box_alpha),
+            whiskerprops=dict(alpha=box_alpha),
+            capprops=dict(alpha=box_alpha),
+        )
 
-        # Add jittered individual data points **inside** each box plot
-        sns.stripplot(x='Sample', y='Value', data=df, hue='Group', palette=group_palette,
-                      jitter=jitter, alpha=alpha, dodge=False, size=4, edgecolor='w', linewidth=0.5)
+        # Add jittered individual data points with adjustable transparency
+        sns.stripplot(
+            x='Sample', y='Value', data=df, hue='Group', palette=group_palette,
+            jitter=jitter, alpha=data_alpha, dodge=False, size=4, edgecolor='w', linewidth=0.5
+        )
 
         # Modify x-axis to show **custom** group labels instead of sample labels
-        group_positions = [np.mean([sample_order.index(sample) for sample in df[df['Group'] == group]['Sample'].unique()]) for group in unique_groups]
+        group_positions = [
+            np.mean([sample_order.index(sample) for sample in df[df['Group'] == group]['Sample'].unique()])
+            for group in unique_groups
+        ]
         plt.xticks(group_positions, group_names, rotation=45, ha='right')  # Use custom group names
 
         # Remove legend (since x-axis already shows groups)
