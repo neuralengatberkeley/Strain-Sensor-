@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 0)
+  (lib (name "Adafruit MCP3421 ADC-eagle-import")(type "KiCad")(uri "${KIPRJMOD}/Adafruit MCP3421 ADC-eagle-import.kicad_sym")(options "")(descr ""))
+)

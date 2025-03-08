@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 0)
+  (lib (name "Adafruit Stemma QT 5 Port Hub-eagle-import")(type "KiCad")(uri "${KIPRJMOD}/Adafruit Stemma QT 5 Port Hub-eagle-import.kicad_sym")(options "")(descr ""))
+)
