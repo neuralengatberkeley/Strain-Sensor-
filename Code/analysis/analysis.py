@@ -337,61 +337,60 @@ class bender_class:
             # Add this run's accuracy to the list
             self.all_accuracies.append(self.accuracy)
 
-    import matplotlib.pyplot as plt
-    import seaborn as sns
 
-    import matplotlib.pyplot as plt
-    import seaborn as sns
 
     def plot_pairwise_min_angle_heatmap(self, df_results, group_dict, group_colors, label):
         """
-        Generate a heatmap with colored lines around defined groups.
+        Generate a heatmap with colored lines around defined groups, ensuring dataset order.
 
         Parameters:
         - df_results: Pandas DataFrame with ["train_dataset", "test_dataset", "min_angle_100"]
         - group_dict: Dictionary mapping dataset names to group labels
-                      Example: {"DS1": "Group 1", "DS2": "Group 1", "DS3": "Group 2", ...}
         - group_colors: Dictionary mapping group labels to border colors
-                        Example: {"Group 1": "red", "Group 2": "blue", ...}
         """
+
         if df_results.empty:
             print("No results to display.")
             return
 
-        # Convert results into a pivot table
+        # Extract dataset names and enforce numeric order
+        def extract_number(ds_name):
+            """ Extract the numeric part from DS names (e.g., 'DS10' -> 10) """
+            return int(ds_name[2:])  # Assuming 'DS' prefix, so we take the numeric part
+
+        # Get all unique dataset names and sort them
+        dataset_order = sorted(set(df_results["train_dataset"]).union(df_results["test_dataset"]), key=extract_number)
+
+        # Convert results into a pivot table, ensuring correct order
         df_pivot = df_results.pivot(index="train_dataset", columns="test_dataset", values="min_angle_100")
+        df_pivot = df_pivot.reindex(index=dataset_order, columns=dataset_order)
 
         # Create figure
         fig, ax = plt.subplots(figsize=(10, 8))
 
         # Plot heatmap
-        sns.heatmap(df_pivot, cmap="coolwarm", linewidths=0.5, cbar=True, cbar_kws={'label': label},
-                    ax=ax)
-
-        # Get unique datasets in correct order
-        datasets = df_pivot.index.tolist()
+        sns.heatmap(df_pivot, cmap="coolwarm", linewidths=0.5, cbar=True, cbar_kws={'label': label}, ax=ax)
 
         # Identify group positions
+        dataset_positions = {dataset: i for i, dataset in enumerate(dataset_order)}
+
         group_positions = {}
         for dataset, group in group_dict.items():
             if group not in group_positions:
                 group_positions[group] = []
-            if dataset in datasets:
-                group_positions[group].append(datasets.index(dataset))
+            if dataset in dataset_positions:
+                group_positions[group].append(dataset_positions[dataset])
 
         # Draw rectangles around groups
         for group, indices in group_positions.items():
             if len(indices) > 1:
-                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include the last dataset
+                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include last dataset
                 color = group_colors.get(group, "black")  # Default to black if no color is specified
 
-                # Horizontal line (above the group)
+                # Draw group boundary lines
                 ax.hlines(y=max_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
-                # Horizontal line (below the group)
                 ax.hlines(y=min_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
-                # Vertical line (left of the group)
                 ax.vlines(x=min_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
-                # Vertical line (right of the group)
                 ax.vlines(x=max_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
 
         # Labels and title
@@ -401,8 +400,6 @@ class bender_class:
 
         plt.show()
 
-    
-
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
         """
         Generate a heatmap with colored lines around defined groups, using mean angular error.
@@ -410,17 +407,24 @@ class bender_class:
         Parameters:
         - df_results: Pandas DataFrame with ["train_dataset", "test_dataset", "mean_error"]
         - group_dict: Dictionary mapping dataset names to group labels
-                      Example: {"DS1": "Group 1", "DS2": "Group 1", "DS3": "Group 2", ...}
         - group_colors: Dictionary mapping group labels to border colors
-                        Example: {"Group 1": "red", "Group 2": "blue", ...}
         - label: Label for the color bar, typically "Mean Angular Error (deg)"
         """
         if df_results.empty:
             print("No results to display.")
             return
 
-        # Convert results into a pivot table
+        # Extract dataset names and enforce numeric order
+        def extract_number(ds_name):
+            """ Extract the numeric part from DS names (e.g., 'DS10' -> 10) """
+            return int(ds_name[2:])  # Assuming 'DS' prefix, so we extract the numeric part
+
+        # Get all unique dataset names and sort them numerically
+        dataset_order = sorted(set(df_results["train_dataset"]).union(df_results["test_dataset"]), key=extract_number)
+
+        # Convert results into a pivot table, ensuring correct dataset order
         df_pivot = df_results.pivot(index="train_dataset", columns="test_dataset", values="mean_error")
+        df_pivot = df_pivot.reindex(index=dataset_order, columns=dataset_order)
 
         # Create figure
         fig, ax = plt.subplots(figsize=(10, 8))
@@ -428,27 +432,27 @@ class bender_class:
         # Plot heatmap
         sns.heatmap(df_pivot, cmap="coolwarm", linewidths=0.5, cbar=True, cbar_kws={'label': label}, ax=ax)
 
-        # Get unique datasets in correct order
-        datasets = df_pivot.index.tolist()
-
         # Identify group positions
+        dataset_positions = {dataset: i for i, dataset in enumerate(dataset_order)}
+
         group_positions = {}
         for dataset, group in group_dict.items():
             if group not in group_positions:
                 group_positions[group] = []
-            if dataset in datasets:
-                group_positions[group].append(datasets.index(dataset))
+            if dataset in dataset_positions:
+                group_positions[group].append(dataset_positions[dataset])
 
         # Draw rectangles around groups
         for group, indices in group_positions.items():
             if len(indices) > 1:
-                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include the last dataset
+                min_idx, max_idx = min(indices), max(indices) + 1  # Extend to include last dataset
                 color = group_colors.get(group, "black")  # Default to black if no color is specified
 
-                # Draw rectangle around the group
-                ax.plot([min_idx, max_idx, max_idx, min_idx, min_idx],
-                        [min_idx, min_idx, max_idx, max_idx, min_idx],
-                        color=color, linewidth=2)
+                # Draw group boundary lines
+                ax.hlines(y=max_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
+                ax.hlines(y=min_idx, xmin=min_idx, xmax=max_idx, colors=color, linewidth=2)
+                ax.vlines(x=min_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
+                ax.vlines(x=max_idx, ymin=min_idx, ymax=max_idx, colors=color, linewidth=2)
 
         # Labels and title
         ax.set_title("Pairwise Mean Angular Error Heatmap with Group Outlines")

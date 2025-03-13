@@ -59,7 +59,7 @@ def capture_images(camera):
 # Main script
 def main():
     # Connect to Arduino and camera
-    ser = serial.Serial(port='COM4', baudrate=115200)
+    ser = serial.Serial(port='COM3', baudrate=115200)
     camera = cv2.VideoCapture(0)
     time.sleep(2)
     ser.flush()

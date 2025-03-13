@@ -137,8 +137,8 @@ class ImagePointAnalyzer:
 
 
 # Example usage:
-image_folder = 'C:/Users/toppenheim/Desktop/UCSF/Preeya UCB/Strain-Sensor-/Code/python/dynamic_test_images'
-adc_csv_path = 'C:/Users/toppenheim/Desktop/UCSF/Preeya UCB/Strain-Sensor-/Code/python/Bending_data_20250109_092904_818.csv'  # Replace with the actual path
+image_folder = 'C:/Users/toppe/OneDrive - CSU Maritime Academy/Documents/GitHub/Strain-Sensor-/Code/python/dynamic_test_images'
+adc_csv_path = 'C:/Users/toppe/OneDrive - CSU Maritime Academy/Documents/GitHub/Strain-Sensor-/Code/python/Bending_data_20250313_132957_604.csv'  # Replace with the actual path
 output_csv_path = 'merged_data_with_angles_and_adc.csv'
 
 analyzer = ImagePointAnalyzer(image_folder)
