@@ -234,13 +234,22 @@ class bender_class:
             raise ValueError("Data was normalized using (R - R₀) / R₀, but '01' normalization was requested.")
 
         # Compute strain (ε) for experimental data
-        self.data['Strain (ε)'] = (thick * 0.0254) * (self.data['Rotary Encoder'] * np.pi / 180) / (l_sam * 0.0254)
+
+        ##### PK notes -- why are values multiplied by 0.0254 all the time? Conversion from inches to meters?
+        ##### PK notes -- Since strain is unitless can we just use inches? 
+        #self.data['Strain (ε)'] = (thick * 0.0254) * (self.data['Rotary Encoder'] * np.pi / 180) / (l_sam * 0.0254)
+        self.data['Strain (ε)'] = (thick) * (self.data['Rotary Encoder'] * np.pi / 180) / (l_sam)
 
         # Prepare theoretical model data
         theta = np.arange(0, np.pi / 2 + 0.1, 0.1)  # Include up to 90 degrees
         rho = 29.4 * 10 ** -8  # Electrical resistivity of galinstan
-        eps_model = (thick * 0.0254) * theta / (l_sam * 0.0254)  # Strain (ε) for theoretical model
-        dr_model = (rho * eps_model * (l_ch * 0.0254) * (8 - eps_model) /
+        eps_model = (thick) * theta / (l_sam)  # Strain (ε) for theoretical model
+
+        ### PK notes -- here looks like  you need the inches_to_meters: 
+        inches_to_meters = 0.0254
+
+        ### PK notes -- What is this 0.000645 value? Can this be defined? 
+        dr_model = (rho * eps_model * (l_ch * inches_to_meters) * (8 - eps_model) /
                     ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change ΔR
 
         # Apply selected normalization method
@@ -259,9 +268,10 @@ class bender_class:
         model_at_data = f_interp(self.data['Strain (ε)'])
 
         # Compute the R² value
+        # This is an R2 for how well the model fits the data 
         ss_res = np.sum((self.data['ADC Value'] - model_at_data) ** 2)
         ss_tot = np.sum((self.data['ADC Value'] - np.mean(self.data['ADC Value'])) ** 2)
-        r2 = 1 - (ss_res / ss_tot)
+        r2_model2data = 1 - (ss_res / ss_tot)
 
         # Create new plot or add to existing one
         if ax is None:
@@ -277,7 +287,7 @@ class bender_class:
 
         # Plot theoretical model with the R² value included in the legend label
         ax.plot(eps_model, model_data, '--', color=model_color,
-                label=f"{model_label} (R² = {r2:.3f})")
+                label=f"{model_label} (R² = {r2_model2data:.3f})")
 
         # Set labels and legend only if a new figure was created
         if ax.get_title() == '':
@@ -302,8 +312,12 @@ class bender_class:
 
         self.accuracy_angle = np.arange(1, 16) # accuracy tested up to 15 deg
         self.accuracy = np.zeros((niter, len(self.accuracy_angle)))
+        self.abs_angular_error = {}; 
 
         for i in range(niter): 
+            # Set up self.abs_angular_error = {}; 
+            self.abs_angular_error[i] = []; 
+            
             # Cross-validation (train: 80%, test: 20%)
             # Shuffle -- don't want to be biased based on time 
             dataTrain, dataTest = train_test_split(self.data, test_size= 1.0 - perc_train, shuffle=True) 
@@ -333,9 +347,13 @@ class bender_class:
 
             for j, angle_accuracy in enumerate(self.accuracy_angle):
                 self.accuracy[i, j] = self.accuracy_by_angle(Y_test, Y_pred, angle_accuracy)
+                self.abs_angular_error[i].append(np.abs(Y_test - Y_pred))   
 
-            # Add this run's accuracy to the list
-            self.all_accuracies.append(self.accuracy)
+        # Add this run's accuracy to the list
+        # PK-notes -- this should be outside the loop. row i in self.accuracy gets updated every run 
+        # IF this gets appended to self.all_accuracies each run then there will be many rows of zeros in 
+        # self.all_accuracies. 
+        self.all_accuracies.append(self.accuracy)
 
 
 
@@ -905,7 +923,7 @@ class bender_class:
         if accuracy_matrix is None:
             if not hasattr(self, 'accuracy') or self.accuracy is None:
                 raise ValueError("Accuracy has not been computed. Please run train_model_test_accuracy first.")
-            accuracy_matrix = self.accuracy  # Default to self.accuracy
+            accuracy_matrix = self.accuracy  # Default to self.accuracy: niter x nangles
 
         # Compute mean accuracy across runs
         mean_accuracy = np.mean(accuracy_matrix, axis=0)
