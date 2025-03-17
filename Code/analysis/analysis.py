@@ -632,7 +632,11 @@ class bender_class:
 
         for i in range(num_splits):
             # Define held-out and training indices
-            test_indices = indices[i * split_size:(i + 1) * split_size]
+            if i < (num_splits - 1): 
+                test_indices = indices[i * split_size:(i + 1) * split_size]
+            else: 
+                test_indices = indices[i * split_size:]  # Use the remaining data points for the last split
+
             train_indices = np.setdiff1d(indices, test_indices)
 
             # Split data
@@ -928,18 +932,28 @@ class bender_class:
         # Compute mean accuracy across runs
         mean_accuracy = np.mean(accuracy_matrix, axis=0)
 
+        # Also report list of all accuracies: 
+        all_min_angle_100 = []
+        for i in range(accuracy_matrix.shape[0]):
+            ix_tmp = np.where(accuracy_matrix[i, :] == 100)[0] 
+            if len(ix_tmp) > 0: 
+                all_min_angle_100.append(self.accuracy_angle[ix_tmp[0]]) # lowest value
+            else: 
+                pass
+
         # Find the first occurrence where accuracy reaches > 99%
         indices_100 = np.where(mean_accuracy == 100)[0]
 
         if len(indices_100) == 0:
             print("No angle threshold reaches 100% accuracy.")
-            return None, None
+            return None, []
 
         # Get the smallest angle threshold where accuracy is 100%
         min_angle_100 = self.accuracy_angle[indices_100[0]]
         accuracy_value = mean_accuracy[indices_100[0]]
+        assert(accuracy_value == 100) # by definition this has to be 100
 
-        return min_angle_100, accuracy_value
+        return min_angle_100, all_min_angle_100
 
 
     def plot_bar_chart(self, data, labels, title, ylabel, colors, ylim=None):
@@ -968,9 +982,14 @@ class bender_class:
 
             # Plot bars for this group, slightly offset from center position
             for j, (val, offset) in enumerate(zip(group_values, x_offsets)):
-                plt.bar(x_positions[i] + offset, val, width=bar_width, color=color,
+                print(type(val))
+                if type(val) is float: 
+                    plt.bar(x_positions[i] + offset, val, width=bar_width, color=color,
                         label=f"Sample {j + 1}" if i == 0 else "")
-
+                elif type(val) is list:
+                    plt.bar(x_positions[i] + offset, np.mean(np.array(val)), width=bar_width, color=color,
+                        label=f"Sample {j + 1}" if i == 0 else "", yerr=np.std(np.array(val)), capsize=5, error_kw={'elinewidth': 1.5})
+                    
         # Set x-ticks to group labels
         plt.xticks(x_positions, labels)
         plt.ylabel(ylabel)
