@@ -600,8 +600,7 @@ class bender_class:
         # Show the updated plot
         plt.show()
 
-    from sklearn.metrics import mean_squared_error
-    import numpy as np
+
 
     def cross_validation_angular_error(self):
         """
@@ -670,6 +669,7 @@ class bender_class:
 
 
         return mean_error, std_error, predictions_df
+
 
 
 
@@ -1087,7 +1087,6 @@ class bender_class:
 
         # Concatenate all accuracy arrays
         all_accuracies_combined = np.vstack(self.all_accuracies)  # Shape: (runs * niter, len(accuracy_angle))
-        print(len(all_accuracies_combined))
 
         # Calculate mean and standard deviation
         mean_accuracy = np.mean(all_accuracies_combined, axis=0)
