@@ -312,12 +312,10 @@ class bender_class:
 
         self.accuracy_angle = np.arange(1, 16) # accuracy tested up to 15 deg
         self.accuracy = np.zeros((niter, len(self.accuracy_angle)))
-        self.abs_angular_error = {}; 
+        self.abs_angular_error = []; 
 
         for i in range(niter): 
-            # Set up self.abs_angular_error = {}; 
-            self.abs_angular_error[i] = []; 
-            
+                        
             # Cross-validation (train: 80%, test: 20%)
             # Shuffle -- don't want to be biased based on time 
             dataTrain, dataTest = train_test_split(self.data, test_size= 1.0 - perc_train, shuffle=True) 
@@ -344,10 +342,12 @@ class bender_class:
             Y_test = dataTest['Rotary Encoder'].values  # Rotary Encoder angles
             
             Y_pred = self.model.predict(X_test)
+            self.abs_angular_error.append(np.abs(Y_test - Y_pred)) 
 
             for j, angle_accuracy in enumerate(self.accuracy_angle):
                 self.accuracy[i, j] = self.accuracy_by_angle(Y_test, Y_pred, angle_accuracy)
-                self.abs_angular_error[i].append(np.abs(Y_test - Y_pred))   
+            
+              
 
         # Add this run's accuracy to the list
         # PK-notes -- this should be outside the loop. row i in self.accuracy gets updated every run 
@@ -1074,7 +1074,9 @@ class bender_class:
         for j, angle_accuracy in enumerate(self.accuracy_angle):
             accuracy[j] = self.accuracy_by_angle(y_new, y_pred_new, angle_accuracy)
 
-        return accuracy
+        abs_error = np.abs(y_new - y_pred_new)
+
+        return accuracy, abs_error
 
     def plot_combined_accuracy(self, title='Combined Accuracy vs Angle'):
         """
