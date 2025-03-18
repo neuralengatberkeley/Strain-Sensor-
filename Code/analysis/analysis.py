@@ -854,6 +854,7 @@ class bender_class:
             medianprops=dict(alpha=box_alpha),
             whiskerprops=dict(alpha=box_alpha),
             capprops=dict(alpha=box_alpha),
+            flierprops=dict(marker='')  # Remove outlier markers
         )
 
         # Add jittered individual data points with adjustable transparency
