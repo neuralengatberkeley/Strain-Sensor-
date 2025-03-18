@@ -13,15 +13,15 @@ or (2) Wheatstone Bridge Circuit (https://www.adafruit.com/product/4538)
 
 // The following libraries are or were used 
 
-#include <Adafruit_DS3502.h>  // Digital Potentiometer Library no longer used
+//#include <Adafruit_DS3502.h>  // Digital Potentiometer Library no longer used
 #include <Servo.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
-#include <Adafruit_INA219.h>  // Current Sensor Library no longer used
+//#include <Adafruit_INA219.h>  // Current Sensor Library no longer used
 #include "Adafruit_MCP3421.h"
-#include <Adafruit_NAU7802.h>
+//#include <Adafruit_NAU7802.h>
 
 //Adafruit_NAU7802 nau;  // 24 bit ADC object created for wheatstone bridge circuit
 Adafruit_MCP3421 mcp;  // 14 bit ADC object created for voltage divider circuit
