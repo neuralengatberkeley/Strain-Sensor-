@@ -62,7 +62,7 @@ df.columns = ['Theoretical Angle (deg)', 'IMU Angle (deg)', 'ADC Value', 'Rotary
 #df.replace([np.inf, -np.inf], np.nan, inplace=True)
 #df.dropna(how="all", inplace=True)
 
-df.to_csv('Bending_data_abs_1p758_retest_v4_3_18_25.csv', index=False)
+df.to_csv('Bending_data_abs_1p987_retest_v3_3_20_25.csv', index=False)
 print(df)
 
 
