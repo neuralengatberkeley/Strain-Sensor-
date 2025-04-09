@@ -159,8 +159,19 @@ class bender_class:
         if self.adc_normalized:
             raise ValueError("ADC data already normalized.")
 
-        # Use the first ADC value as R₀
+        # Use min abs (ADC) value as R₀
+        #R0 = self.data['ADC Value'].iloc[0]
+        # Step 1: Check for negative values and shift if needed
+        min_val = self.data['ADC Value'].min()
+
+        if min_val < 0:
+            self.data['ADC Value'] = self.data['ADC Value'] - min_val
+        else:
+            shift_note = ""
+
+        # Step 2: Normalize using the first (possibly shifted) value as R₀
         R0 = self.data['ADC Value'].iloc[0]
+
 
         # Ensure R₀ is not zero to avoid division errors
         if R0 == 0:

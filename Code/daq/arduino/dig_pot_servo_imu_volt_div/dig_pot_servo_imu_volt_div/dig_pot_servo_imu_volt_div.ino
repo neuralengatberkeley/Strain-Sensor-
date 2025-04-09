@@ -84,7 +84,7 @@ The following greyed out code is for the 14 bit adc used for the voltage divider
   }
 
    // Options: GAIN_1X, GAIN_2X, GAIN_4X, GAIN_8X
-  mcp.setGain(GAIN_8X);
+  mcp.setGain(GAIN_2X);
   Serial.print("Gain set to: ");
   switch (mcp.getGain()) {
     case GAIN_1X: Serial.println("1X"); break;
