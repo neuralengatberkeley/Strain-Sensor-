@@ -321,7 +321,7 @@ class bender_class:
         if self.adc_normalized == False:
             raise ValueError("ADC data not normalized. Please normalize data first.")
 
-        self.accuracy_angle = np.arange(1, 16) # accuracy tested up to 15 deg
+        self.accuracy_angle = np.arange(1, 16, 0.2) # accuracy tested up to 15 deg
         self.accuracy = np.zeros((niter, len(self.accuracy_angle)))
         self.abs_angular_error = []; 
 
@@ -947,7 +947,7 @@ class bender_class:
         # Also report list of all accuracies: 
         all_min_angle_100 = []
         for i in range(accuracy_matrix.shape[0]):
-            ix_tmp = np.where(accuracy_matrix[i, :] == 100)[0] 
+            ix_tmp = np.where(accuracy_matrix[i, :] == 100)[0]
             if len(ix_tmp) > 0: 
                 all_min_angle_100.append(self.accuracy_angle[ix_tmp[0]]) # lowest value
             else: 

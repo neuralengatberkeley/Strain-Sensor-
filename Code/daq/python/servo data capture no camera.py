@@ -7,6 +7,23 @@ from sklearn.metrics import mean_squared_error
 import numpy as np
 import matplotlib.pyplot as plt  # To visualize
 import cv2
+import os
+from datetime import datetime
+
+import sys
+
+# Get absolute path to Code/analysis/
+analysis_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "analysis"))
+
+# Add analysis folder to sys.path
+if analysis_path not in sys.path:
+    sys.path.insert(0, analysis_path)
+
+# Now you can import both modules directly from that folder
+from analysis import bender_class
+from config import path_to_repository
+
+from sklearn.model_selection import train_test_split
 
 # save data using pickle: https://www.geeksforgeeks.org/how-to-use-pickle-to-save-and-load-variables-in-python/
 
@@ -62,7 +79,46 @@ df.columns = ['Theoretical Angle (deg)', 'IMU Angle (deg)', 'ADC Value', 'Rotary
 #df.replace([np.inf, -np.inf], np.nan, inplace=True)
 #df.dropna(how="all", inplace=True)
 
-df.to_csv('Bending_data_abs_2p25_gains_2xp75x_gain_v5_4_9_25_1k_1uF_0p1uF.csv', index=False)
-print(df)
+######################################################################
 
 
+sample_length = "1.86"         # or similar
+testing_type = "static"         # or similar
+version = "v1"
+
+# --- AUTOMATED SAVE SECTION ---
+
+# Format today's date as 'month_day_year'
+today = datetime.today()
+today_str = f"{today.month}_{today.day}_{today.strftime('%y')}"
+
+# Define base directory and folder path
+# Absolute path to this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Path to csv_data folder (assumed to be alongside the Code/ folder)
+csv_data_dir = os.path.abspath(os.path.join(script_dir, "..", "csv_data"))
+
+# Full folder path for today’s date
+folder_path = os.path.join(csv_data_dir, today_str)
+
+# Create folder if it doesn't exist
+os.makedirs(folder_path, exist_ok=True)
+
+# Create filename (no timestamp)
+filename = f"{sample_length}_{testing_type}_{version}_{today_str}.csv"
+full_path = os.path.join(folder_path, filename)
+
+# Save the DataFrame
+df.to_csv(full_path, index=False)
+print(f"Data saved to: {full_path}")
+
+
+#  Plotting normalized data delta R over Ro vs bend angle
+
+g = bender_class()
+g.load_data(full_path)
+g.normalize_adc_over_R0()
+g.plot_data(scatter=True)
+
+plt.show()  # ← This forces the plot to appear
