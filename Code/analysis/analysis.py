@@ -310,60 +310,52 @@ class bender_class:
         # Return the axes object to allow further plotting
         return ax
 
-    def train_model_test_accuracy(self, perc_train=0.8, niter = 10):
+    def train_model_test_accuracy(self, perc_train=0.8, niter=10, degree=1):
         """
-        class method that trains a linear model to predict rotary encoder angles from normalized ADC values
+        Trains a polynomial model (linear by default) to predict rotary encoder angles
+        from normalized ADC values.
+
+        Parameters:
+        - perc_train: float (0–1), percent of data used for training
+        - niter: number of train/test iterations
+        - degree: degree of the polynomial fit (1=linear, 2=quadratic, etc.)
         """
 
         if self.data is None:
             raise ValueError("Data not available. Please read the data first.")
-        
-        if self.adc_normalized == False:
+
+        if not self.adc_normalized:
             raise ValueError("ADC data not normalized. Please normalize data first.")
 
-        self.accuracy_angle = np.arange(1, 16, 0.2) # accuracy tested up to 15 deg
+        self.accuracy_angle = np.arange(1, 16, 0.2)  # accuracy tested up to 15 deg
         self.accuracy = np.zeros((niter, len(self.accuracy_angle)))
-        self.abs_angular_error = []; 
+        self.abs_angular_error = []
 
-        for i in range(niter): 
-                        
-            # Cross-validation (train: 80%, test: 20%)
-            # Shuffle -- don't want to be biased based on time 
-            dataTrain, dataTest = train_test_split(self.data, test_size= 1.0 - perc_train, shuffle=True) 
+        self.poly = PolynomialFeatures(degree=degree, include_bias=True)
 
-            # X_train: normalized ADC values
-            X_train = dataTrain['ADC Value'].values.reshape(-1, 1) # ADC values
-            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add a column of ones for the intercept term
-            y_train = dataTrain['Rotary Encoder'].values  # Rotary Encoder angles
+        for i in range(niter):
+            # Cross-validation
+            dataTrain, dataTest = train_test_split(self.data, test_size=1.0 - perc_train, shuffle=True)
 
-            # Fit a polynomial of degree X to the training data
-            #poly_features = PolynomialFeatures(degree=1)  # degree of 1 corresponds to linear fit, 2 would be quadratic
-            #X_train = -1 * dataTrain.iloc[:, 2].values.reshape(-1, 1)  # Reshapes the 1D array into a 2D array with one...
-            # column and as many rows as needed for compatibility with sklearn functions
-            #y_train = dataTrain.iloc[:, 3].values  # Converts Pandas Series to a NumPy array
-            #X_train_poly = poly_features.fit_transform(X_train)
+            # Extract and transform training data
+            X_train_raw = dataTrain['ADC Value'].values.reshape(-1, 1)
+            X_train = self.poly.fit_transform(X_train_raw)
+            y_train = dataTrain['Rotary Encoder'].values
 
             self.model = LinearRegression()
             self.model.fit(X_train, y_train)
-            #self.poly_features = poly_features  # Store the polynomial features
 
-            # Predicting using the test set
-            X_test = dataTest['ADC Value'].values.reshape(-1, 1)  # Normalized ADC values
-            X_test = np.hstack((X_test, np.ones(X_test.shape)))  # Add a column of ones for the intercept term
-            Y_test = dataTest['Rotary Encoder'].values  # Rotary Encoder angles
-            
+            # Predict using test data
+            X_test_raw = dataTest['ADC Value'].values.reshape(-1, 1)
+            X_test = self.poly.transform(X_test_raw)
+            Y_test = dataTest['Rotary Encoder'].values
             Y_pred = self.model.predict(X_test)
-            self.abs_angular_error.append(np.abs(Y_test - Y_pred)) 
+
+            self.abs_angular_error.append(np.abs(Y_test - Y_pred))
 
             for j, angle_accuracy in enumerate(self.accuracy_angle):
                 self.accuracy[i, j] = self.accuracy_by_angle(Y_test, Y_pred, angle_accuracy)
-            
-              
 
-        # Add this run's accuracy to the list
-        # PK-notes -- this should be outside the loop. row i in self.accuracy gets updated every run 
-        # IF this gets appended to self.all_accuracies each run then there will be many rows of zeros in 
-        # self.all_accuracies. 
         self.all_accuracies.append(self.accuracy)
 
 
@@ -611,18 +603,18 @@ class bender_class:
         # Show the updated plot
         plt.show()
 
-
-
-    def cross_validation_angular_error(self):
+    def cross_validation_angular_error(self, degree=1):
         """
-        Performs 10-fold cross-validation by splitting the data into 10 parts.
+        Performs 10-fold cross-validation using polynomial regression of specified degree.
         - Each fold uses 9/10 of the data for training and 1/10 for testing.
-        - Predicts angles for the held-out data points.
-        - Computes the mean and standard deviation of the angular error across all folds.
+        - Computes the mean and standard deviation of the angular error.
+
+        Args:
+            degree (int): Degree of the polynomial for fitting (1=linear, 2=quadratic, etc.)
 
         Returns:
-            mean_error (float): Mean of the absolute angular errors.
-            std_error (float): Standard deviation of the angular errors.
+            mean_error (float): Mean of absolute angular errors.
+            std_error (float): Standard deviation of angular errors.
             predictions_df (pd.DataFrame): DataFrame with actual and predicted angles.
         """
 
@@ -632,56 +624,48 @@ class bender_class:
         if not self.adc_normalized:
             raise ValueError("ADC data is not normalized. Please normalize it first.")
 
+        from sklearn.linear_model import LinearRegression
+        from sklearn.preprocessing import PolynomialFeatures
+        from sklearn.pipeline import make_pipeline
+
         N = len(self.data)
         num_splits = 10
         indices = np.arange(N)
-        np.random.shuffle(indices)  # Shuffle the indices for randomness
-        split_size = N // num_splits  # Number of data points per split
+        np.random.shuffle(indices)
+        split_size = N // num_splits
 
-        all_predictions = np.zeros(N)  # Store predictions for each data point
-        all_errors = np.zeros(N)  # Store errors
+        all_predictions = np.zeros(N)
+        all_errors = np.zeros(N)
 
         for i in range(num_splits):
-            # Define held-out and training indices
-            if i < (num_splits - 1): 
+            if i < (num_splits - 1):
                 test_indices = indices[i * split_size:(i + 1) * split_size]
-            else: 
-                test_indices = indices[i * split_size:]  # Use the remaining data points for the last split
+            else:
+                test_indices = indices[i * split_size:]
 
             train_indices = np.setdiff1d(indices, test_indices)
 
-            # Split data
             train_data = self.data.iloc[train_indices]
             test_data = self.data.iloc[test_indices]
 
-            # Prepare training and testing inputs
             X_train = train_data['ADC Value'].values.reshape(-1, 1)
-            X_train = np.hstack((X_train, np.ones(X_train.shape)))  # Add intercept term
             y_train = train_data['Rotary Encoder'].values
-
             X_test = test_data['ADC Value'].values.reshape(-1, 1)
-            X_test = np.hstack((X_test, np.ones(X_test.shape)))  # Add intercept term
 
-            # Train model
-            model = LinearRegression()
+            # Polynomial model of given degree
+            model = make_pipeline(PolynomialFeatures(degree=degree), LinearRegression())
             model.fit(X_train, y_train)
-
-            # Predict for the held-out data
             y_pred = model.predict(X_test)
 
-            # Store predictions and errors
             all_predictions[test_indices] = y_pred
             all_errors[test_indices] = np.abs(y_pred - test_data['Rotary Encoder'].values)
 
-        # Compute mean and std of the angular error
         mean_error = np.mean(all_errors)
         std_error = np.std(all_errors)
 
-        # Create DataFrame with actual and predicted values
         predictions_df = self.data.copy()
         predictions_df['Predicted Angle'] = all_predictions
         predictions_df['Absolute Error'] = all_errors
-
 
         return mean_error, std_error, predictions_df
 
@@ -1092,8 +1076,12 @@ class bender_class:
             raise Exception("Model has not been trained yet. Please run the train_test method first.")
         
         # Prepare new data for prediction
-        X_new = new_data_df['ADC Value'].values.reshape(-1, 1) #-1 * new_data.iloc[:, 2].values.reshape(-1, 1)  # Assuming the same structure
-        X_new = np.hstack((X_new, np.ones((X_new.shape[0], 1))))
+        #X_new = new_data_df['ADC Value'].values.reshape(-1, 1) #-1 * new_data.iloc[:, 2].values.reshape(-1, 1)  # Assuming the same structure
+        #X_new = np.hstack((X_new, np.ones((X_new.shape[0], 1))))
+
+        # Prepare new data for prediction using the same transformation
+        X_new_raw = new_data_df['ADC Value'].values.reshape(-1, 1)
+        X_new = self.poly.transform(X_new_raw)
         y_new = new_data_df['Rotary Encoder'].values  # Assuming the same structure
 
         # Predict using the trained model
