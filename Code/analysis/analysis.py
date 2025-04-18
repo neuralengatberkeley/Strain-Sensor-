@@ -869,9 +869,11 @@ class bender_class:
         plt.legend([], [], frameon=False)
 
         # Improve layout
+
         plt.xlabel('Group')
         plt.ylabel('Absolute Angular Error (deg)')
         plt.title('Box Plot of Absolute Errors by Group')
+        plt.ylim(0, 7)  # Change the range as needed
 
         plt.show()
 
