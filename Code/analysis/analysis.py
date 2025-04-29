@@ -185,6 +185,28 @@ class bender_class:
         self.normalize_type = '(R - R₀) / R₀'
         print(f"ADC normalized with initial value R₀: {R0}")
 
+    def normalize_adc_over_largest(self, desired_max=None):
+        """
+        Normalize ADC values to largest (R - R₀) / R₀ value in all datasets
+
+        """
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first.")
+
+        if self.adc_normalized:
+            raise ValueError("ADC data already normalized.")
+
+        # Normalize the ADC values to max value
+        self.normalize_adc_over_R0()
+        print(self.data['ADC Value'].max())
+        self.data['ADC Value'] = self.data['ADC Value'].abs()
+        max_value = self.data['ADC Value'].max()
+        self.data['ADC Value'] =  self.data['ADC Value'] * desired_max / max_value
+
+        # Mark as normalized
+        self.adc_normalized = True
+        self.normalize_type = '0 to max (R - R₀) / R₀'
+
     def plot_data(self, scatter=False, title=''):
         """
         method to plot normalized ADC values vs Rotary Encoder angles (blue dots)
