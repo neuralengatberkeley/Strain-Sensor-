@@ -443,6 +443,104 @@ class bender_class:
 
         plt.show()
 
+    def plot_compact_pairwise_comparison(self, pairwise_min_accuracy, pairwise_abs_error,
+                                         xlabel_flat, group_size=3,
+                                         title1='Min Angle for 100% Accuracy',
+                                         title2='Mean Absolute Error', ylim=(0, 15)):
+        """
+        Compact overlayed double-bar plot showing:
+        - Blue = model trained/tested on same sample (self-trained)
+        - Red = model trained on first sample in group, tested on others (cross-trained)
+
+        Parameters:
+        - pairwise_min_accuracy (np.array): Matrix of min angle for 100% accuracy
+        - pairwise_abs_error (np.array): Matrix of mean absolute errors
+        - xlabel_flat (list): List of sample labels corresponding to DS_flat
+        - group_size (int): Number of samples per group
+        - title1 (str): Title for top subplot
+        - title2 (str): Title for bottom subplot
+        - ylim (tuple): Y-axis limits for both plots (e.g., (0, 15))
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        assert pairwise_min_accuracy.shape[0] == len(xlabel_flat)
+        assert pairwise_min_accuracy.shape[0] % group_size == 0
+
+        num_groups = pairwise_min_accuracy.shape[0] // group_size
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        bar_width = 0.6
+        inner_width = 0.4  # width for the red overlaid bar
+        x_all = []
+
+        for group_idx in range(num_groups):
+            base_idx = group_idx * group_size
+            x_group = np.arange(group_size) + group_idx * (group_size + 1.0)
+            x_all.extend(x_group)
+
+            min_self = []
+            min_cross = []
+            err_self = []
+            err_cross = []
+
+            for i in range(group_size):
+                idx = base_idx + i
+                min_self.append(pairwise_min_accuracy[idx, idx])
+                err_self.append(pairwise_abs_error[idx, idx])
+
+                # Cross-trained using first sample in group
+                cross_idx = base_idx
+                if idx != cross_idx:
+                    min_cross.append(pairwise_min_accuracy[cross_idx, idx])
+                    err_cross.append(pairwise_abs_error[cross_idx, idx])
+                else:
+                    min_cross.append(np.nan)  # skip duplicate
+                    err_cross.append(np.nan)
+
+            # --- Plot Top Subplot: Min Angle ---
+            axes[0].bar(x_group, min_self, width=bar_width, color='blue',
+                        label='Self-trained' if group_idx == 0 else "")
+            axes[0].bar(x_group, min_cross, width=inner_width, color='red', alpha=0.7,
+                        label='Cross-trained (model 1)' if group_idx == 0 else "")
+
+            # --- Plot Bottom Subplot: Mean Error ---
+            axes[1].bar(x_group, err_self, width=bar_width, color='blue')
+            axes[1].bar(x_group, err_cross, width=inner_width, color='red', alpha=0.7)
+
+        # --- Format Top Subplot ---
+        axes[0].set_ylabel('Min Angle (deg)')
+        axes[0].set_ylim(ylim)
+        axes[0].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
+        axes[0].set_title(title1)
+        axes[0].legend()
+        axes[0].grid(True, linestyle='--', alpha=0.5)
+
+        # --- Format Bottom Subplot ---
+        axes[1].set_ylabel('Mean Error (deg)')
+        axes[1].set_xlabel('Sample')
+        axes[1].set_ylim(ylim)
+        axes[1].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
+        axes[1].set_title(title2)
+        axes[1].grid(True, linestyle='--', alpha=0.5)
+
+        # --- Annotated X-Axis Labels ---
+        xtick_labels = []
+        for group_idx in range(num_groups):
+            base_idx = group_idx * group_size
+            for i in range(group_size):
+                idx = base_idx + i
+                label = xlabel_flat[idx]
+                if i == 0:
+                    label += " (model 1)"
+                xtick_labels.append(label)
+
+        axes[1].set_xticks(x_all)
+        axes[1].set_xticklabels(xtick_labels, rotation=45, ha='right')
+
+        plt.tight_layout()
+        plt.show()
+
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
         """
         Generate a heatmap with colored lines around defined groups, using mean angular error.
