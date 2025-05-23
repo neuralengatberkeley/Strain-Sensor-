@@ -238,7 +238,7 @@ class bender_class:
         self.data_ax = ax; 
         self.data_fig = f
 
-    def plot_mech_model_data(self, thick, l_ch, l_sam, area, res, scatter=False,
+    def plot_mech_model_data(self, Gain, LSB, thick, l_ch, l_sam, area, res, scatter=False,
                              data_color='blue', model_color='green',
                              data_label='Experimental Data', model_label='Theoretical Model',
                              normalize_by='over_R0', ax=None):
@@ -281,9 +281,10 @@ class bender_class:
         ### PK notes -- here looks like  you need the inches_to_meters: 
         inches_to_meters = 0.0254
 
-        ### PK notes -- What is this 0.000645 value? Can this be defined? 
-        dr_model = (rho * eps_model * (l_ch * inches_to_meters) * (8 - eps_model) /
-                    ((area * 0.000645) * (2 - eps_model) ** 2))  # Resistance change ΔR
+        ### PK notes -- What is this 0.000645 value? Can this be defined?
+        # Convert area from in² to m² using 1 in² = 0.000645 m²
+        dr_model = (Gain) * (rho * eps_model * (l_ch * inches_to_meters) * (8 - eps_model) /
+                    ((area * 0.000645) * (2 - eps_model) ** 2))   # Resistance change ΔR
 
         # Apply selected normalization method
         if normalize_by == 'over_R0':
