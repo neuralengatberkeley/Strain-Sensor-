@@ -289,7 +289,7 @@ class bender_class:
         # Apply selected normalization method
         if normalize_by == 'over_R0':
             model_data = dr_model / res  # ΔR / R₀
-            y_label = 'Normalized ADC (ΔR / R₀)'
+            y_label = r'Normalized ADC $(\Delta R / R_{0})$'
         elif normalize_by == '01':
             # Normalize theoretical model using MinMax scaling to [0,1]
             model_data = (dr_model - dr_model.min()) / (dr_model.max() - dr_model.min())
@@ -328,7 +328,7 @@ class bender_class:
             ax.set_xlabel('Strain (ε)')
             ax.set_ylabel(y_label)
             ax.set_title('Experimental vs Theoretical Model')
-        ax.legend()
+        ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5))
 
         # Return the axes object to allow further plotting
         return ax
