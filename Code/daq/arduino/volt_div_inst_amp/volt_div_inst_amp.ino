@@ -17,8 +17,8 @@ void setup(void)
   // ads.setGain(GAIN_ONE);        // 1x gain   +/- 4.096V  1 bit = 2mV      0.125mV
   // ads.setGain(GAIN_TWO);        // 2x gain   +/- 2.048V  1 bit = 1mV      0.0625mV
   // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
-  ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
-  //ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
+  //ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
+  ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
 
   if (!ads.begin(0x48)) {
     Serial.println("Failed to initialize ADS.");
@@ -37,8 +37,8 @@ void loop(void)
   volts0 = ads.computeVolts(adc0);
 
 
-Serial.print(adc0); Serial.print('\t'); Serial.print(volts0); Serial.println("V");
+Serial.print(adc0); Serial.print("\t"); Serial.print(volts0,4); Serial.println("V");
 
 
-  delay(200);
+  delayMicroseconds(6000);  // 3.33 ms
 }
