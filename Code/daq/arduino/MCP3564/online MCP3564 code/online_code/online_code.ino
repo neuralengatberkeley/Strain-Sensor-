@@ -2,8 +2,8 @@
 
 #define SPI_CS_PIN 10  // Chip select for MCP3564
 
-#define VREF 2.048      // External voltage reference connected to VREF+
-#define OSR_SETTING 0x02  // OSR_128
+#define VREF 3.3      // External voltage reference (e.g., 3.3 V)
+#define OSR_SETTING 0x0F  // OSR_98304 = ~1 sample/sec
 
 // MCP3564 SPI command constants
 #define ADDR           0b01000000
@@ -20,9 +20,9 @@
 // MCP3564 register values
 #define CONFIG0  (0b11010010 | (1 << 5))  // Internal clock enabled
 #define CONFIG1  (OSR_SETTING << 2)       // OSR_128
-#define CONFIG2  0b10000011  // Bit 7 = 1: external VREF, PGA = 1, REFEXT+ only
+#define CONFIG2  0b10001110  // External VREF, PGA = 64
 #define CONFIG3  0b11110000  // Continuous conversion mode
-#define MUX      0b00000000  // SE_0 (AIN0 with respect to GND)
+#define MUX      0b00000000  // SE_0 (AIN0 w.r.t. AGND)
 
 // === Setup ===
 void setup() {
@@ -36,20 +36,22 @@ void setup() {
   configureADC();
   startConversion();
 
-  Serial.println("MCP3564 initialized using internal clock and external VREF (2.048 V).");
+  Serial.println("MCP3564 initialized with PGA=128, external VREF = 3.3V");
 }
 
 // === Main Loop ===
 void loop() {
   int32_t adc_code = readADC();
-  float voltage = (adc_code / 8388607.0) * VREF;
+
+  // Convert ADC code to voltage (measured voltage = code * VREF / PGA / 2^23)
+  float voltage = (adc_code / 8388607.0) * (VREF / 128.0);
 
   Serial.print("ADC Code: ");
   Serial.print(adc_code);
   Serial.print(" | Voltage: ");
-  Serial.println(voltage, 6);
+  Serial.println(voltage, 6);  // Print with 6 decimal places
 
-  delay(100);  // 10 Hz read rate
+  delay(500);  // ~10 Hz read rate
 }
 
 // === Helper Functions ===
@@ -68,7 +70,7 @@ void configureADC() {
   SPI.transfer(ADDR | CONFIG0_ADDR);  // Start writing at CONFIG0
   SPI.transfer(CONFIG0);
   SPI.transfer(CONFIG1);
-  SPI.transfer(CONFIG2);  // Use external reference
+  SPI.transfer(CONFIG2);  // Use external VREF, PGA = 128
   SPI.transfer(CONFIG3);
   SPI.transfer(MUX);
   digitalWrite(SPI_CS_PIN, HIGH);
