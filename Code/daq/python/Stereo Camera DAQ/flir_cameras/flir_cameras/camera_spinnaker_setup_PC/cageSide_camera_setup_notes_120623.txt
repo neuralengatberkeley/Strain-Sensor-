@@ -1,0 +1,35 @@
+Notes for camera synch debugging.
+12/6/23
+
+SpinView
+    Open SpinView
+    Assure correct settings.
+    Hit "Play" button for both cameras.
+
+    Regarding correct settings:
+        Camera settings should be loading from a saved configuration.
+        But, key debugging settings that may be wrong that can cause issues:
+            Menu: Image Format
+                Setting: Pixel Format
+                Setting: Frame Width/Height
+                    (incorrectly large frames lead to bandwidths that are too high to be saved, leading to dropped frames)
+            Menu: GPIO
+                Settings: All trigger settings
+
+Arduino
+    If camera script is already the script uploaded to the Arduino:
+
+    Click the "Serial Monitor" icon in the upper right-hand corner.
+    Input any key to instigate connection.
+    Input key to start set of triggers:
+        5 for 2000 triggers
+        1 for ongoing triggers
+        0 for off
+
+Anaconda Prompt
+    Open script
+    Hit:
+        Set Folder
+        Start Recording
+    In this state, the program is ready to receive images it is given.
+        Those images are initiated by any triggers sent to the cameras (e.g. from Arduino script, etc.)

@@ -1,0 +1,55 @@
+
+Notes for setting up top and side cameras for 2017 rig; 
+
+Top camera: ends in 71; SECONDARY
+Side camera: ends in 98; PRIMARY 
+
+Hardware trigger setups; https://www.flir.com/support-center/iis/machine-vision/application-note/configuring-synchronized-capture-with-multiple-cameras/
+
+Top camera params: 
+Image format: 
+	1300 x 700 
+	offset x: 500
+	offset y: 150
+	Pixel format: YCbCr411_8
+
+GPIO: 
+	Trigger Mode: on
+	Trigger source: Line 3
+	Trigger overlap: Read out
+
+Side camera params: 
+Image format: 
+	1300 x 700 
+	offset x: 300
+	offset y: 300
+	Pixel format: YCbCr411_8
+
+GPIO: 
+	Trigger Mode: on
+	Trigger source: Line 3
+	Trigger overlap: Read out
+	Line selector: Line 1
+	Line Mode: Output
+	3.3V Enable: On; 
+
+Both: 
+Acquisition Mode: Continuous
+
+Settings: 
+	Exposure Auto: Off
+	Exposure Time: 9997us (side camera)
+	Exposure Time: 5007us (top camera) 
+
+	Gain Auto: Off
+	Gain 4.1 dB
+
+	Gamma Enable: ON 
+	Gamma 0.8
+
+	Balance White Auto: Off; 
+
+Chunk Data Control: 
+	Chunk Mode Active: On; 
+	Chunk Selector: Image Timestamp / Frame ID 
+	Chunk Enable: On; 
