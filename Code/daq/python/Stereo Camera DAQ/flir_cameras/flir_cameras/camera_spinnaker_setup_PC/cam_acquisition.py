@@ -118,7 +118,7 @@ class CameraApp(App):
         folder_str = now.strftime("%Y_%m_%d_%H_%M_%S")
 
         # Make folder string
-        self.folder_path = os.path.join("S:/", folder_str)
+        self.folder_path = os.path.join("C:/", folder_str)
 
         self.folder_label.text = self.folder_path
 
@@ -129,11 +129,11 @@ class CameraApp(App):
 
     def start(self, *args): 
 
-        if self.state == 'loaded': 
+        if self.state == 'loaded':
 
             # Set camera serial numbers
-            serial_1 = '22157398' # side
-            serial_2 = '22157271' # top 
+            serial_1 = '25183199' # side
+            serial_2 = '25185174' # top
              
             # Get system
             # # Get camera list
@@ -148,20 +148,20 @@ class CameraApp(App):
             self.cam_2.Init()
 
             # Set up primary camera trigger to secondary camera trigger
-            self.cam_1.LineSelector.SetValue(PySpin.LineSelector_Line2)
-            self.cam_1.V3_3Enable.SetValue(True)
+            #self.cam_1.LineSelector.SetValue(PySpin.LineSelector_Line2)
+            #self.cam_1.V3_3Enable.SetValue(True)
 
             # # Set up secondary camera trigger
-            self.cam_2.TriggerMode.SetValue(PySpin.TriggerMode_Off)
-            self.cam_2.TriggerSource.SetValue(PySpin.TriggerSource_Line3)
-            self.cam_2.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
             self.cam_2.TriggerMode.SetValue(PySpin.TriggerMode_On)
+            self.cam_2.TriggerSource.SetValue(PySpin.TriggerSource_Line2)
+            self.cam_2.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
+            #self.cam_2.TriggerMode.SetValue(PySpin.TriggerMode_On)
 
             # Setup primary to be  
-            self.cam_1.TriggerMode.SetValue(PySpin.TriggerMode_Off)
-            self.cam_1.TriggerSource.SetValue(PySpin.TriggerSource_Line3)
-            self.cam_1.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
             self.cam_1.TriggerMode.SetValue(PySpin.TriggerMode_On)
+            self.cam_1.TriggerSource.SetValue(PySpin.TriggerSource_Line2)
+            self.cam_1.TriggerOverlap.SetValue(PySpin.TriggerOverlap_ReadOut)
+            #self.cam_1.TriggerMode.SetValue(PySpin.TriggerMode_On)
 
             # # Set acquisition mode to acquire a single frame, this ensures acquired images are sync'd since camera 2 and 3 are setup to be triggered
             self.cam_1.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
@@ -200,6 +200,7 @@ class CameraApp(App):
             self.wait_for_images(self.image_event_handler2)
             
             self.state = 'started'
+            print('started')
         else: 
             print('State is %s, not loaded'%self.state)
 
