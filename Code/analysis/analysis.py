@@ -15,6 +15,7 @@ from config import path_to_repository
 from scipy.interpolate import interp1d
 
 from typing import Dict, Tuple, Optional
+from scipy.io import loadmat
 
 class DLC3DBendAngles:
     """
@@ -25,22 +26,241 @@ class DLC3DBendAngles:
       - 'wrist' : angle(forearm→hand, hand→MCP)
     """
 
-    def __init__(self, csv_path: str, bodyparts: Optional[Dict[str, str]] = None):
-        self.csv_path = csv_path
-        self.df = pd.read_csv(csv_path, header=[0, 1, 2])
-        if not isinstance(self.df.columns, pd.MultiIndex):
-            raise ValueError("Expected DLC 3D CSV with a 3-row MultiIndex header (scorer/bodypart/coord).")
+    def __init__(self, csv_paths, bodyparts: Optional[Dict[str, str]] = None):
+        """
+        Initialize from one or two DLC 3D CSV files.
 
-        # Default DLC bodypart names (override with bodyparts=...)
+        Parameters
+        ----------
+        csv_paths : str or list/tuple of str
+            Path to a CSV file, or a list/tuple of two CSV file paths.
+        bodyparts : dict, optional
+            Override bodypart name mappings.
+        """
+        # Store for reference
+        self.csv_path = csv_paths
+
+        # Handle single CSV
+        if isinstance(csv_paths, str):
+            df = pd.read_csv(csv_paths, header=[0, 1, 2])
+            if not isinstance(df.columns, pd.MultiIndex):
+                raise ValueError("Expected DLC 3D CSV with a 3-row MultiIndex header.")
+            self.df = df
+
+        # Handle two CSVs
+        elif isinstance(csv_paths, (list, tuple)) and len(csv_paths) == 2:
+            dfs = []
+            for path in csv_paths:
+                df = pd.read_csv(path, header=[0, 1, 2])
+                if not isinstance(df.columns, pd.MultiIndex):
+                    raise ValueError(f"{path} does not have a 3-row MultiIndex header.")
+                dfs.append(df)
+            # Check row counts match
+            if len(dfs[0]) != len(dfs[1]):
+                raise ValueError(f"Row count mismatch: {len(dfs[0])} vs {len(dfs[1])}")
+            # Merge columns
+            self.df = pd.concat(dfs, axis=1)
+        else:
+            raise ValueError("csv_paths must be a string or a list/tuple of two CSV paths.")
+
+        # Default bodyparts mapping
         self.bp = {
             "forearm": "forearm",
-            "hand":    "hand",
-            "MCP":     "MCP",
-            "PIP":     "PIP",
+            "hand": "hand",
+            "MCP": "MCP",
+            "PIP": "PIP",
         }
         if bodyparts:
             self.bp.update(bodyparts)
 
+    def load_mat_as_df(self, mat_path: str, prefix: str = None) -> pd.DataFrame:
+        """
+        Load variables from a .mat file into a pandas DataFrame.
+
+        Parameters
+        ----------
+        mat_path : str
+            Path to .mat file.
+        prefix : str, optional
+            If provided, only load variables whose names start with this prefix.
+            Example: prefix="ts" will load ts1, ts_cam, etc.
+        """
+        from scipy.io import loadmat
+
+        mat_data = loadmat(mat_path)
+
+        # Filter keys: skip MATLAB's internal metadata
+        keys = [k for k in mat_data.keys() if not k.startswith("__")]
+
+        # Apply prefix filter if given
+        if prefix:
+            keys = [k for k in keys if k.startswith(prefix)]
+
+        dfs = []
+        for k in keys:
+            val = mat_data[k]
+            if isinstance(val, np.ndarray):
+                if val.ndim == 1:
+                    df_k = pd.DataFrame({k: val})
+                elif val.ndim == 2:
+                    col_names = [f"{k}_{i}" for i in range(val.shape[1])]
+                    df_k = pd.DataFrame(val, columns=col_names)
+                else:
+                    flat = val.reshape(val.shape[0], -1)
+                    col_names = [f"{k}_{i}" for i in range(flat.shape[1])]
+                    df_k = pd.DataFrame(flat, columns=col_names)
+                dfs.append(df_k)
+            else:
+                print(f"Skipping non-array variable: {k}")
+
+        if dfs:
+            return pd.concat(dfs, axis=1)
+        else:
+            raise ValueError(f"No array variables found in {mat_path} matching prefix='{prefix}'")
+
+    @staticmethod
+    def compare_row_counts(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[int, int]:
+        """
+        Return the number of rows in two DataFrames (including NaNs).
+
+        Parameters
+        ----------
+        df1, df2 : pd.DataFrame
+            The DataFrames to compare.
+
+        Returns
+        -------
+        (rows_df1, rows_df2) : tuple of ints
+            Number of rows in each DataFrame.
+        """
+        rows_df1 = len(df1)
+        rows_df2 = len(df2)
+        print(f"DataFrame 1: {rows_df1} rows")
+        print(f"DataFrame 2: {rows_df2} rows")
+        return rows_df1, rows_df2
+
+    def add_dataframe(self, other_df: pd.DataFrame, inplace: bool = True) -> pd.DataFrame:
+        """
+        Add columns from another DataFrame to this object's DataFrame.
+
+        Parameters
+        ----------
+        other_df : pd.DataFrame
+            The DataFrame whose columns will be added.
+        inplace : bool, default=True
+            If True, modifies self.df directly.
+            If False, returns a new combined DataFrame without modifying self.df.
+
+        Returns
+        -------
+        pd.DataFrame
+            The updated DataFrame (self.df if inplace=True, else the new one).
+        """
+        if inplace:
+            # Align indices before assignment
+            if len(other_df) != len(self.df):
+                raise ValueError(
+                    f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
+            for col in other_df.columns:
+                self.df[col] = other_df[col].values
+            return self.df
+        else:
+            if len(other_df) != len(self.df):
+                raise ValueError(
+                    f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
+            return pd.concat([self.df, other_df], axis=1)
+
+    # Aligning timestamps
+
+    def align_and_attach_encoder(
+            self,
+            encoder_df: pd.DataFrame,
+            cam_time_col,  # exact name OR substring in cam df (after flattening)
+            enc_time_col,  # exact name OR substring in encoder df
+            tolerance=None,  # numeric, same units as your timestamps (e.g., 0.005 sec or 5000 µs)
+            direction: str = "nearest",  # 'nearest' | 'backward' | 'forward'
+            suffix: str = "_enc",
+            drop_unmatched: bool = True,  # drop camera rows with no encoder match
+            keep_time_delta: bool = True,  # add absolute numeric |Δt|
+            inplace: bool = True,
+            verbose: bool = True,
+    ) -> pd.DataFrame:
+        import pandas as pd
+        import numpy as np
+
+        def flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.copy()
+                df.columns = ["__".join(map(str, c)) for c in df.columns]
+            return df
+
+        def resolve_col(df: pd.DataFrame, key: str) -> str:
+            # exact match
+            if key in df.columns:
+                return key
+            # unique substring match (case-insensitive)
+            cand = [c for c in df.columns if key.lower() in str(c).lower()]
+            if len(cand) == 1:
+                return cand[0]
+            if len(cand) > 1:
+                raise KeyError(f"Ambiguous column '{key}'. Candidates: {cand}")
+            raise KeyError(f"Column '{key}' not found. First few cols: {list(df.columns)[:10]}")
+
+        # 1) flatten both sides
+        left = flatten_cols(self.df)
+        right = flatten_cols(encoder_df)
+
+        # 2) resolve the time columns (allow substring)
+        cam_time_col = resolve_col(left, cam_time_col)
+        enc_time_col = resolve_col(right, enc_time_col)
+
+        # 3) force join keys to float64 (numeric-only alignment)
+        left = left.copy()
+        right = right.copy()
+        left["_t"] = pd.to_numeric(left[cam_time_col], errors="coerce").astype("float64")
+        right["_t_enc"] = pd.to_numeric(right[enc_time_col], errors="coerce").astype("float64")
+
+        # 4) drop NaNs in keys, sort (required by merge_asof)
+        left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=True)
+        right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=True)
+
+        # 5) suffix encoder columns (skip its time key)
+        rename_map = {c: f"{c}{suffix}" for c in right.columns if c != "_t_enc"}
+        right = right.rename(columns=rename_map)
+
+        # 6) numeric tolerance (no datetime)
+        tol = tolerance  # e.g., 0.005 for 5 ms if keys are seconds; 5000 if microseconds
+
+        merged = pd.merge_asof(
+            left,
+            right,
+            left_on="_t",
+            right_on="_t_enc",
+            direction=direction,
+            tolerance=tol,
+            suffixes=("", suffix),
+        )
+
+        if keep_time_delta:
+            with np.errstate(invalid="ignore"):
+                merged["abs_dt_enc"] = (merged["_t"] - merged["_t_enc"]).abs()
+
+        # warn if nothing matched
+        if merged["_t_enc"].notna().sum() == 0 and verbose:
+            print("[align_and_attach_encoder] WARNING: 0 matches. Check units/columns/tolerance.")
+
+        if drop_unmatched:
+            merged = merged[merged["_t_enc"].notna()].reset_index(drop=True)
+
+        if verbose:
+            print(f"[align_and_attach_encoder] camera rows in: {len(left)}, kept after match: {len(merged)}")
+
+        if inplace:
+            self.df = merged
+            return self.df
+        return merged
+
+    
     # ---------- Column + point helpers ----------
     def get_xyz(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str], Tuple[str, str, str]]:
         """Return MultiIndex columns for (x, y, z) of the given bodypart."""
