@@ -14,6 +14,123 @@ from sklearn.model_selection import KFold, train_test_split
 from config import path_to_repository
 from scipy.interpolate import interp1d
 
+from typing import Dict, Tuple, Optional
+
+class DLC3DBendAngles:
+    """
+    DLC 3D (MultiIndex header) bend-angle calculator.
+
+    angle_type:
+      - 'mcp'   : angle(hand→MCP, MCP→PIP)
+      - 'wrist' : angle(forearm→hand, hand→MCP)
+    """
+
+    def __init__(self, csv_path: str, bodyparts: Optional[Dict[str, str]] = None):
+        self.csv_path = csv_path
+        self.df = pd.read_csv(csv_path, header=[0, 1, 2])
+        if not isinstance(self.df.columns, pd.MultiIndex):
+            raise ValueError("Expected DLC 3D CSV with a 3-row MultiIndex header (scorer/bodypart/coord).")
+
+        # Default DLC bodypart names (override with bodyparts=...)
+        self.bp = {
+            "forearm": "forearm",
+            "hand":    "hand",
+            "MCP":     "MCP",
+            "PIP":     "PIP",
+        }
+        if bodyparts:
+            self.bp.update(bodyparts)
+
+    # ---------- Column + point helpers ----------
+    def get_xyz(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str], Tuple[str, str, str]]:
+        """Return MultiIndex columns for (x, y, z) of the given bodypart."""
+        label = self.bp[bodypart_key]
+        cols = self.df.columns
+        cand = [c for c in cols if len(c) >= 3 and str(c[1]).strip().lower() == label.strip().lower()]
+        if not cand:
+            raise KeyError(f"Bodypart '{label}' not found.")
+        coord_map = {str(c[2]).strip().lower(): c for c in cand}
+        try:
+            return (coord_map["x"], coord_map["y"], coord_map["z"])
+        except KeyError:
+            raise KeyError(f"Missing x/y/z for bodypart '{label}'.")
+
+    def get_points(self, bodypart_key: str) -> np.ndarray:
+        """Return Nx3 array for the bodypart."""
+        xyz_cols = self.get_xyz(bodypart_key)
+        return self.df[list(xyz_cols)].to_numpy(dtype=float)
+
+    # ---------- Vector + angle math ----------
+    @staticmethod
+    def vector(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        """Row-wise vector from A to B."""
+        return B - A
+
+    @staticmethod
+    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        """Row-wise angle (deg) via dot product."""
+        n1 = np.linalg.norm(v1, axis=1)
+        n2 = np.linalg.norm(v2, axis=1)
+        denom = n1 * n2
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cosang = np.sum(v1 * v2, axis=1) / denom
+        cosang = np.clip(cosang, -1.0, 1.0)
+        ang = np.degrees(np.arccos(cosang))
+        ang[~np.isfinite(ang)] = np.nan
+        return ang
+
+    def compute_vectors(self, angle_type: str = "mcp") -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (v1, v2) for the requested angle.
+          - 'mcp'   : v1 = hand→MCP, v2 = MCP→PIP
+          - 'wrist' : v1 = forearm→hand, v2 = hand→MCP
+        """
+        angle_type = angle_type.lower()
+        hand = self.get_points("hand")
+        mcp  = self.get_points("MCP")
+
+        if angle_type == "mcp":
+            pip = self.get_points("PIP")
+            v1 = self.vector(hand, mcp)
+            v2 = self.vector(mcp, pip)
+        elif angle_type == "wrist":
+            forearm = self.get_points("forearm")
+            v1 = self.vector(forearm, hand)
+            v2 = self.vector(hand, mcp)
+        else:
+            raise ValueError("angle_type must be one of {'mcp','wrist'}")
+        return v1, v2
+
+    def compute_bend_angle(self, angle_type: str = "mcp") -> np.ndarray:
+        """Compute bend angle per frame for the requested angle_type."""
+        v1, v2 = self.compute_vectors(angle_type)
+        return self.angle_from_vectors(v1, v2)
+
+    # ---------- Output to DataFrame ----------
+    def add_angle_column(
+        self,
+        angle_type: str = "mcp",
+        out_key: Optional[Tuple[str, str, str]] = None,
+        inplace: bool = False
+    ) -> pd.DataFrame:
+        """
+        Append angle column to a DataFrame copy (or in place if inplace=True).
+
+        out_key: MultiIndex tuple for the column; default ('metric', f'{angle_type}_bend_deg', 'deg')
+        """
+        angles = self.compute_bend_angle(angle_type)
+        target = self.df if inplace else self.df.copy()
+        if out_key is None:
+            out_key = ("metric", f"{angle_type}_bend_deg", "deg")
+        target[out_key] = angles
+        return target
+
+    def add_all_angles(self, inplace: bool = False) -> pd.DataFrame:
+        """Convenience: add both wrist and mcp angles."""
+        target = self.df if inplace else self.df.copy()
+        for ang in ("wrist", "mcp"):
+            target[("metric", f"{ang}_bend_deg", "deg")] = self.compute_bend_angle(ang)
+        return target
 
 class bender_class:
     
