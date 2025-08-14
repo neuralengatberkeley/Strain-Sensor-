@@ -8,6 +8,7 @@ from sklearn import preprocessing
 import glob
 import matplotlib.pyplot as plt
 import seaborn as sns
+from datetime import datetime
 
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
@@ -142,6 +143,7 @@ class DLC3DBendAngles:
         print(f"DataFrame 2: {rows_df2} rows")
         return rows_df1, rows_df2
 
+
     def add_dataframe(self, other_df: pd.DataFrame, inplace: bool = True) -> pd.DataFrame:
         if len(other_df) != len(self.df):
             raise ValueError(
@@ -153,18 +155,65 @@ class DLC3DBendAngles:
         else:
             return pd.concat([self.df, other_df], axis=1)
 
-    # ---------------- Matching & Attaching (new) ----------------
+    @staticmethod
+    def _series_time_of_day_to_timedelta(s: pd.Series) -> pd.Series:
+        """
+        Convert various time formats to Timedelta since midnight.
+        Special handling for HHMMSSffffff strings/ints from strftime("%H%M%S%f").
+        """
+        s = pd.Series(s, copy=False)
+
+        # Detect HHMMSSffffff pattern (int or str)
+        def parse_hhmmssfff(val):
+            if pd.isna(val):
+                return pd.NaT
+            val_str = str(int(val)).zfill(12)  # ensure zero-padded
+            try:
+                t = datetime.strptime(val_str, "%H%M%S%f").time()
+                return (pd.to_timedelta(t.hour, unit="h") +
+                        pd.to_timedelta(t.minute, unit="m") +
+                        pd.to_timedelta(t.second, unit="s") +
+                        pd.to_timedelta(t.microsecond, unit="us"))
+            except Exception:
+                return pd.NaT
+
+        if np.issubdtype(s.dtype, np.number) or s.dtype == object:
+            # Check if all values look like HHMMSSffffff
+            if s.dropna().astype(str).str.fullmatch(r"\d{9,12}").all():
+                return s.apply(parse_hhmmssfff)
+
+        # Fallback to pandas parser
+        try:
+            return pd.to_timedelta(s, errors="coerce")
+        except Exception:
+            return pd.Series(pd.NaT, index=s.index)
+
+    @staticmethod
+    def _coerce_tolerance_to_timedelta(tolerance) -> pd.Timedelta:
+        """
+        Tolerance interpretation:
+          - int   -> microseconds
+          - float -> seconds
+          - str   -> parsed by pandas ('10ms', '500us', '1s', etc.)
+        """
+        if isinstance(tolerance, (np.integer, int)):
+            return pd.to_timedelta(int(tolerance), unit="us")
+        if isinstance(tolerance, (np.floating, float)):
+            return pd.to_timedelta(float(tolerance), unit="s")
+        return pd.to_timedelta(tolerance)
+
     def find_matching_indices(
             self,
             encoder_df: pd.DataFrame,
             cam_time_col,
             enc_time_col,
-            tolerance: float,
+            tolerance,
             direction: str = "nearest",
     ) -> pd.DataFrame:
         """
         Build mapping of camera rows to encoder rows where |t_cam - t_enc| <= tolerance.
-        Stores in self._match_map with columns ['cam_index','enc_index','time_delta'].
+        Accepts µs integers, datetimes, or strings; stores time_delta in **milliseconds (float)**.
+        NOTE: int tolerance = microseconds, float = seconds, str via pandas ('10ms','500us',...).
         """
         if not isinstance(self.df, pd.DataFrame):
             raise ValueError("self.df must be a pandas DataFrame.")
@@ -172,56 +221,85 @@ class DLC3DBendAngles:
         cam_col = self._resolve_col_key(self.df, cam_time_col)
         enc_col = self._resolve_col_key(encoder_df, enc_time_col)
 
-        cam_t = self._ensure_float_series(pd.Series(self.df[cam_col], copy=False)).rename("t_cam")
-        enc_t = self._ensure_float_series(pd.Series(encoder_df[enc_col], copy=False)).rename("t_enc")
+        # Convert to Timedelta since midnight / start
+        cam_td = self._series_time_of_day_to_timedelta(self.df[cam_col]).rename("t_cam_td")
+        enc_td = self._series_time_of_day_to_timedelta(encoder_df[enc_col]).rename("t_enc_td")
 
-        cam_small = pd.DataFrame({"t_cam": cam_t})
-        cam_small["cam_index"] = cam_small.index
+        cam_small = pd.DataFrame({"t_cam_td": cam_td, "cam_index": self.df.index})
+        enc_small = pd.DataFrame({"t_enc_td": enc_td, "enc_index": encoder_df.index})
 
-        enc_small = pd.DataFrame({"t_enc": enc_t})
-        enc_small["enc_index"] = enc_small.index
+        # Debug counts
+        cam_nan_count = cam_small["t_cam_td"].isna().sum()
+        enc_nan_count = enc_small["t_enc_td"].isna().sum()
+        print(f"[find_matching_indices] Dropping {cam_nan_count} camera rows with NaT timestamps.")
+        print(f"[find_matching_indices] Dropping {enc_nan_count} encoder rows with NaT timestamps.")
 
-        # === Debug prints for NaN counts ===
-        cam_nan_count = cam_small["t_cam"].isna().sum()
-        enc_nan_count = enc_small["t_enc"].isna().sum()
-        print(f"[find_matching_indices] Dropping {cam_nan_count} camera rows with NaN timestamps.")
-        print(f"[find_matching_indices] Dropping {enc_nan_count} encoder rows with NaN timestamps.")
-
-        cam_small = cam_small.dropna(subset=["t_cam"]).sort_values("t_cam")
-        enc_small = enc_small.dropna(subset=["t_enc"]).sort_values("t_enc")
+        cam_small = cam_small.dropna(subset=["t_cam_td"]).sort_values("t_cam_td")
+        enc_small = enc_small.dropna(subset=["t_enc_td"]).sort_values("t_enc_td")
 
         if cam_small.empty or enc_small.empty:
             self._match_map = pd.DataFrame(columns=["cam_index", "enc_index", "time_delta"])
             return self._match_map
 
+        # Merge on int64 nanoseconds for speed/safety
+        cam_small["_t_cam_ns"] = cam_small["t_cam_td"].view("i8")
+        enc_small["_t_enc_ns"] = enc_small["t_enc_td"].view("i8")
+
+        # ===== DEBUG: ranges and rough gap stats =====
+        print("[debug] cam range:", cam_small["t_cam_td"].min(), "→", cam_small["t_cam_td"].max())
+        print("[debug] enc range:", enc_small["t_enc_td"].min(), "→", enc_small["t_enc_td"].max())
+
+        probe = pd.merge_asof(
+            cam_small[["t_cam_td", "_t_cam_ns"]].iloc[::max(1, len(cam_small) // 20)].sort_values("_t_cam_ns"),
+            enc_small[["t_enc_td", "_t_enc_ns"]].sort_values("_t_enc_ns"),
+            left_on="_t_cam_ns",
+            right_on="_t_enc_ns",
+            direction="nearest"
+        )
+        probe["delta"] = pd.to_timedelta(probe["_t_enc_ns"] - probe["_t_cam_ns"], unit="ns")
+        probe["delta_ms"] = probe["delta"].dt.total_seconds() * 1000.0
+        print("[debug] probe |delta| (ms) stats:", probe["delta_ms"].abs().describe())
+
+        # =================================================
+
         merged = pd.merge_asof(
             cam_small,
             enc_small,
-            left_on="t_cam",
-            right_on="t_enc",
+            left_on="_t_cam_ns",
+            right_on="_t_enc_ns",
             direction=direction,
             allow_exact_matches=True,
         )
-        merged["time_delta"] = merged["t_enc"] - merged["t_cam"]
 
-        keep = merged["time_delta"].abs() <= float(tolerance)
-        out = merged.loc[keep, ["cam_index", "enc_index", "time_delta"]]
-        out = out.drop_duplicates(subset=["cam_index"], keep="first").reset_index(drop=True)
+        # Timedelta difference (ns → Timedelta → ms)
+        merged["time_delta_td"] = pd.to_timedelta(merged["_t_enc_ns"] - merged["_t_cam_ns"], unit="ns")
+        merged["time_delta_ms"] = merged["time_delta_td"].dt.total_seconds() * 1000.0
+
+        # Tolerance check still in Timedelta space
+        tol_td = self._coerce_tolerance_to_timedelta(tolerance)
+        keep = merged["time_delta_td"].abs() <= tol_td
+
+        # Output with time_delta as milliseconds (numeric)
+        out = (merged.loc[keep, ["cam_index", "enc_index", "time_delta_ms"]]
+               .rename(columns={"time_delta_ms": "time_delta"})
+               .drop_duplicates(subset=["cam_index"], keep="first")
+               .reset_index(drop=True))
 
         self._match_map = out
         return out
 
     def attach_encoder_using_match(
-        self,
-        encoder_df: pd.DataFrame,
-        columns: Optional[List] = None,
-        suffix: str = "_renc",
-        keep_time_delta: bool = True,
-        drop_unmatched: bool = True,
+            self,
+            encoder_df: pd.DataFrame,
+            columns: Optional[List] = None,
+            suffix: str = "_renc",
+            keep_time_delta: bool = True,
+            drop_unmatched: bool = True,
     ) -> pd.DataFrame:
         """
         Use self._match_map to (a) optionally drop unmatched rows in self.df
         and (b) attach chosen encoder columns (flattened + suffixed).
+        Note: 'time_delta' is a Timedelta. Set drop_unmatched=False to preserve all rows.
         """
         if self._match_map is None or self._match_map.empty:
             raise RuntimeError("No matches stored. Run find_matching_indices(...) first.")
