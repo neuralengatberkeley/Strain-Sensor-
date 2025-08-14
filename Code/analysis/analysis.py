@@ -14,8 +14,9 @@ from sklearn.model_selection import KFold, train_test_split
 from config import path_to_repository
 from scipy.interpolate import interp1d
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from scipy.io import loadmat
+
 
 class DLC3DBendAngles:
     """
@@ -29,16 +30,10 @@ class DLC3DBendAngles:
     def __init__(self, csv_paths, bodyparts: Optional[Dict[str, str]] = None):
         """
         Initialize from one or two DLC 3D CSV files.
-
-        Parameters
-        ----------
-        csv_paths : str or list/tuple of str
-            Path to a CSV file, or a list/tuple of two CSV file paths.
-        bodyparts : dict, optional
-            Override bodypart name mappings.
         """
         # Store for reference
         self.csv_path = csv_paths
+        self._match_map: Optional[pd.DataFrame] = None  # holds ['cam_index','enc_index','time_delta']
 
         # Handle single CSV
         if isinstance(csv_paths, str):
@@ -55,10 +50,8 @@ class DLC3DBendAngles:
                 if not isinstance(df.columns, pd.MultiIndex):
                     raise ValueError(f"{path} does not have a 3-row MultiIndex header.")
                 dfs.append(df)
-            # Check row counts match
             if len(dfs[0]) != len(dfs[1]):
                 raise ValueError(f"Row count mismatch: {len(dfs[0])} vs {len(dfs[1])}")
-            # Merge columns
             self.df = pd.concat(dfs, axis=1)
         else:
             raise ValueError("csv_paths must be a string or a list/tuple of two CSV paths.")
@@ -73,26 +66,49 @@ class DLC3DBendAngles:
         if bodyparts:
             self.bp.update(bodyparts)
 
+    # ---------------- helpers ----------------
+    @staticmethod
+    def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Flatten MultiIndex columns to single strings (non-destructive copy)."""
+        if isinstance(df.columns, pd.MultiIndex):
+            out = df.copy()
+            out.columns = [
+                "_".join([str(x) for x in tup if str(x) != ""]).strip()
+                for tup in out.columns.to_list()
+            ]
+            return out
+        return df
+
+    @staticmethod
+    def _resolve_col_key(df: pd.DataFrame, col_spec):
+        """
+        Resolve a column given:
+          - exact name present in df.columns
+          - a tuple (true MultiIndex key)
+          - a substring (returns first match)
+        """
+        # exact (including tuple)
+        if col_spec in df.columns:
+            return col_spec
+        # substring search on stringified column names
+        candidates = [c for c in df.columns if str(col_spec) in str(c)]
+        if len(candidates) == 0:
+            raise KeyError(f"Column matching '{col_spec}' not found.")
+        # pick first match (you can tighten this if needed)
+        return candidates[0]
+
+    @staticmethod
+    def _ensure_float_series(s: pd.Series) -> pd.Series:
+        """Coerce to float64 for numeric asof matching."""
+        if not np.issubdtype(s.dtype, np.number):
+            s = pd.to_numeric(s, errors="coerce")
+        return s.astype("float64")
+
+    # ---------------- MAT loader ----------------
     def load_mat_as_df(self, mat_path: str, prefix: str = None) -> pd.DataFrame:
-        """
-        Load variables from a .mat file into a pandas DataFrame.
-
-        Parameters
-        ----------
-        mat_path : str
-            Path to .mat file.
-        prefix : str, optional
-            If provided, only load variables whose names start with this prefix.
-            Example: prefix="ts" will load ts1, ts_cam, etc.
-        """
         from scipy.io import loadmat
-
         mat_data = loadmat(mat_path)
-
-        # Filter keys: skip MATLAB's internal metadata
         keys = [k for k in mat_data.keys() if not k.startswith("__")]
-
-        # Apply prefix filter if given
         if prefix:
             keys = [k for k in keys if k.startswith(prefix)]
 
@@ -120,19 +136,6 @@ class DLC3DBendAngles:
 
     @staticmethod
     def compare_row_counts(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[int, int]:
-        """
-        Return the number of rows in two DataFrames (including NaNs).
-
-        Parameters
-        ----------
-        df1, df2 : pd.DataFrame
-            The DataFrames to compare.
-
-        Returns
-        -------
-        (rows_df1, rows_df2) : tuple of ints
-            Number of rows in each DataFrame.
-        """
         rows_df1 = len(df1)
         rows_df2 = len(df2)
         print(f"DataFrame 1: {rows_df1} rows")
@@ -140,96 +143,149 @@ class DLC3DBendAngles:
         return rows_df1, rows_df2
 
     def add_dataframe(self, other_df: pd.DataFrame, inplace: bool = True) -> pd.DataFrame:
-        """
-        Add columns from another DataFrame to this object's DataFrame.
-
-        Parameters
-        ----------
-        other_df : pd.DataFrame
-            The DataFrame whose columns will be added.
-        inplace : bool, default=True
-            If True, modifies self.df directly.
-            If False, returns a new combined DataFrame without modifying self.df.
-
-        Returns
-        -------
-        pd.DataFrame
-            The updated DataFrame (self.df if inplace=True, else the new one).
-        """
+        if len(other_df) != len(self.df):
+            raise ValueError(
+                f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
         if inplace:
-            # Align indices before assignment
-            if len(other_df) != len(self.df):
-                raise ValueError(
-                    f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
             for col in other_df.columns:
                 self.df[col] = other_df[col].values
             return self.df
         else:
-            if len(other_df) != len(self.df):
-                raise ValueError(
-                    f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
             return pd.concat([self.df, other_df], axis=1)
 
-    # Aligning timestamps
-
-    def align_and_attach_encoder(
+    # ---------------- Matching & Attaching (new) ----------------
+    def find_matching_indices(
             self,
             encoder_df: pd.DataFrame,
-            cam_time_col,  # exact name OR substring in cam df (after flattening)
-            enc_time_col,  # exact name OR substring in encoder df
-            tolerance=None,  # numeric, same units as your timestamps (e.g., 0.005 sec or 5000 µs)
-            direction: str = "nearest",  # 'nearest' | 'backward' | 'forward'
-            suffix: str = "_enc",
-            drop_unmatched: bool = True,  # drop camera rows with no encoder match
-            keep_time_delta: bool = True,  # add absolute numeric |Δt|
-            inplace: bool = True,
-            verbose: bool = True,
+            cam_time_col,
+            enc_time_col,
+            tolerance: float,
+            direction: str = "nearest",
     ) -> pd.DataFrame:
-        import pandas as pd
-        import numpy as np
+        """
+        Build mapping of camera rows to encoder rows where |t_cam - t_enc| <= tolerance.
+        Stores in self._match_map with columns ['cam_index','enc_index','time_delta'].
+        """
+        if not isinstance(self.df, pd.DataFrame):
+            raise ValueError("self.df must be a pandas DataFrame.")
 
-        def flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
-            if isinstance(df.columns, pd.MultiIndex):
-                df = df.copy()
-                df.columns = ["__".join(map(str, c)) for c in df.columns]
-            return df
+        cam_col = self._resolve_col_key(self.df, cam_time_col)
+        enc_col = self._resolve_col_key(encoder_df, enc_time_col)
 
-        def resolve_col(df: pd.DataFrame, key: str) -> str:
-            # exact match
-            if key in df.columns:
-                return key
-            # unique substring match (case-insensitive)
-            cand = [c for c in df.columns if key.lower() in str(c).lower()]
-            if len(cand) == 1:
-                return cand[0]
-            if len(cand) > 1:
-                raise KeyError(f"Ambiguous column '{key}'. Candidates: {cand}")
-            raise KeyError(f"Column '{key}' not found. First few cols: {list(df.columns)[:10]}")
+        cam_t = self._ensure_float_series(pd.Series(self.df[cam_col], copy=False)).rename("t_cam")
+        enc_t = self._ensure_float_series(pd.Series(encoder_df[enc_col], copy=False)).rename("t_enc")
 
-        # 1) flatten both sides
-        left = flatten_cols(self.df)
-        right = flatten_cols(encoder_df)
+        cam_small = pd.DataFrame({"t_cam": cam_t})
+        cam_small["cam_index"] = cam_small.index
 
-        # 2) resolve the time columns (allow substring)
-        cam_time_col = resolve_col(left, cam_time_col)
-        enc_time_col = resolve_col(right, enc_time_col)
+        enc_small = pd.DataFrame({"t_enc": enc_t})
+        enc_small["enc_index"] = enc_small.index
 
-        # 3) force join keys to float64 (numeric-only alignment)
+        # === Debug prints for NaN counts ===
+        cam_nan_count = cam_small["t_cam"].isna().sum()
+        enc_nan_count = enc_small["t_enc"].isna().sum()
+        print(f"[find_matching_indices] Dropping {cam_nan_count} camera rows with NaN timestamps.")
+        print(f"[find_matching_indices] Dropping {enc_nan_count} encoder rows with NaN timestamps.")
+
+        cam_small = cam_small.dropna(subset=["t_cam"]).sort_values("t_cam")
+        enc_small = enc_small.dropna(subset=["t_enc"]).sort_values("t_enc")
+
+        if cam_small.empty or enc_small.empty:
+            self._match_map = pd.DataFrame(columns=["cam_index", "enc_index", "time_delta"])
+            return self._match_map
+
+        merged = pd.merge_asof(
+            cam_small,
+            enc_small,
+            left_on="t_cam",
+            right_on="t_enc",
+            direction=direction,
+            allow_exact_matches=True,
+        )
+        merged["time_delta"] = merged["t_enc"] - merged["t_cam"]
+
+        keep = merged["time_delta"].abs() <= float(tolerance)
+        out = merged.loc[keep, ["cam_index", "enc_index", "time_delta"]]
+        out = out.drop_duplicates(subset=["cam_index"], keep="first").reset_index(drop=True)
+
+        self._match_map = out
+        return out
+
+    def attach_encoder_using_match(
+        self,
+        encoder_df: pd.DataFrame,
+        columns: Optional[List] = None,
+        suffix: str = "_renc",
+        keep_time_delta: bool = True,
+        drop_unmatched: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Use self._match_map to (a) optionally drop unmatched rows in self.df
+        and (b) attach chosen encoder columns (flattened + suffixed).
+        """
+        if self._match_map is None or self._match_map.empty:
+            raise RuntimeError("No matches stored. Run find_matching_indices(...) first.")
+
+        m = self._match_map
+        cam_to_enc = dict(zip(m["cam_index"].tolist(), m["enc_index"].tolist()))
+
+        if drop_unmatched:
+            keep_idx = m["cam_index"].unique()
+            self.df = self.df.loc[keep_idx]
+        self.df = self.df.sort_index()
+
+        # Choose encoder columns
+        if columns is None:
+            cols_to_take = encoder_df.columns
+        else:
+            cols_to_take = [self._resolve_col_key(encoder_df, c) for c in columns]
+
+        mapped_enc_idx = self.df.index.to_series().map(cam_to_enc)
+        enc_selected = encoder_df.loc[mapped_enc_idx.values, cols_to_take].copy()
+        enc_selected.index = self.df.index
+
+        enc_selected = self._flatten_columns(enc_selected)
+        enc_selected.columns = [f"{c}{suffix}" for c in enc_selected.columns]
+
+        if keep_time_delta:
+            td = m.set_index("cam_index")["time_delta"]
+            enc_selected[f"time_delta{suffix}"] = self.df.index.to_series().map(td).values
+
+        self.df = pd.concat([self.df, enc_selected], axis=1)
+        return self.df
+
+    # ---------------- One-shot aligner (kept, now using helpers) ----------------
+    def align_and_attach_encoder(
+        self,
+        encoder_df: pd.DataFrame,
+        cam_time_col,
+        enc_time_col,
+        tolerance=None,
+        direction: str = "nearest",
+        suffix: str = "_enc",
+        drop_unmatched: bool = True,
+        keep_time_delta: bool = True,
+        inplace: bool = True,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+
+        left = self._flatten_columns(self.df)
+        right = self._flatten_columns(encoder_df)
+
+        cam_time_col = self._resolve_col_key(left, cam_time_col)
+        enc_time_col = self._resolve_col_key(right, enc_time_col)
+
         left = left.copy()
         right = right.copy()
-        left["_t"] = pd.to_numeric(left[cam_time_col], errors="coerce").astype("float64")
-        right["_t_enc"] = pd.to_numeric(right[enc_time_col], errors="coerce").astype("float64")
+        left["_t"] = self._ensure_float_series(left[cam_time_col])
+        right["_t_enc"] = self._ensure_float_series(right[enc_time_col])
 
-        # 4) drop NaNs in keys, sort (required by merge_asof)
-        left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=True)
-        right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=True)
+        left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)  # keep original idx
+        right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
 
-        # 5) suffix encoder columns (skip its time key)
-        rename_map = {c: f"{c}{suffix}" for c in right.columns if c != "_t_enc"}
+        # Suffix encoder columns (skip key)
+        rename_map = {c: f"{c}{suffix}" for c in right.columns if c not in ("_t_enc", "index")}
         right = right.rename(columns=rename_map)
-
-        # 6) numeric tolerance (no datetime)
-        tol = tolerance  # e.g., 0.005 for 5 ms if keys are seconds; 5000 if microseconds
 
         merged = pd.merge_asof(
             left,
@@ -237,30 +293,30 @@ class DLC3DBendAngles:
             left_on="_t",
             right_on="_t_enc",
             direction=direction,
-            tolerance=tol,
+            tolerance=tolerance,
             suffixes=("", suffix),
         )
 
         if keep_time_delta:
             with np.errstate(invalid="ignore"):
-                merged["abs_dt_enc"] = (merged["_t"] - merged["_t_enc"]).abs()
-
-        # warn if nothing matched
-        if merged["_t_enc"].notna().sum() == 0 and verbose:
-            print("[align_and_attach_encoder] WARNING: 0 matches. Check units/columns/tolerance.")
+                merged[f"abs_dt{suffix}"] = (merged["_t"] - merged["_t_enc"]).abs()
 
         if drop_unmatched:
-            merged = merged[merged["_t_enc"].notna()].reset_index(drop=True)
+            matched = merged[merged["_t_enc"].notna()].copy()
+        else:
+            matched = merged
 
         if verbose:
-            print(f"[align_and_attach_encoder] camera rows in: {len(left)}, kept after match: {len(merged)}")
+            print(f"[align_and_attach_encoder] camera rows in: {len(left)}, kept after match: {len(matched)}")
 
+        # Restore original index for rows we kept
+        matched = matched.set_index("index").sort_index()
         if inplace:
-            self.df = merged
+            self.df = matched
             return self.df
-        return merged
+        return matched
 
-    
+
     # ---------- Column + point helpers ----------
     def get_xyz(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str], Tuple[str, str, str]]:
         """Return MultiIndex columns for (x, y, z) of the given bodypart."""
