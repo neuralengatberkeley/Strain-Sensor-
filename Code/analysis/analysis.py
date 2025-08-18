@@ -35,6 +35,9 @@ class DLC3DBendAngles:
         # Store for reference
         self.csv_path = csv_paths
         self._match_map: Optional[pd.DataFrame] = None  # holds ['cam_index','enc_index','time_delta']
+        self.df = None  # for DLC keypoints, if needed
+        self.imu_df = None  # IMU dataframe
+        self.enc_df = None  # encoder dataframe
 
         # Handle single CSV
         if isinstance(csv_paths, str):
@@ -332,6 +335,48 @@ class DLC3DBendAngles:
         self.df = pd.concat([self.df, enc_selected], axis=1)
         return self.df
 
+    def match_encoder_to_imu(
+            self,
+            enc_time_col="timestamp",
+            imu_time_col="timestamp",
+            tolerance="200ms",
+            direction="nearest",
+            columns=None,  # e.g., ["imu_joint_deg"] or None for all
+            suffix="_imu",
+            keep_time_delta=True,
+            drop_unmatched=True,
+    ):
+        """
+        Align encoder rows to nearest IMU rows by timestamp and attach IMU columns onto self.enc_df.
+        """
+        if getattr(self, "enc_df", None) is None or getattr(self, "imu_df", None) is None:
+            raise RuntimeError("enc_df and imu_df must be loaded before calling match_encoder_to_imu().")
+
+        _prev_df = getattr(self, "df", None)
+        self.df = self.enc_df
+
+        # Build match map Encoder <-> IMU
+        self.find_matching_indices(
+            encoder_df=self.imu_df,
+            cam_time_col=enc_time_col,
+            enc_time_col=imu_time_col,
+            tolerance=tolerance,
+            direction=direction,
+        )
+
+        # Attach IMU columns to matched encoder rows
+        self.attach_encoder_using_match(
+            encoder_df=self.imu_df,
+            columns=columns,
+            suffix=suffix,
+            keep_time_delta=keep_time_delta,
+            drop_unmatched=drop_unmatched,
+        )
+
+        self.enc_df = self.df
+        self.df = _prev_df
+        return self.enc_df
+
     # ---------------- One-shot aligner (kept, now using helpers) ----------------
     def align_and_attach_encoder(
         self,
@@ -485,6 +530,512 @@ class DLC3DBendAngles:
         for ang in ("wrist", "mcp"):
             target[("metric", f"{ang}_bend_deg", "deg")] = self.compute_bend_angle(ang)
         return target
+
+    def load_imu_p_enc(self, imu_path=None, enc_path=None):
+        """
+        Load IMU and encoder CSV files into self.imu_df and self.enc_df
+        as pandas DataFrames.
+        """
+        import pandas as pd
+        if imu_path:
+            self.imu_df = pd.read_csv(imu_path)
+        if enc_path:
+            self.enc_df = pd.read_csv(enc_path)
+        print("Loaded IMU shape:", getattr(self, 'imu_df', None).shape if hasattr(self, 'imu_df') else None)
+        print("Loaded ENC shape:", getattr(self, 'enc_df', None).shape if hasattr(self, 'enc_df') else None)
+
+    # ======================
+    # 2) Quaternion → Euler
+    # ======================
+    def imu_quat_to_euler(
+            self,
+            imu_cols=('euler1', 'euler2'),
+            quat_order='wxyz',
+            sequence='zyx',
+            degrees=True,
+            out_prefix=('imu1', 'imu2'),
+    ):
+        """
+        Convert quaternion columns to Euler angles (roll, pitch, yaw).
+        Stores results in self.imu_df with prefixes.
+        """
+        import numpy as np
+        import pandas as pd
+
+        def parse_tuple_string(s):
+            if pd.isna(s): return [np.nan] * 4
+            vals = s.strip().strip('()').split(',')
+            vals = [float(v) for v in vals]
+            return vals if len(vals) == 4 else [np.nan] * 4
+
+        def normalize(q):
+            q = np.asarray(q, dtype=float)
+            n = np.linalg.norm(q, axis=-1, keepdims=True)
+            n[n == 0] = 1.0
+            return q / n
+
+        def quat_to_euler(q, order='wxyz', seq='zyx', deg=True):
+            if order == 'wxyz':
+                w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+            elif order == 'xyzw':
+                x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+            else:
+                raise ValueError("quat_order must be 'wxyz' or 'xyzw'.")
+
+            ww, xx, yy, zz = w * w, x * x, y * y, z * z
+            R00 = 1 - 2 * (yy + zz)
+            R01 = 2 * (x * y - z * w)
+            R02 = 2 * (x * z + y * w)
+            R10 = 2 * (x * y + z * w)
+            R11 = 1 - 2 * (xx + zz)
+            R12 = 2 * (y * z - x * w)
+            R20 = 2 * (x * z - y * w)
+            R21 = 2 * (y * z + x * w)
+            R22 = 1 - 2 * (xx + yy)
+
+            if seq == 'zyx':  # yaw, pitch, roll
+                yaw = np.arctan2(R10, R00)
+                pitch = np.arcsin(-R20)
+                roll = np.arctan2(R21, R22)
+            else:
+                raise ValueError("Unsupported sequence; use 'zyx'.")
+
+            if deg:
+                roll, pitch, yaw = np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+            return roll, pitch, yaw
+
+        for col, prefix in zip(imu_cols, out_prefix):
+            q_raw = self.imu_df[col].apply(parse_tuple_string).to_list()
+            q = normalize(np.array(q_raw))  # Nx4
+            r, p, y = quat_to_euler(q, order=quat_order, seq=sequence, deg=degrees)
+            self.imu_df[f'{prefix}_roll'] = r
+            self.imu_df[f'{prefix}_pitch'] = p
+            self.imu_df[f'{prefix}_yaw'] = y
+
+    # ======================
+    # 3) Euler → unit vector
+    # ======================
+    def euler_to_unit_vec(
+            self,
+            prefix='imu1',
+            sequence='zyx',
+            axis='z',
+            degrees=True,
+            out_col=None,
+    ):
+        import numpy as np
+
+        r = self.imu_df[f'{prefix}_roll'].to_numpy()
+        p = self.imu_df[f'{prefix}_pitch'].to_numpy()
+        y = self.imu_df[f'{prefix}_yaw'].to_numpy()
+
+        if degrees:
+            r, p, y = np.deg2rad(r), np.deg2rad(p), np.deg2rad(y)
+
+        def Rx(a):
+            return np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+
+        def Ry(a):
+            return np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+
+        def Rz(a):
+            return np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+
+        base = {'x': [1, 0, 0], 'y': [0, 1, 0], 'z': [0, 0, 1]}[axis]
+        vecs = []
+        for ri, pi, yi in zip(r, p, y):
+            R = Rz(yi) @ Ry(pi) @ Rx(ri) if sequence == 'zyx' else np.eye(3)
+            vecs.append(tuple((R @ base).tolist()))
+
+        if out_col is None:
+            out_col = f'{prefix}_{axis}vec'
+        self.imu_df[out_col] = vecs
+
+    # ======================
+    # 4) Vector → angle
+    # ======================
+    def angle_between_vectors(
+            self,
+            vec_col_a,
+            vec_col_b,
+            out_col='imu_vec_angle_deg',
+            degrees=True
+    ):
+        import numpy as np
+        a = np.stack(self.imu_df[vec_col_a].apply(lambda v: np.array(v, float)).to_numpy())
+        b = np.stack(self.imu_df[vec_col_b].apply(lambda v: np.array(v, float)).to_numpy())
+        a /= np.linalg.norm(a, axis=1, keepdims=True)
+        b /= np.linalg.norm(b, axis=1, keepdims=True)
+        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
+        ang = np.arccos(dot)
+        if degrees: ang = np.degrees(ang)
+        self.imu_df[out_col] = ang
+
+    # ======================
+    # 5) Add angle column
+    # ======================
+    def add_imu_angle_column(
+            self,
+            values,
+            name=('metric', 'imu_joint_deg', 'deg'),
+            inplace=True
+    ):
+        import pandas as pd
+        target = self.imu_df if inplace else self.imu_df.copy()
+        colname = name
+        if isinstance(name, tuple) and not isinstance(target.columns, pd.MultiIndex):
+            colname = "_".join([str(x) for x in name])
+        target[colname] = values
+        if inplace:
+            self.imu_df = target
+            return self.imu_df
+        return target
+
+    def compute_imu_vs_encoder_error(
+            self,
+            source="enc",  # "enc" -> use self.enc_df; "imu" -> use self.imu_df
+            enc_angle_col="angle_renc",  # ground-truth encoder angle (deg)
+            imu_angle_col="imu_joint_deg_imu",  # IMU estimate angle (deg)
+            time_col="timestamp",  # timestamp column for reference
+            thresholds=(1, 2, 5)  # report % within these absolute-error thresholds (deg)
+    ):
+        """
+        Compute IMU-vs-Encoder angular errors with encoder as truth.
+
+        Returns:
+            metrics (dict): {
+                "rmse": ...,
+                "mae": ...,
+                "bias": ...,
+                "max_abs_error": ...,
+                "abs_error_array": np.ndarray,
+                "within_deg": {thr: percent, ...},
+                "n": N
+            }
+            df_err (pd.DataFrame): [time_col, enc_angle_col, imu_angle_col, "error_deg", "abs_error_deg"]
+        """
+        # 1) pick table
+        if source == "enc":
+            if not hasattr(self, "enc_df") or self.enc_df is None:
+                raise RuntimeError("enc_df is not available. Load/align encoder data first.")
+            df = self.enc_df.copy()
+        elif source == "imu":
+            if not hasattr(self, "imu_df") or self.imu_df is None:
+                raise RuntimeError("imu_df is not available. Load/align IMU data first.")
+            df = self.imu_df.copy()
+        else:
+            raise ValueError("source must be 'enc' or 'imu'")
+
+        # 2) sanity checks
+        for col in (enc_angle_col, imu_angle_col):
+            if col not in df.columns:
+                raise KeyError(f"Column '{col}' not found in chosen table (source='{source}').")
+
+        # 3) numeric + drop NaNs
+        enc = pd.to_numeric(df[enc_angle_col], errors="coerce")
+        imu = pd.to_numeric(df[imu_angle_col], errors="coerce")
+        mask = enc.notna() & imu.notna()
+        enc = enc[mask].to_numpy()
+        imu = imu[mask].to_numpy()
+        ts = df.loc[mask, time_col] if time_col in df.columns else pd.Series(index=df.index[mask], dtype=float)
+
+        # 4) errors
+        err = imu - enc  # signed error (deg)
+        aerr = np.abs(enc - imu)  # absolute error (deg), encoder - imu
+        rmse = float(np.sqrt(np.mean(err ** 2))) if err.size else float("nan")
+        mae = float(np.mean(aerr)) if aerr.size else float("nan")
+        bias = float(np.mean(err)) if err.size else float("nan")
+        max_abs_error = float(np.max(aerr)) if aerr.size else float("nan")
+
+        within = {}
+        for thr in thresholds:
+            within[thr] = float(np.mean(aerr <= thr) * 100.0) if aerr.size else float("nan")
+
+        # 5) assemble output dataframe
+        out_cols = {
+            time_col: ts.values if len(ts) else [],
+            enc_angle_col: enc,
+            imu_angle_col: imu,
+            "error_deg": err,
+            "abs_error_deg": aerr,
+        }
+        df_err = pd.DataFrame(out_cols)
+
+        # 6) metrics include abs_error summary
+        metrics = {
+            "rmse": rmse,
+            "mae": mae,
+            "bias": bias,
+            "max_abs_error": max_abs_error,
+            "abs_error_array": aerr,  # full array if you want it directly
+            "within_deg": within,
+            "n": int(len(df_err)),
+        }
+        return metrics, df_err
+
+    def plot_imu_encoder_error_boxplot_grouped(
+            self,
+            sample_col,  # e.g. "sample_id" or "dataset" in the chosen source df
+            group_dict,  # dict: {sample_name -> group_label}
+            group_colors,  # list of colors, one per unique group (ordered to match group_names)
+            group_names,  # ordered list of group labels to display on x-axis
+            source="enc",  # "enc" -> self.enc_df; "imu" -> self.imu_df
+            enc_angle_col="angle_renc",  # encoder (truth)
+            imu_angle_col="imu_joint_deg_imu",  # IMU (estimate) after matching
+            time_col="timestamp",
+            box_alpha=0.5,
+            data_alpha=0.5,
+            jitter=0.2,
+            ylim=(0, 7),
+            save_path=None,
+            dpi=300,
+            title="IMU vs Encoder | Absolute Error by Sample (Grouped)",
+    ):
+        """
+        Build a box plot of |IMU - Encoder| per sample, color boxes by group, and
+        replace sample tick labels with centered group names (as in your earlier plot_box_plot).
+
+        Requires:
+          - sample_col exists in the chosen source dataframe (enc_df or imu_df)
+          - group_dict maps each sample (sample_col value) to a group label
+          - group_names defines the display order of groups
+          - group_colors aligns with group_names order
+        """
+        import matplotlib.pyplot as plt
+        import pandas as pd
+        import numpy as np
+        try:
+            import seaborn as sns
+        except ImportError:
+            raise ImportError("seaborn is required for this plot. pip install seaborn")
+
+        # 1) Compute errors from the chosen table (encoder or IMU)
+        metrics, df_err = self.compute_imu_vs_encoder_error(
+            source=source,
+            enc_angle_col=enc_angle_col,
+            imu_angle_col=imu_angle_col,
+            time_col=time_col,
+        )
+
+        # 2) Pull sample labels from the same source df and merge into error table via timestamp
+        df_src = self.enc_df if source == "enc" else self.imu_df
+        if sample_col not in df_src.columns:
+            raise KeyError(f"'{sample_col}' not in the chosen source dataframe (source='{source}').")
+
+        df_plot = df_err.merge(
+            df_src[[time_col, sample_col]].drop_duplicates(subset=[time_col]),
+            on=time_col, how="left"
+        ).rename(columns={sample_col: "Sample"})
+
+        # 3) Attach Group via mapping; drop rows with unknown samples or missing group
+        df_plot["Group"] = df_plot["Sample"].map(group_dict)
+        df_plot = df_plot.dropna(subset=["Sample", "Group", "abs_error_deg"]).copy()
+
+        # 4) Build color palette for groups (in the order of group_names)
+        unique_groups = list(group_names)
+        if len(unique_groups) != len(group_colors):
+            raise ValueError("group_colors length must match group_names length.")
+        group_palette = {g: c for g, c in zip(unique_groups, group_colors)}
+
+        # 5) Determine sample order grouped by group_names (keeps your grouped layout)
+        #    Only include samples present in df_plot
+        samples_in_data = df_plot["Sample"].dropna().unique().tolist()
+        grouped_samples = []
+        for g in unique_groups:
+            members = [s for s, gg in group_dict.items() if (gg == g) and (s in samples_in_data)]
+            # preserve appearance order or sort if you prefer: members.sort()
+            grouped_samples.extend(members)
+
+        if not grouped_samples:
+            raise ValueError("No samples found after grouping. Check group_dict and sample_col values.")
+
+        # 6) Make a color list aligned to sample order (each box gets the color of its group)
+        color_list = [group_palette[group_dict[s]] for s in grouped_samples]
+
+        # 7) Draw the box plot by sample, but color boxes by group
+        plt.figure(figsize=(12, 6))
+        ax = sns.boxplot(
+            data=df_plot, x="Sample", y="abs_error_deg",
+            order=grouped_samples,
+            palette=color_list,  # per-box colors
+            boxprops=dict(alpha=box_alpha),
+            medianprops=dict(alpha=box_alpha),
+            whiskerprops=dict(alpha=box_alpha),
+            capprops=dict(alpha=box_alpha),
+            flierprops=dict(marker="")  # hide outliers
+        )
+
+        # Optional: overlay jittered points, colored by group for visual density
+        sns.stripplot(
+            data=df_plot, x="Sample", y="abs_error_deg",
+            order=grouped_samples,
+            hue="Group", palette=group_palette,
+            jitter=jitter, alpha=data_alpha, dodge=False, size=3, edgecolor="w", linewidth=0.3
+        )
+
+        # 8) Replace x-tick labels with centered group names
+        #    Compute the mean x-position (index) of samples belonging to each group.
+        sample_positions = {s: i for i, s in enumerate(grouped_samples)}
+        group_positions = []
+        for g in unique_groups:
+            members = [s for s in grouped_samples if group_dict.get(s) == g]
+            if members:
+                idxs = [sample_positions[s] for s in members]
+                group_positions.append(np.mean(idxs))
+
+        # Re-label x-axis with group names at their cluster centers
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(unique_groups, rotation=45, ha="right")
+
+        # 9) Cosmetics
+        ax.set_xlabel("Group")
+        ax.set_ylabel("Absolute Angular Error (deg)")
+        ax.set_ylim(ylim)
+        ax.set_title(title)
+        #ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.legend([], [], frameon=False)  # remove legend (groups are on x-axis)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        plt.show()
+
+        # Return the plotting dataframe and metrics in case you want to reuse them
+        return df_plot, metrics
+
+    def add_encoder_angular_velocity(
+            self,
+            angle_col: str = "angle_renc",
+            time_col: str = "timestamp",
+            out_col: str = "enc_angvel_dps",
+            smoothing: str = None,  # None | "mean" | "median"
+            window: int = 2,
+            center: bool = True,
+            min_periods: int = 1,
+            unwrap: bool = False,
+            time_format: str = "HMSfn",  # "HMSfn" | "s" | "ms" | "us" | "ns" | "datetime"
+            method: str = "diff"  # "diff" | "gradient"
+    ):
+        """
+        Compute instantaneous angular velocity (deg/s) from ENCODER angle vs timestamp.
+
+        time_format:
+          - "HMSfn": timestamps like HHMMSSffffff (no delimiters; any # of fractional digits)
+          - "s"|"ms"|"us"|"ns": numeric counters in those units
+          - "datetime": parseable datetime-like strings or pandas datetime dtype
+        """
+        import numpy as np
+        import pandas as pd
+
+        if not hasattr(self, "enc_df") or self.enc_df is None or len(self.enc_df) == 0:
+            raise ValueError("self.enc_df is empty; load encoder data first.")
+
+        df = self.enc_df
+        if angle_col not in df.columns:
+            raise KeyError(f"'{angle_col}' not in enc_df columns.")
+        if time_col not in df.columns:
+            raise KeyError(f"'{time_col}' not in enc_df columns.")
+
+        work = df[[time_col, angle_col]].copy()
+
+        # --- Angle (deg) ---
+        ang = pd.to_numeric(work[angle_col], errors="coerce")
+
+        # Optional unwrap (handles 360° wraparound)
+        if unwrap:
+            ang_rad = np.deg2rad(ang.to_numpy())
+            ang = pd.Series(np.rad2deg(np.unwrap(ang_rad)), index=work.index)
+
+        # --- Time → seconds ---
+        def hmsfn_to_seconds(vals):
+            """Parse HHMMSS + optional fractional digits into seconds since start of day."""
+            out = np.empty(len(vals), dtype="float64")
+            for i, v in enumerate(vals):
+                s = str(v)
+                # pad if needed; assume at least HHMMSS present
+                if len(s) < 6:
+                    s = s.zfill(6)
+                hh = int(s[0:2]);
+                mm = int(s[2:4]);
+                ss = int(s[4:6])
+                frac = 0.0
+                if len(s) > 6:
+                    frac_str = s[6:]
+                    # ignore non-digits gracefully
+                    if frac_str.isdigit():
+                        frac = int(frac_str) / (10 ** len(frac_str))
+                out[i] = hh * 3600 + mm * 60 + ss + frac
+            # handle midnight rollover (if sequence goes past midnight)
+            if len(out) > 1:
+                jumps = np.diff(out)
+                wrap_idx = np.where(jumps < -43200.0)[0]  # large negative step → crossed midnight
+                if wrap_idx.size:
+                    # add 86400 s after each rollover point (supports multiple days)
+                    add = np.zeros_like(out)
+                    for idx in wrap_idx:
+                        add[idx + 1:] += 86400.0
+                    out = out + add
+            return out
+
+        tf = str(time_format).lower()
+
+        if tf == "hmsfn":
+            t_vals = work[time_col].astype(str).to_numpy()
+            t_s = hmsfn_to_seconds(t_vals)
+        elif tf in {"s", "ms", "us", "ns"}:
+            unit_map = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
+            raw = pd.to_numeric(work[time_col], errors="coerce").to_numpy(dtype="float64")
+            t_s = (raw - raw[0]) * unit_map[tf]
+        elif tf == "datetime":
+            tt = pd.to_datetime(work[time_col], errors="coerce")
+            t_s = (tt - tt.iloc[0]).dt.total_seconds().to_numpy()
+        else:
+            raise ValueError(f"Unsupported time_format='{time_format}'. Use 'HMSfn'|'s'|'ms'|'us'|'ns'|'datetime'.")
+
+        # Ensure strictly increasing time (sort by t_s)
+        order = np.argsort(t_s)
+        t_s = t_s[order]
+        ang = ang.iloc[order]
+
+        # dt (s), guard against zeros/negatives
+        dt_s = np.r_[np.nan, np.diff(t_s)]
+        dt_s[dt_s <= 0] = np.nan
+
+        # --- Velocity (deg/s) ---
+        if method == "gradient":
+            vel_vals = np.gradient(ang.to_numpy(), t_s)
+        else:
+            vel_vals = pd.Series(ang).diff().to_numpy() / dt_s
+
+        vel = pd.Series(vel_vals, index=work.index[order])
+
+        # Optional smoothing
+        if smoothing == "mean":
+            vel = vel.rolling(window=window, center=center, min_periods=min_periods).mean()
+        elif smoothing == "median":
+            vel = vel.rolling(window=window, center=center, min_periods=min_periods).median()
+
+        # Write back
+        self.enc_df.loc[vel.index, out_col] = vel.values
+
+        # Stats
+        finite_vel = vel[np.isfinite(vel)]
+        median_dps = float(np.nanmedian(finite_vel)) if not finite_vel.empty else float("nan")
+        median_speed_dps = float(np.nanmedian(np.abs(finite_vel))) if not finite_vel.empty else float("nan")
+
+        finite_dt = dt_s[np.isfinite(dt_s)]
+        median_dt_s = float(np.median(finite_dt)) if finite_dt.size else float("nan")
+        est_rate_hz = float(1.0 / median_dt_s) if median_dt_s and np.isfinite(
+            median_dt_s) and median_dt_s > 0 else float("nan")
+
+        return self.enc_df, {
+            "median_dps": median_dps,
+            "median_speed_dps": median_speed_dps,
+            "median_dt_s": median_dt_s,
+            "est_rate_hz": est_rate_hz,
+            "time_format_used": time_format,
+        }
+
 
 class bender_class:
     
@@ -1011,6 +1562,7 @@ class bender_class:
         axes[1].set_xticklabels(xtick_labels, rotation=45, ha='right')
 
         plt.tight_layout()
+        plt.savefig("compact pairwise comp.png", dpi=300, bbox_inches='tight')
         plt.show()
 
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
@@ -1467,6 +2019,8 @@ class bender_class:
         plt.title('Box Plot of Absolute Errors by Group')
         plt.ylim(0, 7)  # Change the range as needed
 
+        plt.savefig("box plot", dpi=300, bbox_inches='tight')
+
         plt.show()
 
     def accuracy_by_angle(self, y_true, y_pred, angle_accuracy):
@@ -1588,7 +2142,7 @@ class bender_class:
         if ylim:
             plt.ylim(ylim)
 
-
+        plt.savefig("min_angle_bar_chart.png", dpi=300, bbox_inches='tight')
 
         plt.show()
 
