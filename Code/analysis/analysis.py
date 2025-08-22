@@ -83,6 +83,113 @@ class DLC3DBendAngles:
             return out
         return df
 
+    # ---------- Column + point helpers ----------
+    def get_xyz(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str], Tuple[str, str, str]]:
+        """Return MultiIndex columns for (x, y, z) of the given bodypart."""
+        label = self.bp[bodypart_key]
+        cols = self.df.columns
+        cand = [c for c in cols if len(c) >= 3 and str(c[1]).strip().lower() == label.strip().lower()]
+        if not cand:
+            raise KeyError(f"Bodypart '{label}' not found.")
+        coord_map = {str(c[2]).strip().lower(): c for c in cand}
+        try:
+            return (coord_map["x"], coord_map["y"], coord_map["z"])
+        except KeyError:
+            # Preserve old behavior for explicit xyz requests
+            raise KeyError(f"Missing x/y/z for bodypart '{label}'.")
+
+    def get_xy(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str]]:
+        """Return MultiIndex columns for (x, y) of the given bodypart."""
+        label = self.bp[bodypart_key]
+        cols = self.df.columns
+        cand = [c for c in cols if len(c) >= 3 and str(c[1]).strip().lower() == label.strip().lower()]
+        if not cand:
+            raise KeyError(f"Bodypart '{label}' not found.")
+        coord_map = {str(c[2]).strip().lower(): c for c in cand}
+        try:
+            return (coord_map["x"], coord_map["y"])
+        except KeyError:
+            raise KeyError(f"Missing x and/or y for bodypart '{label}'.")
+
+    def get_points(
+            self,
+            bodypart_key: str,
+            allow_2d: bool = True,
+            pad_2d_with_z0: bool = True
+    ) -> np.ndarray:
+        """
+        Return Nx3 (preferred) or Nx2 coordinates for the bodypart.
+        - If (x,y,z) exist: returns Nx3.
+        - If only (x,y) exist and allow_2d:
+            * returns Nx3 with z=0 if pad_2d_with_z0=True,
+            * otherwise returns Nx2.
+        """
+        try:
+            # Try full (x,y,z)
+            xyz_cols = self.get_xyz(bodypart_key)
+            return self.df[list(xyz_cols)].to_numpy(dtype=float)
+        except KeyError:
+            if not allow_2d:
+                raise
+            # Fall back to 2D
+            x_col, y_col = self.get_xy(bodypart_key)
+            xy = self.df[[x_col, y_col]].to_numpy(dtype=float)
+            if pad_2d_with_z0:
+                # Promote to 3D by padding z=0 so downstream 3D code keeps working
+                z = np.zeros((xy.shape[0], 1), dtype=float)
+                return np.hstack([xy, z])
+            else:
+                # Return pure 2D; vector/angle ops still work (axis=1)
+                return xy
+
+        # ---------- Vector + angle math ----------
+
+    @staticmethod
+    def vector(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        """Row-wise vector from A to B."""
+        return B - A
+
+    @staticmethod
+    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        """Row-wise angle (deg) via dot product."""
+        n1 = np.linalg.norm(v1, axis=1)
+        n2 = np.linalg.norm(v2, axis=1)
+        denom = n1 * n2
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cosang = np.sum(v1 * v2, axis=1) / denom
+        cosang = np.clip(cosang, -1.0, 1.0)
+        ang = np.degrees(np.arccos(cosang))
+        ang[~np.isfinite(ang)] = np.nan
+        return ang
+
+    def compute_vectors(self, angle_type: str = "mcp") -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return (v1, v2) for the requested angle.
+          - 'mcp'   : v1 = hand→MCP, v2 = MCP→PIP
+          - 'wrist' : v1 = forearm→hand, v2 = hand→MCP
+        """
+        angle_type = angle_type.lower()
+        hand = self.get_points("hand")
+        mcp = self.get_points("MCP")
+
+        if angle_type == "mcp":
+            pip = self.get_points("PIP")
+            v1 = self.vector(hand, mcp)
+            v2 = self.vector(mcp, pip)
+        elif angle_type == "wrist":
+            forearm = self.get_points("forearm")
+            v1 = self.vector(forearm, hand)
+            v2 = self.vector(hand, mcp)
+        else:
+            raise ValueError("angle_type must be one of {'mcp','wrist'}")
+        return v1, v2
+
+    def compute_bend_angle(self, angle_type: str = "mcp") -> np.ndarray:
+        """Compute bend angle per frame for the requested angle_type."""
+        v1, v2 = self.compute_vectors(angle_type)
+        return self.angle_from_vectors(v1, v2)
+
+
     @staticmethod
     def _resolve_col_key(df: pd.DataFrame, col_spec):
         """
@@ -439,97 +546,6 @@ class DLC3DBendAngles:
             return self.df
         return matched
 
-
-    # ---------- Column + point helpers ----------
-    def get_xyz(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str], Tuple[str, str, str]]:
-        """Return MultiIndex columns for (x, y, z) of the given bodypart."""
-        label = self.bp[bodypart_key]
-        cols = self.df.columns
-        cand = [c for c in cols if len(c) >= 3 and str(c[1]).strip().lower() == label.strip().lower()]
-        if not cand:
-            raise KeyError(f"Bodypart '{label}' not found.")
-        coord_map = {str(c[2]).strip().lower(): c for c in cand}
-        try:
-            return (coord_map["x"], coord_map["y"], coord_map["z"])
-        except KeyError:
-            raise KeyError(f"Missing x/y/z for bodypart '{label}'.")
-
-    def get_points(self, bodypart_key: str) -> np.ndarray:
-        """Return Nx3 array for the bodypart."""
-        xyz_cols = self.get_xyz(bodypart_key)
-        return self.df[list(xyz_cols)].to_numpy(dtype=float)
-
-    # ---------- Vector + angle math ----------
-    @staticmethod
-    def vector(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-        """Row-wise vector from A to B."""
-        return B - A
-
-    @staticmethod
-    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-        """Row-wise angle (deg) via dot product."""
-        n1 = np.linalg.norm(v1, axis=1)
-        n2 = np.linalg.norm(v2, axis=1)
-        denom = n1 * n2
-        with np.errstate(invalid="ignore", divide="ignore"):
-            cosang = np.sum(v1 * v2, axis=1) / denom
-        cosang = np.clip(cosang, -1.0, 1.0)
-        ang = np.degrees(np.arccos(cosang))
-        ang[~np.isfinite(ang)] = np.nan
-        return ang
-
-    def compute_vectors(self, angle_type: str = "mcp") -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return (v1, v2) for the requested angle.
-          - 'mcp'   : v1 = hand→MCP, v2 = MCP→PIP
-          - 'wrist' : v1 = forearm→hand, v2 = hand→MCP
-        """
-        angle_type = angle_type.lower()
-        hand = self.get_points("hand")
-        mcp  = self.get_points("MCP")
-
-        if angle_type == "mcp":
-            pip = self.get_points("PIP")
-            v1 = self.vector(hand, mcp)
-            v2 = self.vector(mcp, pip)
-        elif angle_type == "wrist":
-            forearm = self.get_points("forearm")
-            v1 = self.vector(forearm, hand)
-            v2 = self.vector(hand, mcp)
-        else:
-            raise ValueError("angle_type must be one of {'mcp','wrist'}")
-        return v1, v2
-
-    def compute_bend_angle(self, angle_type: str = "mcp") -> np.ndarray:
-        """Compute bend angle per frame for the requested angle_type."""
-        v1, v2 = self.compute_vectors(angle_type)
-        return self.angle_from_vectors(v1, v2)
-
-    # ---------- Output to DataFrame ----------
-    def add_angle_column(
-        self,
-        angle_type: str = "mcp",
-        out_key: Optional[Tuple[str, str, str]] = None,
-        inplace: bool = False
-    ) -> pd.DataFrame:
-        """
-        Append angle column to a DataFrame copy (or in place if inplace=True).
-
-        out_key: MultiIndex tuple for the column; default ('metric', f'{angle_type}_bend_deg', 'deg')
-        """
-        angles = self.compute_bend_angle(angle_type)
-        target = self.df if inplace else self.df.copy()
-        if out_key is None:
-            out_key = ("metric", f"{angle_type}_bend_deg", "deg")
-        target[out_key] = angles
-        return target
-
-    def add_all_angles(self, inplace: bool = False) -> pd.DataFrame:
-        """Convenience: add both wrist and mcp angles."""
-        target = self.df if inplace else self.df.copy()
-        for ang in ("wrist", "mcp"):
-            target[("metric", f"{ang}_bend_deg", "deg")] = self.compute_bend_angle(ang)
-        return target
 
     def load_imu_p_enc(self, imu_path=None, enc_path=None):
         """
@@ -901,6 +917,244 @@ class DLC3DBendAngles:
         plt.show()
 
         # Return the plotting dataframe and metrics in case you want to reuse them
+        return df_plot, metrics
+
+    def compute_mcp_vs_encoder_error(
+            self,
+            mcp_angle_col=("metric", "mcp_bend_deg", "deg"),  # MCP bend angle in degrees
+            enc_angle_col="angle_renc",  # encoder angle column
+            time_col="timestamp",  # timestamp for optional merge/trace
+            thresholds=(1, 2, 5),  # report % within these abs-error thresholds
+            use_abs_encoder=True,  # compare against |encoder| if True
+            wrap=False  # set True only if 0–360 wrapping applies
+    ):
+        """
+        Compute MCP-vs-Encoder angular errors with encoder as truth.
+
+        Returns:
+            metrics (dict): {
+                "rmse", "mae", "bias", "max_abs_error",
+                "abs_error_array", "within_deg": {thr: percent, ...}, "n"
+            }
+            df_err (pd.DataFrame): [time_col (if present), enc_angle_col, mcp_angle_col, "error_deg", "abs_error_deg"]
+        """
+        import numpy as np
+        import pandas as pd
+
+        # --- Resolve a working table that has BOTH columns (prefer self.df) ---
+        if (mcp_angle_col in self.df.columns) and (enc_angle_col in self.df.columns):
+            df = self.df.copy()
+        else:
+            # Try merging encoder from self.enc_df into self.df by timestamp
+            if not hasattr(self, "enc_df") or self.enc_df is None:
+                raise RuntimeError(
+                    "Encoder column not found in self.df and self.enc_df is not available for merge."
+                )
+            for need, tab, col in [(mcp_angle_col, "self.df", mcp_angle_col), (time_col, "self.df", time_col)]:
+                if need not in self.df.columns:
+                    raise KeyError(f"Column {col} not found in {tab} (needed to merge).")
+            if time_col not in self.enc_df.columns or enc_angle_col not in self.enc_df.columns:
+                raise KeyError(f"'{time_col}' and/or '{enc_angle_col}' missing in self.enc_df; cannot merge.")
+
+            df = (
+                self.df[[time_col, mcp_angle_col]]
+                .merge(self.enc_df[[time_col, enc_angle_col]], on=time_col, how="inner")
+            )
+
+        # --- Coerce to numeric & mask NaNs ---
+        mcp = pd.to_numeric(df[mcp_angle_col], errors="coerce")
+        enc = pd.to_numeric(df[enc_angle_col], errors="coerce")
+        mask = mcp.notna() & enc.notna()
+        mcp = mcp[mask].to_numpy()
+        enc = enc[mask].to_numpy()
+        ts = df.loc[mask, time_col].to_numpy() if time_col in df.columns else None
+
+        # --- Prepare encoder reference (|encoder| optional) ---
+        enc_cmp = np.abs(enc) if use_abs_encoder else enc
+
+        # --- Signed diff (optionally circular) ---
+        if wrap:
+            # minimal signed diff in [-180, 180)
+            err = (mcp - enc_cmp + 180.0) % 360.0 - 180.0
+        else:
+            err = mcp - enc_cmp
+
+        aerr = np.abs(err)
+
+        # --- Build output table ---
+        out_cols = {
+            enc_angle_col: enc_cmp,
+            mcp_angle_col: mcp,
+            "error_deg": err,
+            "abs_error_deg": aerr,
+        }
+        if ts is not None:
+            out_cols[time_col] = ts
+        df_err = pd.DataFrame(out_cols)
+
+        # --- Metrics ---
+        if aerr.size:
+            rmse = float(np.sqrt(np.mean(err ** 2)))
+            mae = float(np.mean(aerr))
+            bias = float(np.mean(err))
+            max_abs_error = float(np.max(aerr))
+            within = {thr: float(np.mean(aerr <= thr) * 100.0) for thr in thresholds}
+        else:
+            rmse = mae = bias = max_abs_error = float("nan")
+            within = {thr: float("nan") for thr in thresholds}
+
+        metrics = {
+            "rmse": rmse,
+            "mae": mae,
+            "bias": bias,
+            "max_abs_error": max_abs_error,
+            "abs_error_array": aerr,  # full array if you want it
+            "within_deg": within,
+            "n": int(len(df_err)),
+        }
+        return metrics, df_err
+
+    def plot_mcp_encoder_error_boxplot_grouped(
+            self,
+            sample_col,  # e.g. "sample_id"
+            group_dict,  # {sample_name -> group_label}
+            group_colors,  # list of colors, aligned with group_names
+            group_names,  # ordered list of group labels to display
+            mcp_angle_col=("metric", "mcp_bend_deg", "deg"),
+            enc_angle_col="angle_renc",
+            time_col="timestamp",
+            thresholds=(1, 2, 5),
+            use_abs_encoder=True,
+            wrap=False,
+            box_alpha=0.5,
+            data_alpha=0.5,
+            jitter=0.2,
+            ylim=(0, 7),
+            save_path=None,
+            dpi=300,
+            title="MCP vs Encoder | Absolute Error by Sample (Grouped)",
+    ):
+        """
+        Box plot of |MCP - Encoder| per sample, colored by group, with group names centered on x-axis.
+
+        Assumes:
+          - Rows come from self.df (preferred) after encoder has been attached by timestamp,
+            OR encoder will be merged from self.enc_df via compute_mcp_vs_encoder_error.
+          - `sample_col` and `time_col` exist in whichever table provides the labels (self.df preferred).
+        """
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        try:
+            import seaborn as sns
+        except ImportError:
+            raise ImportError("seaborn is required for this plot. Try: pip install seaborn")
+
+        # 1) Compute MCP vs Encoder errors (handles merge if encoder not in self.df)
+        metrics, df_err = self.compute_mcp_vs_encoder_error(
+            mcp_angle_col=mcp_angle_col,
+            enc_angle_col=enc_angle_col,
+            time_col=time_col,
+            thresholds=thresholds,
+            use_abs_encoder=use_abs_encoder,
+            wrap=wrap
+        )
+
+        if df_err.empty or "abs_error_deg" not in df_err.columns:
+            raise ValueError("No error rows to plot: df_err is empty or missing 'abs_error_deg'.")
+
+        # 2) Attach sample labels (prefer self.df, else self.enc_df) — SAFE None checks
+        src_df = None
+        if getattr(self, "df", None) is not None and {sample_col, time_col}.issubset(self.df.columns):
+            src_df = self.df
+        elif getattr(self, "enc_df", None) is not None and {sample_col, time_col}.issubset(self.enc_df.columns):
+            src_df = self.enc_df
+
+        if src_df is None:
+            raise KeyError(
+                f"Could not find both '{sample_col}' and '{time_col}' in either self.df or self.enc_df "
+                "to label samples for the grouped boxplot."
+            )
+
+        df_samples = src_df[[time_col, sample_col]].drop_duplicates(subset=[time_col])
+        df_plot = (
+            df_err.merge(df_samples, on=time_col, how="left")
+            .rename(columns={sample_col: "Sample"})
+        )
+        df_plot["Group"] = df_plot["Sample"].map(group_dict)
+        df_plot = df_plot.dropna(subset=["Sample", "Group", "abs_error_deg"]).copy()
+
+        if df_plot.empty:
+            raise ValueError(
+                "No rows after joining labels/groups. Check sample_col, time_col, and group_dict mappings.")
+
+        # 3) Palette / order
+        unique_groups = list(group_names)
+        if len(unique_groups) != len(group_colors):
+            raise ValueError("group_colors length must match group_names length.")
+        group_palette = {g: c for g, c in zip(unique_groups, group_colors)}
+
+        # Keep only samples present in data, preserving group order
+        samples_in_data = df_plot["Sample"].dropna().unique().tolist()
+        grouped_samples = []
+        for g in unique_groups:
+            members = [s for s, gg in group_dict.items() if (gg == g) and (s in samples_in_data)]
+            grouped_samples.extend(members)
+
+        if not grouped_samples:
+            raise ValueError("No samples to plot after grouping; check group_dict/group_names/sample_col values.")
+
+        # Per-box colors matching sample order
+        color_list = [group_palette[group_dict[s]] for s in grouped_samples]
+
+        # 4) Plot
+        plt.figure(figsize=(12, 6))
+        ax = sns.boxplot(
+            data=df_plot, x="Sample", y="abs_error_deg",
+            order=grouped_samples,
+            palette=color_list,
+            showfliers=False,
+            boxprops=dict(alpha=box_alpha),
+            medianprops=dict(alpha=box_alpha),
+            whiskerprops=dict(alpha=box_alpha),
+            capprops=dict(alpha=box_alpha),
+        )
+
+        sns.stripplot(
+            data=df_plot, x="Sample", y="abs_error_deg",
+            order=grouped_samples,
+            hue="Group", palette=group_palette,
+            jitter=jitter, alpha=data_alpha, dodge=False, size=3, edgecolor="w", linewidth=0.3
+        )
+
+        # Center group labels on clusters
+        sample_positions = {s: i for i, s in enumerate(grouped_samples)}
+        group_positions = []
+        for g in unique_groups:
+            members = [s for s in grouped_samples if group_dict.get(s) == g]
+            if members:
+                idxs = [sample_positions[s] for s in members]
+                group_positions.append(np.mean(idxs))
+
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(unique_groups, rotation=45, ha="right")
+
+        ax.set_xlabel("Group")
+        ax.set_ylabel("Absolute Angular Error (deg)")
+        ax.set_ylim(ylim)
+        ax.set_title(title)
+
+        # Remove legend (group names are on x-axis)
+        try:
+            ax.legend_.remove()
+        except Exception:
+            ax.legend([], [], frameon=False)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        plt.show()
+
         return df_plot, metrics
 
     def add_encoder_angular_velocity(
