@@ -28,28 +28,36 @@ class DLC3DBendAngles:
       - 'wrist' : angle(forearm→hand, hand→MCP)
     """
 
-    def __init__(self, csv_paths, bodyparts: Optional[Dict[str, str]] = None):
-        """
-        Initialize from one or two DLC 3D CSV files.
-        """
-        # Store for reference
-        self.csv_path = csv_paths
-        self._match_map: Optional[pd.DataFrame] = None  # holds ['cam_index','enc_index','time_delta']
-        self.df = None  # for DLC keypoints, if needed
-        self.imu_df = None  # IMU dataframe
-        self.enc_df = None  # encoder dataframe
 
-        # Handle single CSV
-        if isinstance(csv_paths, str):
-            df = pd.read_csv(csv_paths, header=[0, 1, 2])
+    def __init__(self, data, bodyparts: Optional[Dict[str, str]] = None):
+        """
+        Initialize from:
+          - one or two DLC 3D CSV file paths
+          - OR an existing pandas DataFrame
+        """
+        import pandas as pd
+
+        self.csv_path = data
+        self._match_map: Optional[pd.DataFrame] = None
+        self.df = None
+        self.imu_df = None
+        self.enc_df = None
+
+        # Case 1: Directly a pandas DataFrame
+        if isinstance(data, pd.DataFrame):
+            self.df = data
+
+        # Case 2: Single CSV path
+        elif isinstance(data, str):
+            df = pd.read_csv(data, header=[0, 1, 2])
             if not isinstance(df.columns, pd.MultiIndex):
                 raise ValueError("Expected DLC 3D CSV with a 3-row MultiIndex header.")
             self.df = df
 
-        # Handle two CSVs
-        elif isinstance(csv_paths, (list, tuple)) and len(csv_paths) == 2:
+        # Case 3: Two CSV paths
+        elif isinstance(data, (list, tuple)) and len(data) == 2:
             dfs = []
-            for path in csv_paths:
+            for path in data:
                 df = pd.read_csv(path, header=[0, 1, 2])
                 if not isinstance(df.columns, pd.MultiIndex):
                     raise ValueError(f"{path} does not have a 3-row MultiIndex header.")
@@ -58,7 +66,7 @@ class DLC3DBendAngles:
                 raise ValueError(f"Row count mismatch: {len(dfs[0])} vs {len(dfs[1])}")
             self.df = pd.concat(dfs, axis=1)
         else:
-            raise ValueError("csv_paths must be a string or a list/tuple of two CSV paths.")
+            raise ValueError("Input must be a DataFrame, a CSV path, or a list/tuple of two CSV paths.")
 
         # Default bodyparts mapping
         self.bp = {
@@ -161,6 +169,85 @@ class DLC3DBendAngles:
         ang = np.degrees(np.arccos(cosang))
         ang[~np.isfinite(ang)] = np.nan
         return ang
+
+    @staticmethod
+    def _rowwise_unit(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+        """Normalize rows; rows with ||x|| < eps become 0."""
+        n = np.linalg.norm(x, axis=1, keepdims=True)
+        out = np.zeros_like(x)
+        good = (n[:, 0] > eps)
+        out[good] = x[good] / n[good]
+        return out
+
+    @staticmethod
+    def _project_onto_plane(vec: np.ndarray, n_hat: np.ndarray) -> np.ndarray:
+        """Project rows of vec onto plane with unit normal n_hat (row-wise)."""
+        # Projection: v_proj = v - (v·n_hat) n_hat
+        dot = np.sum(vec * n_hat, axis=1, keepdims=True)
+        return vec - dot * n_hat
+
+    def angle_from_vectors_in_plane(
+            self,
+            v1: np.ndarray,
+            v2: np.ndarray,
+            plane_v1: np.ndarray,
+            plane_v2: np.ndarray,
+            signed: bool = False,
+            eps: float = 1e-12,
+    ):
+        """
+        Row-wise: project v1 and v2 onto the plane spanned by plane_v1 and plane_v2,
+        then compute the angle between the projected vectors (in degrees).
+
+        Returns:
+            ang: (N,) array of angles in degrees (NaN where plane/inputs degenerate)
+            p1:  (N,3) projected v1 onto plane
+            p2:  (N,3) projected v2 onto plane
+            valid_plane: (N,) bool mask where plane normal is well-defined
+        """
+        v1 = np.asarray(v1, float)
+        v2 = np.asarray(v2, float)
+        p1a = np.asarray(plane_v1, float)
+        p2a = np.asarray(plane_v2, float)
+
+        # Plane normal (row-wise)
+        n = np.cross(p1a, p2a)
+        n_norm = np.linalg.norm(n, axis=1)
+        valid_plane = n_norm > eps
+        n_hat = np.zeros_like(n)
+        n_hat[valid_plane] = (n[valid_plane] / n_norm[valid_plane, None])
+
+        # Project v1, v2 into the plane
+        p1 = self._project_onto_plane(v1, n_hat)
+        p2 = self._project_onto_plane(v2, n_hat)
+
+        # Normalize to compute angles robustly
+        p1n = np.linalg.norm(p1, axis=1)
+        p2n = np.linalg.norm(p2, axis=1)
+        good = valid_plane & (p1n > eps) & (p2n > eps)
+
+        ang = np.full(v1.shape[0], np.nan, dtype=float)
+
+        if not np.any(good):
+            return ang, p1, p2, valid_plane
+
+        if signed:
+            # Signed angle w.r.t. plane normal: atan2( (p1×p2)·n_hat, p1·p2 )
+            p1u = np.zeros_like(p1)
+            p2u = np.zeros_like(p2)
+            p1u[good] = p1[good] / p1n[good, None]
+            p2u[good] = p2[good] / p2n[good, None]
+            cross_p = np.cross(p1u[good], p2u[good])
+            sin_th = np.sum(cross_p * n_hat[good], axis=1)
+            cos_th = np.sum(p1u[good] * p2u[good], axis=1)
+            ang[good] = np.degrees(np.arctan2(sin_th, cos_th))
+        else:
+            # Unsigned angle via dot product
+            cosang = np.sum(p1[good] * p2[good], axis=1) / (p1n[good] * p2n[good])
+            cosang = np.clip(cosang, -1.0, 1.0)
+            ang[good] = np.degrees(np.arccos(cosang))
+
+        return ang, p1, p2, valid_plane
 
     def compute_vectors(self, angle_type: str = "mcp") -> Tuple[np.ndarray, np.ndarray]:
         """
