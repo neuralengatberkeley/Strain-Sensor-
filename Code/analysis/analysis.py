@@ -1420,6 +1420,55 @@ class bender_class:
                 f"model={self.model.__class__.__name__ if self.model else 'None'}, "
                 f"poly_features={self.poly_features.__class__.__name__ if self.poly_features else 'None'})")
 
+    def load_merged_df(self, merged_df, enc_col="angle_renc", adc_col="adc_ch0"):
+        """
+        Load an already merged (aligned) dataframe into bender_class.
+        Picks out encoder and ADC columns, converts encoder to degrees,
+        then back into raw counts (so normalization + model methods still work).
+
+        Parameters
+        ----------
+        merged_df : pd.DataFrame
+            DataFrame containing at least encoder and ADC/strain columns.
+        enc_col : str
+            Column name for encoder angle in DEGREES (e.g., "angle_renc_renc").
+        adc_col : str
+            Column name for ADC/strain channel (e.g., "adc_ch0").
+        """
+        import pandas as pd
+        import numpy as np
+
+        if enc_col not in merged_df.columns:
+            raise KeyError(f"Encoder column '{enc_col}' not found in merged_df. "
+                           f"Available columns: {list(merged_df.columns)}")
+
+        if adc_col not in merged_df.columns:
+            raise KeyError(f"ADC column '{adc_col}' not found in merged_df. "
+                           f"Available columns: {list(merged_df.columns)}")
+
+        # 1) Get encoder degrees, convert to raw counts
+        enc_counts = pd.to_numeric(merged_df[enc_col], errors="coerce")
+      
+
+        # 2) Get ADC values
+        adc_vals = pd.to_numeric(merged_df[adc_col], errors="coerce")
+
+        # 3) Build internal dataframe with 4 cols (like load_data)
+        df = pd.DataFrame({
+            "Rotary Encoder": enc_counts,
+            "ADC Value": adc_vals,
+            "C3": 0,
+            "C4": 0,
+        })
+
+        self.data = df
+        self.columns = df.columns
+        self.adc_normalized = False
+        self.normalize_type = None
+
+        print(f"Loaded merged_df with {len(df)} rows into bender_class.")
+        return self.data
+
     def load_data(self, regex_path):
         '''
         method to load data from csv files that match the regular expression string "regex_path"
