@@ -9,6 +9,7 @@ import glob
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
+from scipy.optimize import curve_fit
 
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
@@ -2015,6 +2016,118 @@ class bender_class:
         ax.set_ylabel("Train Dataset")
 
         plt.show()
+
+    import numpy as np
+    from scipy.optimize import curve_fit
+    import matplotlib.pyplot as plt
+
+    def _norm_theoretical(self, theta_rad, r, L=2.0):
+        """
+        Normalized theoretical curve vs angle θ (radians).
+        alpha = r / L.
+        y(0)=0 and y(pi/2)=1 by construction.
+        """
+        theta = np.asarray(theta_rad, dtype=float)
+        alpha = r / L
+
+        num = theta * (8.0 - alpha * theta) / (2.0 - alpha * theta) ** 2
+        th_max = np.pi / 2.0
+        den = th_max * (8.0 - alpha * th_max) / (2.0 - alpha * th_max) ** 2
+        return num / den
+
+    def fit_knuckle_radius_from_normalized(self,
+                                           L=2.0,
+                                           angle_col="Rotary Encoder",
+                                           value_col="ADC Value",
+                                           r0=0.7,
+                                           bounds=(1e-4, 2.45),
+                                           restrict_to_0_90=True,
+                                           make_angles_positive=True,
+                                           plot=False,
+                                           ax=None,
+                                           flip_data=False):
+        """
+        Fit the normalized theoretical model to data in self.data to estimate knuckle radius r.
+        Now supports flipping the data so that 0°→0 and 90°→1 always match the model.
+        """
+        import numpy as np
+        from scipy.optimize import curve_fit
+        import matplotlib.pyplot as plt
+
+        if self.data is None:
+            raise ValueError("No data loaded. Use load_merged_df(...) or load_data(...) first.")
+
+        # Pull columns
+        x_deg = np.asarray(self.data[angle_col], dtype=float)
+        y = np.asarray(self.data[value_col], dtype=float)
+
+        # Flip data if needed
+        if flip_data:
+            y = 1.0 - y
+
+        # Clean/guard
+        m = np.isfinite(x_deg) & np.isfinite(y)
+        x_deg = x_deg[m]
+        y = y[m]
+
+        if make_angles_positive:
+            x_deg = np.abs(x_deg)
+
+        if restrict_to_0_90:
+            mm = (x_deg >= 0.0) & (x_deg <= 90.0)
+            x_deg = x_deg[mm]
+            y = y[mm]
+
+        if x_deg.size < 5:
+            raise ValueError("Not enough points (need ≥5) in the 0–90° range to fit.")
+
+        # Convert to radians
+        theta = np.deg2rad(x_deg)
+
+        # Theoretical model
+        def _norm_theoretical(theta, r, L=L):
+            alpha = r / L
+            num = theta * (8.0 - alpha * theta) / (2.0 - alpha * theta) ** 2
+            th_max = np.pi / 2.0
+            den = th_max * (8.0 - alpha * th_max) / (2.0 - alpha * th_max) ** 2
+            return num / den
+
+        # Fit r
+        popt, pcov = curve_fit(lambda th, r: _norm_theoretical(th, r, L),
+                               theta, y, p0=[r0], bounds=bounds, maxfev=20000)
+        r_hat = float(popt[0])
+
+        # Predictions and R²
+        y_pred = _norm_theoretical(theta, r_hat, L)
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+        # Std error & 95% CI
+        r_se = float(np.sqrt(pcov[0, 0])) if pcov.size else np.nan
+        ci95 = (r_hat - 1.96 * r_se, r_hat + 1.96 * r_se) if np.isfinite(r_se) else (np.nan, np.nan)
+
+        # Optional plot
+        if plot:
+            if ax is None:
+                fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x_deg, y, ".", markersize=3, label="Data")
+            th_fit = np.linspace(0, np.deg2rad(max(90.0, x_deg.max())), 600)
+            y_fit = _norm_theoretical(th_fit, r_hat, L)
+            ax.plot(np.rad2deg(th_fit), y_fit, "-", label=f"Fit r={r_hat:.3f} in (R²={r2:.4f})")
+            ax.set_xlabel("Angle (deg)")
+            ax.set_ylabel("Normalized ADC (0–1)")
+            ax.set_title(f"Theoretical fit (L={L} in)")
+            ax.legend()
+            plt.tight_layout()
+
+        return {
+            "r_hat": r_hat,
+            "r_se": r_se,
+            "r_ci95": ci95,
+            "r2": r2,
+            "params_cov": pcov,
+        }
 
     def fig_1_lin_vs_quad(self, perc_train=0.8, random_state=None,
                           data_color='blue', lin_color='red', quad_color='green',
