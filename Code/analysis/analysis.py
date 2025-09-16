@@ -19,6 +19,156 @@ from scipy.interpolate import interp1d
 from typing import Dict, Tuple, Optional, List
 from scipy.io import loadmat
 
+from pathlib import Path
+import re, pandas as pd
+from datetime import datetime
+
+
+from pathlib import Path
+import re
+import pandas as pd
+from datetime import datetime
+
+class BallBearingData:
+    """
+    Manager for ball bearing application datasets.
+
+    Automatically:
+      • Discovers *_B folders under a root path
+      • Splits into two sets of N_TRIALS_PER_SET consecutive trials
+      • Validates # of CSVs per trial
+      • Loads DataFrames with rich metadata
+
+    Usage:
+        bb = BallBearingData(root_dir="CSV Data/9_9_25", path_to_repo=path_to_repository)
+        df_first  = bb.load_first()
+        df_second = bb.load_second()
+        all_data  = bb.load_all()
+    """
+    dt_pat = re.compile(r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_B$")
+
+    def __init__(self, root_dir, path_to_repo=None, n_trials_per_set=15, files_per_trial=5):
+        if path_to_repo:
+            self.root = Path(path_to_repo) / root_dir
+        else:
+            self.root = Path(root_dir)
+        self.n_trials_per_set = n_trials_per_set
+        self.files_per_trial = files_per_trial
+        self.B_folders = self._find_B_folders()
+        self.first_block, self.second_block = self._split_blocks()
+        self._check_counts(self.first_block, "ball_bearing_first")
+        self._check_counts(self.second_block, "ball_bearing_second")
+
+    def _parse_folder_dt(self, folder_name: str):
+        m = self.dt_pat.search(folder_name)
+        if not m:
+            return None
+        y, M, d, h, m, s = map(int, m.groups())
+        return datetime(y, M, d, h, m, s)
+
+    def _find_B_folders(self):
+        out = []
+        for p in self.root.rglob("*_B"):
+            if p.is_dir():
+                dt = self._parse_folder_dt(p.name)
+                csvs = sorted(p.rglob("*.csv"))
+                out.append((p, dt, csvs))
+        out = [(p, dt, csvs) for (p, dt, csvs) in out if dt is not None]
+        out.sort(key=lambda t: t[1])
+        print(f"Found {len(out)} *_B folders total.")
+        return out
+
+    def _split_blocks(self):
+        needed = 2 * self.n_trials_per_set
+        if len(self.B_folders) < needed:
+            raise ValueError(f"Expected at least {needed} *_B folders (2×{self.n_trials_per_set}), "
+                             f"found {len(self.B_folders)}.")
+        first_block = self.B_folders[:self.n_trials_per_set]
+        second_block = self.B_folders[self.n_trials_per_set:needed]
+        print("First set range:", first_block[0][0].name, "→", first_block[-1][0].name)
+        print("Second set range:", second_block[0][0].name, "→", second_block[-1][0].name)
+        return first_block, second_block
+
+    def _check_counts(self, block, label):
+        bad = []
+        for i, (folder, dt, csvs) in enumerate(block, 1):
+            if len(csvs) != self.files_per_trial:
+                bad.append((i, folder, len(csvs)))
+        if bad:
+            print(f"[WARN] {label}: Some trials do not have exactly {self.files_per_trial} CSVs:")
+            for i, folder, n in bad:
+                print(f"  • Trial {i:02d}: {folder.name} has {n} CSVs")
+        else:
+            print(f"{label}: All trials have {self.files_per_trial} CSVs ✅")
+
+    def _load_block(self, block, application_set_label):
+        frames = []
+        for trial_idx, (folder, dt, csvs) in enumerate(block, 1):
+            for file_idx, csv_path in enumerate(csvs, 1):
+                try:
+                    df = pd.read_csv(csv_path, low_memory=False)
+                except Exception as e:
+                    print(f"[WARN] Skipping unreadable file: {csv_path} ({e})")
+                    continue
+                df["application_set"] = application_set_label
+                df["trial_index"] = trial_idx
+                df["file_index"] = file_idx
+                df["folder_name"] = folder.name
+                df["source_folder"] = folder.as_posix()
+                df["source_file"] = csv_path.name
+                df["source_path"] = csv_path.as_posix()
+                df["timestamp_folder"] = dt
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, axis=0, ignore_index=True)
+
+    def load_first(self):
+        return self._load_block(self.first_block, "ball_bearing_first")
+
+    def load_second(self):
+        return self._load_block(self.second_block, "ball_bearing_second")
+
+    def load_all(self):
+        return pd.concat([self.load_first(), self.load_second()], ignore_index=True)
+
+    # -----------------------------
+    # NEW: get ADC DataFrames by trial
+    # -----------------------------
+    def extract_adc_dfs_by_trial(self, df: pd.DataFrame, trials=None):
+        """
+        From a dataset (e.g., df_first or df_second), return one ADC DataFrame per trial.
+        Selection rule:
+          - filter rows whose source_file contains 'adc' (case-insensitive)
+          - if multiple ADC files exist within a trial, pick the file with the most rows
+        Returns:
+          list[pd.DataFrame]: index i corresponds to trial (i+1)
+        """
+        if trials is None:
+            trials = self.n_trials_per_set
+
+        if "source_file" not in df.columns or "source_path" not in df.columns or "trial_index" not in df.columns:
+            raise KeyError("df must contain 'source_file', 'source_path', and 'trial_index' columns.")
+
+        adc_only = df[df["source_file"].str.contains("adc", case=False, na=False)].copy()
+
+        out = []
+        for trial_idx in range(1, trials + 1):
+            rows_t = adc_only[adc_only["trial_index"] == trial_idx]
+            if rows_t.empty:
+                out.append(pd.DataFrame())
+                continue
+
+            # Group by file and pick the one with the most rows
+            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
+            chosen_path = max(groups, key=lambda x: x[1])[0]
+
+            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
+            out.append(df_trial.reset_index(drop=True))
+
+        return out
+
+
 
 class DLC3DBendAngles:
     """
@@ -634,19 +784,210 @@ class DLC3DBendAngles:
             return self.df
         return matched
 
-
-    def load_imu_p_enc(self, imu_path=None, enc_path=None):
+    def load_imu_p_enc(self, imu_path, enc_path):
         """
-        Load IMU and encoder CSV files into self.imu_df and self.enc_df
-        as pandas DataFrames.
+        Load IMU and encoder CSV files into self.imu_df and self.enc_df.
+        Accepts str/Path-like or None. Avoids ambiguous truth checks.
         """
+        import os
         import pandas as pd
-        if imu_path:
+        from pathlib import Path
+
+        def _to_str_path(p):
+            if p is None:
+                return None
+            # Handle Path, numpy.str_, etc.
+            try:
+                return str(p)
+            except Exception:
+                raise TypeError(f"Unsupported path type: {type(p)}")
+
+        imu_path = _to_str_path(imu_path)
+        enc_path = _to_str_path(enc_path)
+
+        if imu_path is not None:
+            if not os.path.exists(imu_path):
+                raise FileNotFoundError(f"IMU path not found: {imu_path}")
             self.imu_df = pd.read_csv(imu_path)
-        if enc_path:
+
+        if enc_path is not None:
+            if not os.path.exists(enc_path):
+                raise FileNotFoundError(f"Encoder path not found: {enc_path}")
             self.enc_df = pd.read_csv(enc_path)
-        print("Loaded IMU shape:", getattr(self, 'imu_df', None).shape if hasattr(self, 'imu_df') else None)
-        print("Loaded ENC shape:", getattr(self, 'enc_df', None).shape if hasattr(self, 'enc_df') else None)
+
+        if not hasattr(self, "imu_df") or self.imu_df is None:
+            raise ValueError("IMU CSV was not loaded (imu_path was None or invalid).")
+        if not hasattr(self, "enc_df") or self.enc_df is None:
+            raise ValueError("Encoder CSV was not loaded (enc_path was None or invalid).")
+
+    def drop_rows_with_none_in_euler(df, euler_cols=("euler1", "euler2")):
+        import numpy as np
+        import pandas as pd
+        df = df.copy()
+        for c in euler_cols:
+            if c not in df.columns:
+                raise KeyError(f"Missing expected IMU column: {c}")
+            # Normalize various string Nones to NaN
+            df[c] = df[c].replace(["None", "none", "NULL", "null", ""], np.nan)
+        mask_valid = df[list(euler_cols)].notna().all(axis=1)
+        return df.loc[mask_valid].copy()
+
+    def compute_joint_angle_from_body_axes(self,
+                                           fixed_prefix='imu1', fixed_axis='x',
+                                           moving_prefix='imu2', moving_axis='z',
+                                           out_col='imu_joint_deg_axes',
+                                           degrees=True):
+        """
+        Compute bend as the angle between two IMU body axes expressed in world:
+            angle = ∠( R_fixed * e_fixed_axis , R_moving * e_moving_axis ).
+
+        Requires that imu_quat_to_euler(...) has already populated:
+            '{prefix}_roll', '{prefix}_pitch', '{prefix}_yaw' for each prefix.
+
+        Args:
+            fixed_prefix, moving_prefix: which IMUs (matching your earlier out_prefix names)
+            fixed_axis, moving_axis: 'x'|'y'|'z' axes from each IMU body frame
+            out_col: output column name to store angle (degrees)
+        """
+        import numpy as np
+
+        # ensure world vectors exist (re-use your routine to build them)
+        colA = f'{fixed_prefix}_{fixed_axis}vec'
+        colB = f'{moving_prefix}_{moving_axis}vec'
+        if colA not in self.imu_df.columns:
+            self.euler_to_unit_vec(prefix=fixed_prefix, axis=fixed_axis, out_col=colA)
+        if colB not in self.imu_df.columns:
+            self.euler_to_unit_vec(prefix=moving_prefix, axis=moving_axis, out_col=colB)
+
+        a = np.stack(self.imu_df[colA].apply(lambda v: np.array(v, float)).to_numpy())
+        b = np.stack(self.imu_df[colB].apply(lambda v: np.array(v, float)).to_numpy())
+        a /= np.linalg.norm(a, axis=1, keepdims=True)
+        b /= np.linalg.norm(b, axis=1, keepdims=True)
+        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
+        ang = np.arccos(dot)
+        if degrees:
+            ang = np.degrees(ang)
+        self.imu_df[out_col] = ang
+        return out_col
+
+    def apply_fixed_mount_rotation(self, quat_col, axis='x', angle_deg=90.0, quat_order='wxyz', out_col=None):
+        """
+        Left-multiply a fixed mount rotation to every quaternion in `quat_col`:
+            q_corrected = q_fixed ⊗ q_measured
+        This virtually reorients a sensor mounted with a known fixed rotation.
+
+        Args:
+            quat_col: name of quaternion column in self.imu_df (tuple-like or string "(w,x,y,z)")
+            axis: 'x'|'y'|'z' (right-hand rule)
+            angle_deg: fixed rotation in degrees
+            quat_order: 'wxyz' or 'xyzw' for input storage order
+            out_col: if None, overwrites quat_col; else write to new column
+        """
+        import numpy as np
+        import pandas as pd
+
+        def _parse_q(s):
+            if isinstance(s, (list, tuple, np.ndarray)):
+                arr = np.array(s, dtype=float)
+                if arr.size == 4: return arr
+                out = np.full(4, np.nan);
+                out[:min(4, arr.size)] = arr[:min(4, arr.size)]
+                return out
+            if s is None or (isinstance(s, float) and np.isnan(s)): return np.full(4, np.nan)
+            s = str(s).strip().strip('[](){}')
+            parts = [p for p in s.replace(',', ' ').split() if p]
+            vals = []
+            for p in parts[:4]:
+                try:
+                    vals.append(float(p))
+                except:
+                    vals.append(np.nan)
+            if len(vals) < 4: vals += [np.nan] * (4 - len(vals))
+            return np.array(vals, dtype=float)
+
+        def _qmul(q1, q2, order='wxyz'):
+            if order == 'wxyz':
+                w1, x1, y1, z1 = q1;
+                w2, x2, y2, z2 = q2
+                return np.array([
+                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                ], dtype=float)
+            else:  # 'xyzw'
+                x1, y1, z1, w1 = q1;
+                x2, y2, z2, w2 = q2
+                x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+                y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+                z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+                return np.array([x, y, z, w], dtype=float)
+
+        # fixed rotation quaternion (axis–angle)
+        ang = np.deg2rad(angle_deg)
+        ax = axis.lower()
+        v = {'x': np.array([1, 0, 0.0]),
+             'y': np.array([0, 1, 0.0]),
+             'z': np.array([0, 0, 1.0])}[ax]
+        s = np.sin(ang / 2.0);
+        c = np.cos(ang / 2.0)
+        if quat_order == 'wxyz':
+            q_fix = np.array([c, v[0] * s, v[1] * s, v[2] * s], dtype=float)
+        else:  # 'xyzw'
+            q_fix = np.array([v[0] * s, v[1] * s, v[2] * s, c], dtype=float)
+
+        q_meas = self.imu_df[quat_col].apply(_parse_q).to_list()
+        q_corr = []
+        for q in q_meas:
+            if np.any(~np.isfinite(q)):
+                q_corr.append(np.array([np.nan] * 4))
+            else:
+                qc = _qmul(q_fix, q, quat_order)
+                qc = qc / (np.linalg.norm(qc) or 1.0)
+                q_corr.append(qc)
+
+        out = out_col or quat_col
+        self.imu_df[out] = q_corr
+        return out
+
+    def compute_joint_angle_from_body_axes(self,
+                                           fixed_prefix='imu1', fixed_axis='x',
+                                           moving_prefix='imu2', moving_axis='z',
+                                           out_col='imu_joint_deg_axes',
+                                           degrees=True):
+        """
+        Compute bend as the angle between two IMU body axes expressed in world:
+            angle = ∠( R_fixed * e_fixed_axis , R_moving * e_moving_axis ).
+
+        Requires that imu_quat_to_euler(...) has already populated:
+            '{prefix}_roll', '{prefix}_pitch', '{prefix}_yaw' for each prefix.
+
+        Args:
+            fixed_prefix, moving_prefix: which IMUs (matching your earlier out_prefix names)
+            fixed_axis, moving_axis: 'x'|'y'|'z' axes from each IMU body frame
+            out_col: output column name to store angle (degrees)
+        """
+        import numpy as np
+
+        # ensure world vectors exist (re-use your routine to build them)
+        colA = f'{fixed_prefix}_{fixed_axis}vec'
+        colB = f'{moving_prefix}_{moving_axis}vec'
+        if colA not in self.imu_df.columns:
+            self.euler_to_unit_vec(prefix=fixed_prefix, axis=fixed_axis, out_col=colA)
+        if colB not in self.imu_df.columns:
+            self.euler_to_unit_vec(prefix=moving_prefix, axis=moving_axis, out_col=colB)
+
+        a = np.stack(self.imu_df[colA].apply(lambda v: np.array(v, float)).to_numpy())
+        b = np.stack(self.imu_df[colB].apply(lambda v: np.array(v, float)).to_numpy())
+        a /= np.linalg.norm(a, axis=1, keepdims=True)
+        b /= np.linalg.norm(b, axis=1, keepdims=True)
+        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
+        ang = np.arccos(dot)
+        if degrees:
+            ang = np.degrees(ang)
+        self.imu_df[out_col] = ang
+        return out_col
 
     # ======================
     # 2) Quaternion → Euler
@@ -666,17 +1007,48 @@ class DLC3DBendAngles:
         import numpy as np
         import pandas as pd
 
+        # --- robust parser: accepts list/tuple/np.array/string/'None'/NaN, pads/truncates to 4
         def parse_tuple_string(s):
-            if pd.isna(s): return [np.nan] * 4
-            vals = s.strip().strip('()').split(',')
-            vals = [float(v) for v in vals]
-            return vals if len(vals) == 4 else [np.nan] * 4
+            # already sequence-like
+            if isinstance(s, (list, tuple, np.ndarray)):
+                arr = np.array(s, dtype=float).reshape(-1)
+                if arr.size == 4:
+                    return arr
+                out = np.full(4, np.nan, dtype=float)
+                n = min(4, arr.size)
+                out[:n] = arr[:n]
+                return out
 
+            # None / NaN / empty
+            if s is None:
+                return np.full(4, np.nan, dtype=float)
+            s = str(s).strip()
+            if s == "" or s.lower() == "none":
+                return np.full(4, np.nan, dtype=float)
+
+            # strip delimiters and split
+            s = s.strip("[](){}")
+            parts = [p for p in s.replace(",", " ").split() if p]
+
+            vals = []
+            for p in parts[:4]:
+                try:
+                    vals.append(float(p))
+                except Exception:
+                    vals.append(np.nan)
+
+            if len(vals) < 4:
+                vals += [np.nan] * (4 - len(vals))
+
+            return np.array(vals, dtype=float)
+
+        # --- safe normalize
         def normalize(q):
             q = np.asarray(q, dtype=float)
             n = np.linalg.norm(q, axis=-1, keepdims=True)
-            n[n == 0] = 1.0
-            return q / n
+            with np.errstate(invalid='ignore', divide='ignore'):
+                qn = q / n
+            return qn
 
         def quat_to_euler(q, order='wxyz', seq='zyx', deg=True):
             if order == 'wxyz':
@@ -688,11 +1060,7 @@ class DLC3DBendAngles:
 
             ww, xx, yy, zz = w * w, x * x, y * y, z * z
             R00 = 1 - 2 * (yy + zz)
-            R01 = 2 * (x * y - z * w)
-            R02 = 2 * (x * z + y * w)
             R10 = 2 * (x * y + z * w)
-            R11 = 1 - 2 * (xx + zz)
-            R12 = 2 * (y * z - x * w)
             R20 = 2 * (x * z - y * w)
             R21 = 2 * (y * z + x * w)
             R22 = 1 - 2 * (xx + yy)
@@ -708,9 +1076,10 @@ class DLC3DBendAngles:
                 roll, pitch, yaw = np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
             return roll, pitch, yaw
 
+        # ---- convert each listed column
         for col, prefix in zip(imu_cols, out_prefix):
             q_raw = self.imu_df[col].apply(parse_tuple_string).to_list()
-            q = normalize(np.array(q_raw))  # Nx4
+            q = normalize(np.array(q_raw))  # Nx4 (NaNs stay NaN)
             r, p, y = quat_to_euler(q, order=quat_order, seq=sequence, deg=degrees)
             self.imu_df[f'{prefix}_roll'] = r
             self.imu_df[f'{prefix}_pitch'] = p
@@ -2074,7 +2443,7 @@ class bender_class:
             x_deg = np.abs(x_deg)
 
         if restrict_to_0_90:
-            mm = (x_deg >= 0.0) & (x_deg <= 90.0)
+            mm = (x_deg >= 0.0) & (x_deg <= 95.0)
             x_deg = x_deg[mm]
             y = y[mm]
 
@@ -2112,7 +2481,7 @@ class bender_class:
             if ax is None:
                 fig, ax = plt.subplots(figsize=(6, 4))
             ax.plot(x_deg, y, ".", markersize=3, label="Data")
-            th_fit = np.linspace(0, np.deg2rad(max(90.0, x_deg.max())), 600)
+            th_fit = np.linspace(0, np.deg2rad(max(95.0, x_deg.max())), 600)
             y_fit = _norm_theoretical(th_fit, r_hat, L)
             ax.plot(np.rad2deg(th_fit), y_fit, "-", label=f"Fit r={r_hat:.3f} in (R²={r2:.4f})")
             ax.set_xlabel("Angle (deg)")
@@ -2128,6 +2497,70 @@ class bender_class:
             "r2": r2,
             "params_cov": pcov,
         }
+
+    def theta_from_y(self, y, r, L=2.0, tol_deg=1e-3, max_iters=30):
+        """
+        Invert normalized theoretical curve y(θ; r, L) on [0, 90°].
+        No other class methods required. Returns radians.
+        """
+        import numpy as np
+        # clamp for safety
+        y = float(np.clip(y, 0.0, 1.0))
+
+        # inline normalized model (y = 1 at 90°)
+        def f(theta):
+            a = r / L
+            num = theta * (8.0 - a * theta)
+            den = (2.0 - a * theta) ** 2
+            th90 = np.pi / 2
+            num90 = th90 * (8.0 - a * th90) / (2.0 - a * th90) ** 2
+            return (num / den) / num90
+
+        lo, hi = 0.0, np.pi / 2
+        for _ in range(max_iters):
+            mid = 0.5 * (lo + hi)
+            if f(mid) < y:
+                lo = mid
+            else:
+                hi = mid
+            if (hi - lo) <= np.deg2rad(tol_deg):
+                break
+        return 0.5 * (lo + hi)
+
+    def append_theta_from_normalized(self,
+                                     r_hand,
+                                     L=2.0,
+                                     value_col="ADC Value",
+                                     out_col="theta_pred_deg",
+                                     flip_data=False,
+                                     clip=True,
+                                     tol_deg=1e-3,
+                                     max_iters=30):
+        """
+        Convert an existing normalized 0–1 column to predicted angle (deg) using r_hand.
+        Appends results to self.data[out_col].
+        """
+        import numpy as np
+        import pandas as pd
+
+        if self.data is None:
+            raise ValueError("No data loaded.")
+        if value_col not in self.data.columns:
+            raise KeyError(f"'{value_col}' not found in self.data.")
+
+        y = pd.to_numeric(self.data[value_col], errors="coerce").to_numpy(dtype=float)
+        if flip_data:
+            y = 1.0 - y
+        if clip:
+            y = np.clip(y, 0.0, 1.0)
+
+        theta_rad = np.array([
+            self.theta_from_y(v, r=r_hand, L=L, tol_deg=tol_deg, max_iters=max_iters)
+            if np.isfinite(v) else np.nan
+            for v in y
+        ])
+        self.data[out_col] = np.rad2deg(theta_rad)
+        return self.data[out_col]
 
     def fig_1_lin_vs_quad(self, perc_train=0.8, random_state=None,
                           data_color='blue', lin_color='red', quad_color='green',
