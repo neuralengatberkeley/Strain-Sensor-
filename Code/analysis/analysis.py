@@ -203,6 +203,50 @@ class BallBearingData:
 
         return out
 
+    def extract_trigger_dfs_by_trial(self, df: pd.DataFrame, trials=None):
+        """
+        From a dataset (e.g., df_first or df_second), return one Trigger-Time DataFrame per trial.
+
+        Selection rule:
+          - filter rows whose source_file contains 'data_trigger_time' (case-insensitive)
+          - if multiple files exist within a trial, pick the file with the most rows
+            (tie-breaker: lexicographically largest source_path)
+
+        Returns:
+          list[pd.DataFrame]: index i corresponds to trial (i+1)
+        """
+        if trials is None:
+            trials = self.n_trials_per_set
+
+        required = {"source_file", "source_path", "trial_index"}
+        if not required.issubset(df.columns):
+            missing = sorted(required - set(df.columns))
+            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
+
+        # Keep only rows from trigger-time CSVs
+        trig_only = df[df["source_file"].str.contains("data_trigger_time", case=False, na=False)].copy()
+
+        out = []
+        for trial_idx in range(1, trials + 1):
+            rows_t = trig_only[trig_only["trial_index"] == trial_idx]
+            if rows_t.empty:
+                out.append(pd.DataFrame())
+                continue
+
+            # Group by file and pick the one with the most rows (tie-break by path)
+            groups = []
+            for path, g in rows_t.groupby("source_path", sort=False):
+                groups.append((path, len(g)))
+
+            max_len = max(n for _, n in groups)
+            candidates = [p for p, n in groups if n == max_len]
+            chosen_path = sorted(candidates)[-1]  # tie-breaker: lexicographically last
+
+            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
+            out.append(df_trial.reset_index(drop=True))
+
+        return out
+
 
 class DLC3DBendAngles:
     """
