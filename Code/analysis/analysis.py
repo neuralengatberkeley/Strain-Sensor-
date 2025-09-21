@@ -168,6 +168,40 @@ class BallBearingData:
 
         return out
 
+    def extract_imu_dfs_by_trial(self, df: pd.DataFrame, trials=None):
+        """
+        From a dataset (e.g., df_first or df_second), return one IMU DataFrame per trial.
+        Selection rule:
+          - filter rows whose source_file contains 'data_imu' (case-insensitive)
+          - if multiple IMU files exist within a trial, pick the file with the most rows
+        Returns:
+          list[pd.DataFrame]: index i corresponds to trial (i+1)
+        """
+        if trials is None:
+            trials = self.n_trials_per_set
+
+        required = {"source_file", "source_path", "trial_index"}
+        if not required.issubset(df.columns):
+            missing = sorted(required - set(df.columns))
+            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
+
+        imu_only = df[df["source_file"].str.contains("data_imu", case=False, na=False)].copy()
+
+        out = []
+        for trial_idx in range(1, trials + 1):
+            rows_t = imu_only[imu_only["trial_index"] == trial_idx]
+            if rows_t.empty:
+                out.append(pd.DataFrame())
+                continue
+
+            # Group by file and pick the one with the most rows
+            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
+            chosen_path = max(groups, key=lambda x: x[1])[0]
+
+            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
+            out.append(df_trial.reset_index(drop=True))
+
+        return out
 
 
 class DLC3DBendAngles:
