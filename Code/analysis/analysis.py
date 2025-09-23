@@ -29,35 +29,94 @@ import re
 import pandas as pd
 from datetime import datetime
 
+import re
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+
+import re
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+
 class BallBearingData:
     """
     Manager for ball bearing application datasets.
 
     Automatically:
-      • Discovers *_B folders under a root path
-      • Splits into two sets of N_TRIALS_PER_SET consecutive trials
+      • Discovers *_{suffix} folders under a root path (default: *_R)
+      • Sorts by timestamp parsed from folder name: YYYY_MM_DD_HH_MM_SS_{suffix}
+      • Splits into two sets of n_trials_per_set consecutive trials
       • Validates # of CSVs per trial
       • Loads DataFrames with rich metadata
+      • Extracts per-trial ADC / IMU / Trigger-Time DataFrames
+      • Provides ADC calibration helpers → tall dataframe builder
+      • Provides IMU processing helpers (Euler/Quat) → in-place augmentation
 
-    Usage:
-        bb = BallBearingData(root_dir="CSV Data/9_9_25", path_to_repo=path_to_repository)
+    Parameters
+    ----------
+    root_dir : str | Path
+        Directory (relative to repo or absolute) under which to search for runs.
+    path_to_repo : str | Path | None
+        If provided, root is resolved as Path(path_to_repo) / root_dir.
+    n_trials_per_set : int
+        Number of trials in the first set and in the second set (same value for both).
+    files_per_trial : int
+        Expected number of CSV files per trial folder (used for validation only).
+    folder_suffix : str
+        Folder suffix to discover (e.g., "R" → match '*_R').
+
+    Usage
+    -----
+        bb = BallBearingData(
+            root_dir="CSV Data/9_9_25",
+            path_to_repo=path_to_repository,
+            n_trials_per_set=15,
+            files_per_trial=5,
+            folder_suffix="R",   # or "B"
+        )
         df_first  = bb.load_first()
         df_second = bb.load_second()
         all_data  = bb.load_all()
-    """
-    dt_pat = re.compile(r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_B$")
 
-    def __init__(self, root_dir, path_to_repo=None, n_trials_per_set=15, files_per_trial=5):
+        adc_trials_first  = bb.extract_adc_dfs_by_trial(df_first)
+        imu_trials_first  = bb.extract_imu_dfs_by_trial(df_first)
+        trig_trials_first = bb.extract_trigger_dfs_by_trial(df_first)
+    """
+
+    # ---------------- core setup ----------------
+
+    def __init__(self,
+                 root_dir,
+                 path_to_repo=None,
+                 n_trials_per_set=15,
+                 files_per_trial=5,
+                 folder_suffix="R"):
+        # Resolve root
         if path_to_repo:
             self.root = Path(path_to_repo) / root_dir
         else:
             self.root = Path(root_dir)
-        self.n_trials_per_set = n_trials_per_set
-        self.files_per_trial = files_per_trial
-        self.B_folders = self._find_B_folders()
+
+        self.n_trials_per_set = int(n_trials_per_set)   # same for first & second sets
+        self.files_per_trial  = int(files_per_trial)
+        self.folder_suffix    = str(folder_suffix).strip().upper()
+
+        # Compile regex for folder names like: 2025_09_09_12_41_29_R
+        self.dt_pat = re.compile(
+            rf"(\d{{4}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_{re.escape(self.folder_suffix)}$"
+        )
+
+        # Discover, split, and validate
+        self.run_folders = self._find_run_folders()          # list[(Path, datetime, [csvs])]
         self.first_block, self.second_block = self._split_blocks()
-        self._check_counts(self.first_block, "ball_bearing_first")
+        self._check_counts(self.first_block,  "ball_bearing_first")
         self._check_counts(self.second_block, "ball_bearing_second")
+
+    # --------------- discovery & parsing ---------------
 
     def _parse_folder_dt(self, folder_name: str):
         m = self.dt_pat.search(folder_name)
@@ -66,26 +125,31 @@ class BallBearingData:
         y, M, d, h, m, s = map(int, m.groups())
         return datetime(y, M, d, h, m, s)
 
-    def _find_B_folders(self):
+    def _find_run_folders(self):
+        """Find folders matching '*_{suffix}' and parse timestamp."""
         out = []
-        for p in self.root.rglob("*_B"):
+        pattern = f"*_{self.folder_suffix}"   # e.g., *_R
+        for p in self.root.rglob(pattern):
             if p.is_dir():
                 dt = self._parse_folder_dt(p.name)
                 csvs = sorted(p.rglob("*.csv"))
                 out.append((p, dt, csvs))
+        # keep only those with valid datetime
         out = [(p, dt, csvs) for (p, dt, csvs) in out if dt is not None]
         out.sort(key=lambda t: t[1])
-        print(f"Found {len(out)} *_B folders total.")
+        print(f"Found {len(out)} *_{self.folder_suffix} folders total.")
         return out
 
     def _split_blocks(self):
         needed = 2 * self.n_trials_per_set
-        if len(self.B_folders) < needed:
-            raise ValueError(f"Expected at least {needed} *_B folders (2×{self.n_trials_per_set}), "
-                             f"found {len(self.B_folders)}.")
-        first_block = self.B_folders[:self.n_trials_per_set]
-        second_block = self.B_folders[self.n_trials_per_set:needed]
-        print("First set range:", first_block[0][0].name, "→", first_block[-1][0].name)
+        if len(self.run_folders) < needed:
+            raise ValueError(
+                f"Expected at least {needed} *_{self.folder_suffix} folders "
+                f"(2×{self.n_trials_per_set}), found {len(self.run_folders)}."
+            )
+        first_block  = self.run_folders[:self.n_trials_per_set]
+        second_block = self.run_folders[self.n_trials_per_set:needed]
+        print("First set range:",  first_block[0][0].name,  "→", first_block[-1][0].name)
         print("Second set range:", second_block[0][0].name, "→", second_block[-1][0].name)
         return first_block, second_block
 
@@ -101,6 +165,8 @@ class BallBearingData:
         else:
             print(f"{label}: All trials have {self.files_per_trial} CSVs ✅")
 
+    # ---------------- loading ----------------
+
     def _load_block(self, block, application_set_label):
         frames = []
         for trial_idx, (folder, dt, csvs) in enumerate(block, 1):
@@ -110,13 +176,13 @@ class BallBearingData:
                 except Exception as e:
                     print(f"[WARN] Skipping unreadable file: {csv_path} ({e})")
                     continue
-                df["application_set"] = application_set_label
-                df["trial_index"] = trial_idx
-                df["file_index"] = file_idx
-                df["folder_name"] = folder.name
-                df["source_folder"] = folder.as_posix()
-                df["source_file"] = csv_path.name
-                df["source_path"] = csv_path.as_posix()
+                df["application_set"]  = application_set_label
+                df["trial_index"]      = trial_idx
+                df["file_index"]       = file_idx
+                df["folder_name"]      = folder.name
+                df["source_folder"]    = folder.as_posix()
+                df["source_file"]      = csv_path.name
+                df["source_path"]      = csv_path.as_posix()
                 df["timestamp_folder"] = dt
                 frames.append(df)
         if not frames:
@@ -130,25 +196,28 @@ class BallBearingData:
         return self._load_block(self.second_block, "ball_bearing_second")
 
     def load_all(self):
-        return pd.concat([self.load_first(), self.load_second()], ignore_index=True)
+        d1 = self.load_first()
+        d2 = self.load_second()
+        return pd.concat([d1, d2], ignore_index=True)
 
-    # -----------------------------
-    # NEW: get ADC DataFrames by trial
-    # -----------------------------
+    # --------------- extractors by trial ---------------
+
     def extract_adc_dfs_by_trial(self, df: pd.DataFrame, trials=None):
         """
-        From a dataset (e.g., df_first or df_second), return one ADC DataFrame per trial.
-        Selection rule:
-          - filter rows whose source_file contains 'adc' (case-insensitive)
-          - if multiple ADC files exist within a trial, pick the file with the most rows
+        Return one ADC DataFrame per trial.
+        Rule:
+          - keep rows where source_file contains 'adc' (case-insensitive)
+          - if multiple files in a trial, pick the file with the most rows
         Returns:
-          list[pd.DataFrame]: index i corresponds to trial (i+1)
+          list[pd.DataFrame] with index i → trial (i+1)
         """
         if trials is None:
             trials = self.n_trials_per_set
 
-        if "source_file" not in df.columns or "source_path" not in df.columns or "trial_index" not in df.columns:
-            raise KeyError("df must contain 'source_file', 'source_path', and 'trial_index' columns.")
+        required = {"source_file", "source_path", "trial_index"}
+        if not required.issubset(df.columns):
+            missing = sorted(required - set(df.columns))
+            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
 
         adc_only = df[df["source_file"].str.contains("adc", case=False, na=False)].copy()
 
@@ -156,26 +225,21 @@ class BallBearingData:
         for trial_idx in range(1, trials + 1):
             rows_t = adc_only[adc_only["trial_index"] == trial_idx]
             if rows_t.empty:
-                out.append(pd.DataFrame())
-                continue
-
-            # Group by file and pick the one with the most rows
+                out.append(pd.DataFrame()); continue
             groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
             chosen_path = max(groups, key=lambda x: x[1])[0]
-
             df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
             out.append(df_trial.reset_index(drop=True))
-
         return out
 
     def extract_imu_dfs_by_trial(self, df: pd.DataFrame, trials=None):
         """
-        From a dataset (e.g., df_first or df_second), return one IMU DataFrame per trial.
-        Selection rule:
-          - filter rows whose source_file contains 'data_imu' (case-insensitive)
-          - if multiple IMU files exist within a trial, pick the file with the most rows
+        Return one IMU DataFrame per trial.
+        Rule:
+          - keep rows where source_file contains 'data_imu' (case-insensitive)
+          - if multiple files in a trial, pick the file with the most rows
         Returns:
-          list[pd.DataFrame]: index i corresponds to trial (i+1)
+          list[pd.DataFrame] with index i → trial (i+1)
         """
         if trials is None:
             trials = self.n_trials_per_set
@@ -191,29 +255,21 @@ class BallBearingData:
         for trial_idx in range(1, trials + 1):
             rows_t = imu_only[imu_only["trial_index"] == trial_idx]
             if rows_t.empty:
-                out.append(pd.DataFrame())
-                continue
-
-            # Group by file and pick the one with the most rows
+                out.append(pd.DataFrame()); continue
             groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
             chosen_path = max(groups, key=lambda x: x[1])[0]
-
             df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
             out.append(df_trial.reset_index(drop=True))
-
         return out
 
     def extract_trigger_dfs_by_trial(self, df: pd.DataFrame, trials=None):
         """
-        From a dataset (e.g., df_first or df_second), return one Trigger-Time DataFrame per trial.
-
-        Selection rule:
-          - filter rows whose source_file contains 'data_trigger_time' (case-insensitive)
-          - if multiple files exist within a trial, pick the file with the most rows
-            (tie-breaker: lexicographically largest source_path)
-
+        Return one Trigger-Time DataFrame per trial.
+        Rule:
+          - keep rows where source_file contains 'data_trigger_time' (case-insensitive)
+          - if multiple files in a trial: pick file with most rows; tie-break by path
         Returns:
-          list[pd.DataFrame]: index i corresponds to trial (i+1)
+          list[pd.DataFrame] with index i → trial (i+1)
         """
         if trials is None:
             trials = self.n_trials_per_set
@@ -223,29 +279,305 @@ class BallBearingData:
             missing = sorted(required - set(df.columns))
             raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
 
-        # Keep only rows from trigger-time CSVs
         trig_only = df[df["source_file"].str.contains("data_trigger_time", case=False, na=False)].copy()
 
         out = []
         for trial_idx in range(1, trials + 1):
             rows_t = trig_only[trig_only["trial_index"] == trial_idx]
             if rows_t.empty:
-                out.append(pd.DataFrame())
-                continue
+                out.append(pd.DataFrame()); continue
 
-            # Group by file and pick the one with the most rows (tie-break by path)
-            groups = []
-            for path, g in rows_t.groupby("source_path", sort=False):
-                groups.append((path, len(g)))
-
+            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=False)]
             max_len = max(n for _, n in groups)
             candidates = [p for p, n in groups if n == max_len]
-            chosen_path = sorted(candidates)[-1]  # tie-breaker: lexicographically last
-
+            chosen_path = sorted(candidates)[-1]  # tie-breaker
             df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
             out.append(df_trial.reset_index(drop=True))
-
         return out
+
+    # ---------------- calibration state (ADC) ----------------
+
+    def set_calibration(self, angle_adc_df: pd.DataFrame, coeffs: tuple[float, float, float]):
+        """
+        Store the quadratic fit (c2,c1,c0) and compute empirical 0°/90° ADC anchors
+        from a calibration table with columns ['angle','adc_ch3'].
+        """
+        assert {"angle", "adc_ch3"}.issubset(angle_adc_df.columns), \
+            "angle_adc_df must contain 'angle' and 'adc_ch3'"
+
+        c2, c1, c0 = coeffs
+        self.c2, self.c1, self.c0 = float(c2), float(c1), float(c0)
+
+        # Fitted endpoints used for root selection
+        p = np.poly1d([self.c2, self.c1, self.c0])
+        self.y0_fit = float(p(0.0))
+        self.y90_fit = float(p(90.0))
+        self.increasing_fit = (self.y90_fit >= self.y0_fit)
+
+        # Empirical anchors for normalization
+        EXPECTED = np.array([0.0, 22.5, 45.0, 67.5, 90.0])
+
+        def _snap(a):
+            a = float(a)
+            j = int(np.argmin(np.abs(EXPECTED - a)))
+            return EXPECTED[j] if abs(EXPECTED[j] - a) < 1e-3 else a
+
+        cal = angle_adc_df.copy()
+        cal["angle"] = pd.to_numeric(cal["angle"], errors="coerce").map(_snap)
+        cal = cal.dropna(subset=["angle", "adc_ch3"])
+
+        g = cal.groupby("angle")["adc_ch3"]
+        self.y0_emp = float(g.get_group(0.0).mean())
+        self.y90_emp = float(g.get_group(90.0).mean())
+        self.increasing_emp = (self.y90_emp >= self.y0_emp)
+        den_emp = (self.y90_emp - self.y0_emp) if self.increasing_emp else (self.y0_emp - self.y90_emp)
+        if np.isclose(den_emp, 0.0):
+            raise ValueError("Empirical 0°/90° anchors too close; check calibration selections.")
+        self._den_emp = float(den_emp)
+
+    @staticmethod
+    def adc_to_theta_deg(adc_vals, c2, c1, c0,
+                         y0_fit, y90_fit,
+                         increasing_fit: bool, clamp: bool = True):
+        """
+        Invert ADC = c2*θ^2 + c1*θ + c0  →  θ (deg). Uses fitted endpoints to
+        pick the correct root when two real roots exist.
+        """
+        a = np.asarray(adc_vals, dtype=float)
+        theta = np.full_like(a, np.nan, dtype=float)
+
+        # near-linear fallback
+        if np.isclose(c2, 0.0, atol=1e-14):
+            if np.isclose(c1, 0.0, atol=1e-14):
+                return theta
+            theta = (a - c0) / c1
+            return np.clip(theta, 0.0, 90.0) if clamp else theta
+
+        A, B, C = c2, c1, c0 - a
+        D = B * B - 4 * A * C
+        valid = D >= 0
+        sqrtD = np.zeros_like(D)
+        sqrtD[valid] = np.sqrt(D[valid])
+        t1 = np.where(valid, (-B + sqrtD) / (2 * A), np.nan)
+        t2 = np.where(valid, (-B - sqrtD) / (2 * A), np.nan)
+
+        # build guess from endpoints to choose a consistent branch
+        t01 = (a - y0_fit) / (y90_fit - y0_fit + 1e-12) if increasing_fit \
+            else (y0_fit - a) / (y0_fit - y90_fit + 1e-12)
+        t_guess = np.clip(90.0 * t01, 0.0, 90.0)
+
+        d1, d2 = np.abs(t1 - t_guess), np.abs(t2 - t_guess)
+        in1 = (t1 >= 0.0) & (t1 <= 90.0)
+        in2 = (t2 >= 0.0) & (t2 <= 90.0)
+
+        choose2 = (d2 < d1)
+        theta_chosen = np.where(choose2, t2, t1)
+        theta_chosen = np.where(in1 & ~choose2, t1, theta_chosen)
+        theta_chosen = np.where(in2 & choose2, t2, theta_chosen)
+
+        return np.clip(theta_chosen, 0.0, 90.0) if clamp else theta_chosen
+
+    def _adc_to_norm_emp(self, a):
+        """Normalize raw ADC to [0,1] using stored empirical anchors."""
+        a = np.asarray(a, float)
+        if self.increasing_emp:
+            return (a - self.y0_emp) / (self._den_emp + 1e-12)
+        else:
+            return (self.y0_emp - a) / (self._den_emp + 1e-12)
+
+    @staticmethod
+    def _coerce_timestamp_series(df: pd.DataFrame) -> pd.Series:
+        """Return a 'timestamp' series from common names; else NaNs."""
+        for col in ("timestamp", "time", "datetime"):
+            if col in df.columns:
+                s = df[col].copy()
+                s.name = "timestamp"
+                return s
+        return pd.Series([np.nan] * len(df), name="timestamp")
+
+    def trials_to_tall_df(self, trials: list[pd.DataFrame], set_label: str, trial_len_sec: float = 10.0):
+        """
+        Convert a list of ADC trials into one tall DataFrame with:
+        ['time_s','theta_pred_deg','adc_norm_01','adc_ch3','timestamp','trial','set_label'].
+        Requires you called set_calibration(...) first.
+        """
+        # safety: ensure calibration present
+        for attr in ("c2", "c1", "c0", "y0_fit", "y90_fit", "increasing_fit",
+                     "y0_emp", "y90_emp", "increasing_emp", "_den_emp"):
+            if not hasattr(self, attr):
+                raise RuntimeError("Call set_calibration(angle_adc_df, (c2,c1,c0)) before trials_to_tall_df().")
+
+        pieces = []
+        for i, tdf in enumerate(trials, start=1):
+            if tdf is None or tdf.empty or "adc_ch3" not in tdf.columns:
+                continue
+
+            df = tdf.copy()
+            ts = self._coerce_timestamp_series(df)
+
+            # synthetic time axis per trial
+            n = len(df)
+            time_s = np.linspace(0.0, float(trial_len_sec), n, dtype=float)
+
+            adc_raw = pd.to_numeric(df["adc_ch3"], errors="coerce").to_numpy()
+            adc_norm = np.clip(self._adc_to_norm_emp(adc_raw), 0.0, 1.0)
+            theta = self.adc_to_theta_deg(
+                adc_raw, self.c2, self.c1, self.c0,
+                y0_fit=self.y0_fit, y90_fit=self.y90_fit,
+                increasing_fit=self.increasing_fit, clamp=True
+            )
+
+            out = pd.DataFrame({
+                "time_s": time_s,
+                "theta_pred_deg": theta,
+                "adc_norm_01": adc_norm,
+                "adc_ch3": adc_raw,
+                "timestamp": ts.values if len(ts) == n else np.nan,
+                "trial": i,
+                "set_label": set_label
+            })
+            pieces.append(out)
+
+        if not pieces:
+            return pd.DataFrame(
+                columns=["time_s", "theta_pred_deg", "adc_norm_01", "adc_ch3", "timestamp", "trial", "set_label"]
+            )
+        return pd.concat(pieces, ignore_index=True)
+
+    # ---------------- IMU helpers & API ----------------
+
+    _INVALID = {"", "none", "null", "None", "NULL"}  # class-level constant
+
+    @staticmethod
+    def _pick_imu_cols_and_mask(df: pd.DataFrame):
+        """
+        Pick which IMU columns to use for this trial and build a validity mask.
+        Preference: ('euler1','euler2') if present; else ('quat1','quat2').
+        Returns: (cols_tuple, mask Series). If neither available → (None, None).
+        """
+        # Try Euler first
+        if all(c in df.columns for c in ("euler1", "euler2")):
+            s1 = df["euler1"].astype("string", errors="ignore")
+            s2 = df["euler2"].astype("string", errors="ignore")
+            m = s1.notna() & (~s1.isin(BallBearingData._INVALID)) & s2.notna() & (~s2.isin(BallBearingData._INVALID))
+            if m.any():
+                return ("euler1", "euler2"), m
+
+        # Fallback: quaternion pair
+        if all(c in df.columns for c in ("quat1", "quat2")):
+            s1 = df["quat1"].astype("string", errors="ignore")
+            s2 = df["quat2"].astype("string", errors="ignore")
+            m = s1.notna() & (~s1.isin(BallBearingData._INVALID)) & s2.notna() & (~s2.isin(BallBearingData._INVALID))
+            if m.any():
+                return ("quat1", "quat2"), m
+
+        return None, None
+
+    @staticmethod
+    def _compute_angle_for_trial_using_class(trigger_df: pd.DataFrame,
+                                             imu_df: pd.DataFrame,
+                                             trial_len_sec: float = 10.0,
+                                             axis_imu1: str = "y",
+                                             axis_imu2: str = "x"):
+        """
+        Build a fresh DLC3DBendAngles instance from this trial's trigger df,
+        run pipeline on IMU tuple-string columns (Euler or Quat), and return:
+            (angle ndarray), (time_s ndarray), (kept_idx int array)
+        """
+        if imu_df is None or imu_df.empty:
+            return np.array([]), np.array([]), np.array([], dtype=int)
+
+        imu_cols, mask = BallBearingData._pick_imu_cols_and_mask(imu_df)
+        if imu_cols is None:
+            return np.array([]), np.array([]), np.array([], dtype=int)
+
+        kept_idx = np.flatnonzero(mask.to_numpy())
+        imu_in = imu_df.loc[mask, list(imu_cols)].reset_index(drop=True)
+
+        # Fresh instance PER TRIAL (avoid shared state)
+        inst = DLC3DBendAngles(trigger_df)
+
+        # Convert tuple-like strings to Euler using your class API
+        inst.imu_df = imu_in.copy()
+        # NOTE: DLC3DBendAngles.imu_quat_to_euler must accept imu_cols + out_prefix
+        inst.imu_quat_to_euler(imu_cols=imu_cols, out_prefix=("imu1", "imu2"))
+        inst.euler_to_unit_vec(prefix="imu1", axis=axis_imu1, out_col="imu1_yvec")
+        inst.euler_to_unit_vec(prefix="imu2", axis=axis_imu2, out_col="imu2_xvec")
+        inst.angle_between_vectors("imu1_yvec", "imu2_xvec", out_col="imu_joint_deg_rx_py")
+
+        if "imu_joint_deg_rx_py" not in inst.imu_df.columns or inst.imu_df.empty:
+            return np.array([]), np.array([]), np.array([], dtype=int)
+
+        n = len(inst.imu_df)
+        time_s = np.linspace(0.0, float(trial_len_sec), n, dtype=float)
+        angle = pd.to_numeric(inst.imu_df["imu_joint_deg_rx_py"], errors="coerce").to_numpy()
+
+        return angle, time_s, kept_idx
+
+    def imu_augment_trials_inplace(self,
+                                   trigger_trials: list[pd.DataFrame],
+                                   imu_trials: list[pd.DataFrame],
+                                   trial_len_sec: float = 10.0,
+                                   axis_imu1: str = "y",
+                                   axis_imu2: str = "x",
+                                   verbose: bool = True):
+        """
+        For each trial, compute IMU bend angle using DLC3DBendAngles and append:
+            • 'imu_joint_deg_rx_py' (deg)
+            • 'time_s' (0..trial_len_sec)
+        Writes results back into the original IMU trial DataFrames (timestamps preserved).
+        """
+        n = min(len(trigger_trials), len(imu_trials))
+        for i in range(n):
+            df_imu = imu_trials[i]
+            df_trg = trigger_trials[i]
+            if df_imu is None or df_imu.empty:
+                if verbose: print(f"[skip trial {i + 1}] IMU df empty")
+                continue
+
+            try:
+                angle, time_s, kept_idx = BallBearingData._compute_angle_for_trial_using_class(
+                    df_trg, df_imu, trial_len_sec=trial_len_sec,
+                    axis_imu1=axis_imu1, axis_imu2=axis_imu2
+                )
+            except Exception as e:
+                if verbose: print(f"[skip trial {i + 1}] {e}")
+                continue
+
+            # ensure output columns exist
+            if "imu_joint_deg_rx_py" not in df_imu.columns:
+                df_imu["imu_joint_deg_rx_py"] = np.nan
+            if "time_s" not in df_imu.columns:
+                df_imu["time_s"] = np.nan
+
+            if kept_idx.size == 0:
+                if verbose: print(f"[skip trial {i + 1}] no usable IMU tuple cols (euler1/euler2 or quat1/quat2)")
+                continue
+
+            df_imu.loc[df_imu.index[kept_idx], "imu_joint_deg_rx_py"] = angle
+            df_imu.loc[df_imu.index[kept_idx], "time_s"] = time_s
+
+    @staticmethod
+    def imu_collect_tall(imu_trials: list[pd.DataFrame], set_label: str) -> pd.DataFrame:
+        """
+        From augmented IMU trials (with 'time_s' and 'imu_joint_deg_rx_py'),
+        build a tall DataFrame: ['time_s','imu_joint_deg_rx_py','trial','set_label'].
+        """
+        pieces = []
+        for i, tdf in enumerate(imu_trials, start=1):
+            if tdf is None or tdf.empty:
+                continue
+            if "imu_joint_deg_rx_py" not in tdf.columns or "time_s" not in tdf.columns:
+                continue
+            part = tdf.loc[tdf["imu_joint_deg_rx_py"].notna(), ["time_s", "imu_joint_deg_rx_py"]].copy()
+            if not part.empty:
+                part["trial"] = i
+                part["set_label"] = set_label
+                pieces.append(part)
+        if not pieces:
+            return pd.DataFrame(columns=["time_s", "imu_joint_deg_rx_py", "trial", "set_label"])
+        return pd.concat(pieces, ignore_index=True)
+
 
 
 class DLC3DBendAngles:
