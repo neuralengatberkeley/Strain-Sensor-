@@ -1,3 +1,4 @@
+from weakref import ref
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_squared_error
@@ -465,17 +466,119 @@ class DLC3DBendAngles:
         """Row-wise vector from A to B."""
         return B - A
 
+    # @staticmethod
+    # def angle_from_vectors(v1: np.ndarray, v2: np.ndarray, signed=False, ref=np.array([0,0,1])) -> np.ndarray:
+    #     """Row-wise angle (deg) between 3D vectors.
+    #     Parameters
+    #     ----------
+    #     v1, v2 : np.ndarray
+    #         Shape (N, 3), arrays of 3D vectors.
+    #     ref : np.ndarray
+    #         Reference axis (default z-axis). Defines the orientation
+    #         for positive vs negative angles.
+    #     """
+    #     n1 = np.linalg.norm(v1, axis=1)
+    #     n2 = np.linalg.norm(v2, axis=1)
+    #     denom = n1 * n2
+
+    #     if not signed: # dot product
+    #         with np.errstate(invalid="ignore", divide="ignore"):
+    #             cosang = np.sum(v1 * v2, axis=1) / denom
+    #         cosang = np.clip(cosang, -1.0, 1.0)
+    #         ang = np.degrees(np.arccos(cosang))
+    #         ang[~np.isfinite(ang)] = np.nan
+
+    #     if signed:
+    #         if v1.shape != v2.shape or v1.shape[1] != 3:
+    #             raise ValueError("Inputs must be of shape (N, 3)")
+    #         with np.errstate(invalid="ignore", divide="ignore"):
+    #             cosang = np.einsum("ij,ij->i", v1, v2) / denom
+
+    #         cosang = np.clip(cosang, -1.0, 1.0)
+    #         ang = np.degrees(np.arccos(cosang))
+
+    #         # Determine sign using reference axis
+    #         cross = np.cross(v1, v2)                # (N, 3)
+    #         sign = np.sign(cross @ ref)  # projection on ref axis
+    #         ang *= sign
+
+    #         ang[~np.isfinite(ang)] = np.nan
+    #     return ang
+
     @staticmethod
-    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-        """Row-wise angle (deg) via dot product."""
-        n1 = np.linalg.norm(v1, axis=1)
-        n2 = np.linalg.norm(v2, axis=1)
-        denom = n1 * n2
+    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray, signed=False, ref=np.array([0,0,1])) -> np.ndarray:
+        """
+        Row-wise angle (deg) between 3D vectors.
+
+        If signed=True, `ref` defines positive orientation:
+        - `ref` can be a 1D array (3,) common for all frames, or
+        - an array of shape (N,3) with one ref per row.
+        """
+        v1 = np.asarray(v1)
+        v2 = np.asarray(v2)
+
+        if v1.shape != v2.shape or v1.shape[1] != 3:
+            raise ValueError("v1 and v2 must be shape (N,3)")
+
+        # dot and cross
+        dot = np.einsum("ij,ij->i", v1, v2)                 # (N,)
+        cross = np.cross(v1, v2)                           # (N,3)
+        norm_cross = np.linalg.norm(cross, axis=1)         # (N,)
+
+        # angle magnitude (robust)
         with np.errstate(invalid="ignore", divide="ignore"):
-            cosang = np.sum(v1 * v2, axis=1) / denom
-        cosang = np.clip(cosang, -1.0, 1.0)
-        ang = np.degrees(np.arccos(cosang))
+            ang = np.degrees(np.arctan2(norm_cross, dot))  # returns [0, 180]
+
+        # invalids -> nan
         ang[~np.isfinite(ang)] = np.nan
+
+        if not signed:
+            return ang
+
+        # signed branch: prepare ref
+        if ref is None:
+            # default: global +Z
+            ref = np.array([0.0, 0.0, 1.0])
+
+        ref = np.asarray(ref)
+
+        # Support both single ref (3,) and per-frame refs (N,3)
+        if ref.ndim == 1:
+            if ref.size != 3:
+                raise ValueError("ref must be length 3 or shape (N,3)")
+            # dot each cross row with ref
+            orient = np.einsum("ij,j->i", cross, ref)      # (N,)
+        elif ref.shape == v1.shape:
+            # per-frame ref
+            orient = np.einsum("ij,ij->i", cross, ref)     # (N,)
+        else:
+            raise ValueError("ref must be shape (3,) or (N,3)")
+
+        sign = np.sign(orient)                            # -1, 0, +1
+
+        # When cross magnitude is near zero we treat angle as 0 (ambiguous orientation)
+        near_zero = norm_cross < 1e-8
+        sign[near_zero] = 0.0
+
+        signed_ang = ang * sign
+        signed_ang[~np.isfinite(signed_ang)] = np.nan
+        return signed_ang
+
+
+    def signed_angle_from_vectors(v1: np.ndarray, v2: np.ndarray, ref: np.ndarray = np.array([0, 0, 1])) -> np.ndarray:
+        """
+        Row-wise signed angle (deg) between 3D vectors v1 and v2.
+        Angles in range [-180, 180].
+        
+        Parameters
+        ----------
+        v1, v2 : np.ndarray
+            Shape (N, 3), arrays of 3D vectors.
+        ref : np.ndarray
+            Reference axis (default z-axis). Defines the orientation
+            for positive vs negative angles.
+        """
+
         return ang
 
     def compute_vectors(self, angle_type: str = "mcp") -> Tuple[np.ndarray, np.ndarray]:
