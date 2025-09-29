@@ -1,73 +1,30 @@
 from __future__ import annotations
-import pandas as pd
-from sklearn.metrics import r2_score
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LinearRegression
-from sklearn import preprocessing
+
+# Standard library
+import os
+import re
 import glob
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Tuple, Optional, List
+
+# Third-party
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
+
 from scipy.optimize import curve_fit
-
-import numpy as np
-from sklearn.model_selection import KFold, train_test_split
-from config import path_to_repository
 from scipy.interpolate import interp1d
-
-from typing import Dict, Tuple, Optional, List
 from scipy.io import loadmat
 
-from pathlib import Path
-import re, pandas as pd
-from datetime import datetime
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn import preprocessing
 
-
-from pathlib import Path
-import re
-import pandas as pd
-from datetime import datetime
-
-import re
-from pathlib import Path
-from datetime import datetime
-import pandas as pd
-
-import re
-from pathlib import Path
-from datetime import datetime
-
-import numpy as np
-import pandas as pd
-
-
-from pathlib import Path
-from datetime import datetime
-import re
-import numpy as np
-import pandas as pd
-
-# ====================================================
-# BallBearingData (adds robust extract_mat_dfs_by_trial)
-# ====================================================
-import os, re, glob
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-import numpy as np
-import pandas as pd
-
-
-
-
-
-import os, re
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
+# Local
+from config import path_to_repository
 
 
 
@@ -607,6 +564,394 @@ class BallBearingData:
         )
         return tall
 
+    # ======== ADC→θ builders + ADC↔CAM alignment (per set / both sets) ========
+
+    def _detect_cam_time_col(self, cam_df: pd.DataFrame, prefix: str = "ts") -> Optional[str]:
+        """Pick the first column that looks like a camera timestamp (e.g., 'ts_25183199')."""
+        cands = [c for c in cam_df.columns if str(c).lower().startswith(prefix)]
+        return cands[0] if cands else None
+
+    def _coerce_time_series_numeric_seconds(self, s: pd.Series) -> pd.Series:
+        """
+        Robustly coerce timestamps to a numeric 'seconds' axis for merge_asof alignment.
+        Tries numeric first; otherwise tries datetime-like and converts to seconds from min.
+        """
+        sn = pd.to_numeric(s, errors="coerce")
+        if sn.notna().any():
+            # If scale looks micro/nano, down-scale to ~seconds for stability
+            m = sn[sn.notna()]
+            if len(m) > 2:
+                span = float(m.max() - m.min())
+                if span > 1e6:  # heuristic: big numbers → probably µs or ns
+                    # choose scale based on magnitude
+                    med = float(m.abs().median())
+                    scale = 1e9 if med > 1e9 else (1e6 if med > 1e6 else 1.0)
+                    return sn.astype(float) / scale
+            return sn.astype(float)
+
+        # Try datetime-like
+        try:
+            dt = pd.to_datetime(s, errors="coerce", utc=True)
+            if dt.notna().any():
+                t0 = dt.min()
+                return (dt - t0).dt.total_seconds()
+        except Exception:
+            pass
+
+        # give up → NaNs
+        return pd.Series(np.nan, index=s.index, dtype=float)
+
+    def _theta_trials_from_adc(
+            self,
+            adc_trials: List[pd.DataFrame],
+            trial_len_sec: float = 10.0,
+            adc_col: str = "adc_ch3",
+            time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+            include_endpoint: bool = True,
+    ) -> List[pd.DataFrame]:
+        """
+        Produce per-trial frames with columns:
+          ['time_s','timestamp','theta_pred_deg', <adc_col>]
+        Uses self.calib via trials_to_tall_df (and self._adc_to_theta_deg internally).
+        """
+        out = []
+        for df in adc_trials:
+            if df is None or df.empty:
+                out.append(pd.DataFrame());
+                continue
+            tall_one = self.trials_to_tall_df(
+                [df],
+                set_label="set",
+                trial_len_sec=float(trial_len_sec),
+                adc_col=adc_col,
+                time_col_options=time_col_options,
+                include_endpoint=include_endpoint,
+            )
+            out.append(
+                tall_one.drop(columns=["set_label", "trial"], errors="ignore").reset_index(drop=True)
+            )
+        return out
+
+    def align_adc_to_cam_for_set(
+            self,
+            adc_trials: List[pd.DataFrame],
+            cam_trials: List[pd.DataFrame],
+            *,
+            trial_len_sec: float = 10.0,
+            adc_col: str = "adc_ch3",
+            enc_time_col: str = "timestamp",
+            cam_time_col: Optional[str] = None,  # auto-detect if None (e.g., 'ts_25183199')
+            cam_time_prefix: str = "ts",
+            tolerance: str | float = "10ms",
+            direction: str = "nearest",
+            attach_cols: Tuple[str, ...] = ("theta_pred_deg",),
+            keep_time_delta: bool = True,
+            drop_unmatched: bool = True,
+            # DLC/“cam” object hook (optional)
+            dlc_cam_obj: Optional[object] = None,
+            # object exposing find_matching_indices(...) and attach_encoder_using_match(...)
+    ) -> List[pd.DataFrame]:
+        """
+        Align per-trial angle-converted ADC (θ_pred from self.calib) to camera timestamps.
+        If dlc_cam_obj is provided and has the expected methods, we use it; otherwise we use merge_asof fallback.
+        Returns: list of merged DataFrames (one per trial).
+        """
+        import pandas as pd
+        import numpy as np
+
+        # 1) Safety: need calibration first
+        if not self.calib:
+            raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) before aligning.")
+
+        # 2) Build θ-from-ADC tables per trial
+        theta_trials = self._theta_trials_from_adc(
+            adc_trials,
+            trial_len_sec=trial_len_sec,
+            adc_col=adc_col,
+            time_col_options=(enc_time_col, "timestamp", "time", "t_sec"),
+            include_endpoint=True,
+        )
+
+        merged = []
+        use_dlc = (
+                dlc_cam_obj is not None
+                and hasattr(dlc_cam_obj, "find_matching_indices")
+                and hasattr(dlc_cam_obj, "attach_encoder_using_match")
+        )
+
+        for i, (cam_df, th_df) in enumerate(zip(cam_trials, theta_trials), start=1):
+            if cam_df is None or cam_df.empty or th_df is None or th_df.empty:
+                merged.append(pd.DataFrame());
+                continue
+
+            cam_col = cam_time_col or self._detect_cam_time_col(cam_df, prefix=cam_time_prefix)
+            if cam_col is None or cam_col not in cam_df.columns:
+                print(f"[align] Trial {i}: camera time column not found (prefix='{cam_time_prefix}').")
+                merged.append(pd.DataFrame());
+                continue
+
+            if enc_time_col not in th_df.columns:
+                print(f"[align] Trial {i}: encoder time column '{enc_time_col}' not found in theta trial.")
+                merged.append(pd.DataFrame());
+                continue
+
+            if use_dlc:
+                # --- Path A: delegate to DLC/“cam” helper (user-provided object) ---
+                try:
+                    dlc_cam_obj.find_matching_indices(
+                        encoder_df=th_df.rename(columns={enc_time_col: "timestamp"}),
+                        cam_time_col=(cam_col, "", ""),
+                        enc_time_col="timestamp",
+                        tolerance=tolerance,  # DLC util can accept the string form
+                        direction=direction,
+                    )
+                    mdf = dlc_cam_obj.attach_encoder_using_match(
+                        encoder_df=th_df.rename(columns={enc_time_col: "timestamp"}),
+                        columns=list(attach_cols) if attach_cols else None,
+                        suffix="_adc",
+                        keep_time_delta=keep_time_delta,
+                        drop_unmatched=drop_unmatched,
+                    )
+                    merged.append(mdf)
+                    continue
+                except Exception as e:
+                    print(f"[align] Trial {i}: DLC path failed ({e}); falling back to merge_asof).")
+
+            # --- Path B: merge_asof fallback ---
+            left = cam_df[[cam_col]].copy()
+            right = th_df[[enc_time_col] + [c for c in attach_cols if c in th_df.columns]].copy()
+
+            # coerce to comparable float-seconds domain for asof
+            left["_t"] = self._coerce_time_series_numeric_seconds(left[cam_col])
+            right["_t"] = self._coerce_time_series_numeric_seconds(right[enc_time_col])
+
+            # drop NaN times (can happen if coercion failed on some rows)
+            left = left.loc[left["_t"].notna()].sort_values("_t")
+            right = right.loc[right["_t"].notna()].sort_values("_t")
+
+            # NOTE: when joining on float "_t", tolerance must be a FLOAT (seconds), not Timedelta
+            m = pd.merge_asof(
+                left, right,
+                on="_t",
+                direction=direction,
+                tolerance=self._tol_seconds(tolerance),  # <-- key fix
+                allow_exact_matches=True,
+            )
+
+            # keep raw time delta if requested (best-effort)
+            if keep_time_delta:
+                try:
+                    lraw = pd.to_numeric(cam_df.loc[left.index, cam_col], errors="coerce")
+                    # map matched encoder timestamp back to raw domain by re-merge on _t
+                    rr = right[["_t", enc_time_col]].copy()
+                    mm = m.merge(rr, on="_t", how="left", suffixes=("", ""))
+                    rraw = pd.to_numeric(mm[enc_time_col], errors="coerce")
+                    if lraw.notna().any() and rraw.notna().any():
+                        # align series lengths
+                        lraw_aligned = lraw.reset_index(drop=True)
+                        rraw_aligned = rraw.reset_index(drop=True)
+                        m["_delta_raw"] = rraw_aligned - lraw_aligned
+                except Exception:
+                    pass
+
+            # Optionally drop rows that failed to match within tolerance
+            if drop_unmatched and attach_cols:
+                first_col = next((c for c in attach_cols if c in m.columns), None)
+                if first_col is not None:
+                    m = m.loc[m[first_col].notna()].copy()
+
+            # keep original cam time too
+            m[cam_col] = left[cam_col].values
+
+            merged.append(m.reset_index(drop=True))
+
+        return merged
+
+    def align_theta_all_to_cam_for_set(
+            self,
+            theta_all_set: pd.DataFrame,
+            cam_trials: List[pd.DataFrame],
+            *,
+            enc_time_col: str = "timestamp",  # from trials_to_tall_df
+            cam_time_col: Optional[str] = None,  # auto-detect if None (e.g., 'ts_25183199')
+            cam_time_prefix: str = "ts",
+            tolerance: str | int | float = "10ms",  # str -> Timedelta (e.g., '10ms'); int->µs; float->s
+            direction: str = "nearest",
+            theta_col: str = "theta_pred_deg",
+            keep_time_delta: bool = True,
+            drop_unmatched: bool = True,
+            return_concatenated: bool = False,
+    ) -> List[pd.DataFrame] | pd.DataFrame:
+        """
+        Align a tall per-set θ table (theta_all_first or theta_all_second) to per-trial camera ts_* DataFrames.
+
+        • Uses the same plumbing as your cam helper:
+          - convert both sides to int64 nanoseconds
+          - tolerance is a Timedelta converted to integer nanoseconds
+          - pandas.merge_asof on the ns axis, nearest with tolerance
+
+        • Keeps ALL camera columns; appends theta/ADC/time_s, plus deltas in ns/ms/s.
+
+        Parameters
+        ----------
+        enc_time_col : encoder/ADC timestamp column in theta_all_set
+        cam_time_col : camera time column to use (e.g., 'ts_25185174'); if None, auto-detect by `cam_time_prefix`
+        tolerance    : '10ms' / '500us' / '1s' (str) or int→microseconds, float→seconds
+        direction    : 'nearest' | 'forward' | 'backward'
+        drop_unmatched : if True, remove rows where theta could not be attached
+        return_concatenated : if True, return a single DataFrame (concat of trials)
+        """
+
+        import numpy as np
+        import pandas as pd
+
+        def _coerce_tolerance_to_timedelta(tol) -> pd.Timedelta:
+            """ ints→µs, floats→s, str→pandas offset """
+            if isinstance(tol, (np.integer, int)):
+                return pd.to_timedelta(int(tol), unit="us")
+            if isinstance(tol, (np.floating, float)):
+                return pd.to_timedelta(float(tol), unit="s")
+            return pd.to_timedelta(tol)
+
+        def _to_int64_ns(series: pd.Series) -> pd.Series:
+            """
+            Coerce a timestamp-like series to int64 nanoseconds.
+            Priority:
+              1) if already datetime/timedelta64[ns] -> view('i8')
+              2) numeric -> assume already ns (int-like); coerce to Int64
+              3) parseable datetime strings -> to_datetime(...).view('i8')
+            Returns Int64 dtype (nullable) aligned to original index.
+            """
+            # case 1: datetime-like / timedelta-like
+            if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
+                return series.view("i8").astype("Int64")
+
+            # case 2: numeric
+            sn = pd.to_numeric(series, errors="coerce")
+            if sn.notna().any():
+                # keep as integer ns if possible; otherwise round
+                sn_i8 = sn.round().astype("Int64")
+                return sn_i8
+
+            # case 3: try datetime parsing
+            dt = pd.to_datetime(series, errors="coerce", utc=True)
+            if dt.notna().any():
+                return dt.view("i8").astype("Int64")
+
+            # give up -> all <NA>
+            return pd.Series(pd.array([pd.NA] * len(series), dtype="Int64"), index=series.index)
+
+        # sanity checks
+        if theta_col not in theta_all_set.columns:
+            raise KeyError(f"'{theta_col}' not found in theta_all_set.")
+        if enc_time_col not in theta_all_set.columns:
+            raise KeyError(f"'{enc_time_col}' not found in theta_all_set.")
+
+        tol_td = _coerce_tolerance_to_timedelta(tolerance)
+        tol_ns = int(tol_td / pd.to_timedelta(1, unit="ns"))
+
+        merged_trials: List[pd.DataFrame] = []
+
+        # iterate 1..N, pairing trial i from theta_all_set with cam_trials[i-1]
+        for trial_idx, cam_df in enumerate(cam_trials, start=1):
+            th_df = theta_all_set.loc[theta_all_set["trial"] == trial_idx].copy()
+
+            if cam_df is None or cam_df.empty or th_df.empty:
+                merged_trials.append(pd.DataFrame());
+                continue
+
+            # camera time column autodetect (e.g., 'ts_25183199')
+            if cam_time_col is None:
+                cam_cands = [c for c in cam_df.columns if str(c).lower().startswith(cam_time_prefix)]
+                cam_col = cam_cands[0] if cam_cands else None
+            else:
+                cam_col = cam_time_col
+
+            if cam_col is None or cam_col not in cam_df.columns:
+                print(f"[alignθ] Trial {trial_idx}: camera time column not found (prefix='{cam_time_prefix}').")
+                merged_trials.append(pd.DataFrame());
+                continue
+
+            # --- build LEFT (camera) and RIGHT (theta) tables on int64 ns axis ---
+
+            # 1) LEFT: keep ALL camera columns; create _t_ns
+            left = cam_df.copy()
+            left["_t_ns"] = _to_int64_ns(left[cam_col])
+            left = left.dropna(subset=["_t_ns"]).sort_values("_t_ns")
+
+            # 2) RIGHT: only attach selected cols from theta table; create _t_ns
+            extra_cols = ["time_s", "adc_ch3"]  # add other ADC cols as needed
+            right_cols = [enc_time_col, theta_col] + [c for c in extra_cols if c in th_df.columns]
+            right = th_df[right_cols].copy()
+            right["_t_ns"] = _to_int64_ns(right[enc_time_col])
+            right = right.dropna(subset=["_t_ns"]).sort_values("_t_ns")
+
+            # keep raw encoder ns for precise deltas
+            right["_t_enc_ns"] = right["_t_ns"].copy()
+
+            if left.empty or right.empty:
+                merged_trials.append(pd.DataFrame());
+                continue
+
+            # --- asof merge on ns axis ---
+            m = pd.merge_asof(
+                left,
+                right,
+                left_on="_t_ns",
+                right_on="_t_ns",
+                direction=direction,
+                tolerance=tol_ns,
+                allow_exact_matches=True,
+            )
+
+            # --- deltas like cam helper ---
+            if keep_time_delta and "_t_enc_ns" in m.columns:
+                m["_delta_ns"] = (m["_t_enc_ns"] - m["_t_ns"]).astype("Int64")
+                # ms/s as float for convenience
+                m["_delta_ms"] = m["_delta_ns"].astype("float64") / 1e6
+                m["_delta_sec"] = m["_delta_ns"].astype("float64") / 1e9
+
+            # Optionally drop rows that failed to match within tolerance (theta stayed NaN)
+            if drop_unmatched and theta_col in m.columns:
+                m = m.loc[m[theta_col].notna()].copy()
+
+            # tag trial/set for convenience
+            m["trial"] = trial_idx
+            if "set_label" in theta_all_set.columns:
+                vals = th_df["set_label"].dropna()
+                if not vals.empty:
+                    m["set_label"] = vals.mode().iat[0]
+
+            merged_trials.append(m.reset_index(drop=True))
+
+        if return_concatenated:
+            non_empty = [df for df in merged_trials if not df.empty]
+            return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
+
+        return merged_trials
+
+    def _tol_seconds(self, tol):
+        """Return tolerance in float seconds (handles strings like '10ms')."""
+        import pandas as pd
+        if isinstance(tol, str):
+            return pd.to_timedelta(tol).total_seconds()
+        return float(tol)
+
+    def align_adc_to_cam_both_sets(
+            self,
+            adc_trials_first: List[pd.DataFrame],
+            cam_trials_first: List[pd.DataFrame],
+            adc_trials_second: List[pd.DataFrame],
+            cam_trials_second: List[pd.DataFrame],
+            **kwargs,
+    ) -> Tuple[List[pd.DataFrame], List[pd.DataFrame]]:
+        """
+        Convenience wrapper: runs align_adc_to_cam_for_set for first and second sets.
+        kwargs are passed through to align_adc_to_cam_for_set.
+        """
+        first = self.align_adc_to_cam_for_set(adc_trials_first, cam_trials_first, **kwargs)
+        second = self.align_adc_to_cam_for_set(adc_trials_second, cam_trials_second, **kwargs)
+        return first, second
 
 
 class DLC3DBendAngles:
