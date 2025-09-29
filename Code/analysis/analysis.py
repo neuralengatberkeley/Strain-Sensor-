@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_squared_error
@@ -42,541 +43,569 @@ import numpy as np
 import pandas as pd
 
 
+from pathlib import Path
+from datetime import datetime
+import re
+import numpy as np
+import pandas as pd
+
+# ====================================================
+# BallBearingData (adds robust extract_mat_dfs_by_trial)
+# ====================================================
+import os, re, glob
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import pandas as pd
+
+
+
+
+
+import os, re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+
+# Ensure DLC3DBendAngles is available in scope
+# from your_module import DLC3DBendAngles
+
+
 class BallBearingData:
     """
-    Manager for ball bearing application datasets.
-
-    Automatically:
-      • Discovers *_{suffix} folders under a root path (default: *_R)
-      • Sorts by timestamp parsed from folder name: YYYY_MM_DD_HH_MM_SS_{suffix}
-      • Splits into two sets of n_trials_per_set consecutive trials
-      • Validates # of CSVs per trial
-      • Loads DataFrames with rich metadata
-      • Extracts per-trial ADC / IMU / Trigger-Time DataFrames
-      • Provides ADC calibration helpers → tall dataframe builder
-      • Provides IMU processing helpers (Euler/Quat) → in-place augmentation
-
-    Parameters
-    ----------
-    root_dir : str | Path
-        Directory (relative to repo or absolute) under which to search for runs.
-    path_to_repo : str | Path | None
-        If provided, root is resolved as Path(path_to_repo) / root_dir.
-    n_trials_per_set : int
-        Number of trials in the first set and in the second set (same value for both).
-    files_per_trial : int
-        Expected number of CSV files per trial folder (used for validation only).
-    folder_suffix : str
-        Folder suffix to discover (e.g., "R" → match '*_R').
-
-    Usage
-    -----
-        bb = BallBearingData(
-            root_dir="CSV Data/9_9_25",
-            path_to_repo=path_to_repository,
-            n_trials_per_set=15,
-            files_per_trial=5,
-            folder_suffix="R",   # or "B"
-        )
-        df_first  = bb.load_first()
-        df_second = bb.load_second()
-        all_data  = bb.load_all()
-
-        adc_trials_first  = bb.extract_adc_dfs_by_trial(df_first)
-        imu_trials_first  = bb.extract_imu_dfs_by_trial(df_first)
-        trig_trials_first = bb.extract_trigger_dfs_by_trial(df_first)
+    Loader + calibration for ball-bearing / beaker trials.
     """
 
-    # ---------------- core setup ----------------
+    def __init__(
+        self,
+        root_dir: str,
+        path_to_repo: str,
+        n_trials_per_set: int = 9,
+        files_per_trial: int = 7,
+        folder_suffix: str = "R_mar",
+    ):
+        self.root_dir = Path(path_to_repo) / Path(root_dir)
+        self.n_trials_per_set = int(n_trials_per_set)
+        self.files_per_trial = int(files_per_trial)
+        self.folder_suffix = str(folder_suffix)
+        self._all_folders: List[Path] = []
+        self._first_set: List[Path] = []
+        self._second_set: List[Path] = []
 
-    def __init__(self,
-                 root_dir,
-                 path_to_repo=None,
-                 n_trials_per_set=15,
-                 files_per_trial=5,
-                 folder_suffix="R"):
-        # Resolve root
-        if path_to_repo:
-            self.root = Path(path_to_repo) / root_dir
+        # calibration state
+        self.calib: Dict[str, float] = {}   # {c0,c1,c2,y0,y90,source}
+
+    # ---------- file system helpers ----------
+    @staticmethod
+    def _is_bad_dot_underscore(p: Path) -> bool:
+        return p.name.startswith("._")
+
+    @staticmethod
+    def _read_csv_safe(p: Path) -> Optional[pd.DataFrame]:
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        if BallBearingData._is_bad_dot_underscore(p):
+            return None
+        for enc in ("utf-8", "utf-8-sig", "latin1"):
+            try:
+                return pd.read_csv(p, encoding=enc)
+            except Exception:
+                continue
+        print(f"[WARN] Skipping unreadable file: {p} (failed UTF-8/UTF-8-SIG/latin1)")
+        return None
+
+    def _find_trial_folders(self) -> List[Path]:
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
+
+        pat = re.compile(rf".*_{re.escape(self.folder_suffix)}$", flags=re.IGNORECASE)
+        folders = []
+        for dirpath, _, filenames in os.walk(self.root_dir):
+            if not any(f.lower().endswith(".csv") for f in filenames):
+                continue
+            d = Path(dirpath)
+            if pat.match(d.name):
+                folders.append(d)
+
+        folders = sorted(folders, key=lambda p: p.name)
+        self._all_folders = folders
+        print(f"Found {len(folders)} *_{self.folder_suffix} folders total (case-insensitive).")
+        return folders
+
+    def _split_sets(self) -> Tuple[List[Path], List[Path]]:
+        folders = self._all_folders or self._find_trial_folders()
+        if len(folders) < 2 * self.n_trials_per_set:
+            n = len(folders) // 2
+            first, second = folders[:n], folders[n: n*2]
         else:
-            self.root = Path(root_dir)
+            first  = folders[: self.n_trials_per_set]
+            second = folders[self.n_trials_per_set: 2 * self.n_trials_per_set]
 
-        self.n_trials_per_set = int(n_trials_per_set)   # same for first & second sets
-        self.files_per_trial  = int(files_per_trial)
-        self.folder_suffix    = str(folder_suffix).strip().upper()
+        if first:
+            print(f"First set range: {first[0].name} → {first[-1].name}")
+        if second:
+            print(f"Second set range: {second[0].name} → {second[-1].name}")
 
-        # Compile regex for folder names like: 2025_09_09_12_41_29_R
-        self.dt_pat = re.compile(
-            rf"(\d{{4}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_(\d{{2}})_{re.escape(self.folder_suffix)}$"
+        self._first_set, self._second_set = first, second
+        return first, second
+
+    # ---------- public loaders ----------
+    def load_first(self) -> List[str]:
+        if not self._all_folders:
+            self._find_trial_folders()
+        first, _ = self._split_sets()
+        self._warn_counts("ball_bearing_first", first)
+        return [str(p) for p in first]
+
+    def load_second(self) -> List[str]:
+        if not self._all_folders:
+            self._find_trial_folders()
+        _, second = self._split_sets()
+        self._warn_counts("ball_bearing_second", second)
+        return [str(p) for p in second]
+
+    def _warn_counts(self, label: str, folders: List[Path]):
+        problems = []
+        for i, f in enumerate(folders, start=1):
+            csvs = [p for p in f.glob("*.csv") if not self._is_bad_dot_underscore(p)]
+            if len(csvs) != self.files_per_trial:
+                problems.append((i, f.name, len(csvs)))
+        if problems:
+            print(f"[WARN] {label}: Some trials do not have exactly {self.files_per_trial} CSVs:")
+            for i, name, n in problems:
+                print(f"  • Trial {i:02d}: {name} has {n} CSVs")
+
+    # ---------- generic per-trial extractor ----------
+    def _extract_by_glob(self, trial_folders: List[str], pattern: str) -> List[pd.DataFrame]:
+        out: List[pd.DataFrame] = []
+        for folder in trial_folders:
+            fp = Path(folder)
+            cands = [p for p in fp.glob(pattern) if not self._is_bad_dot_underscore(p)]
+            if not cands:
+                nested = list(fp.glob(f"**/{pattern}"))
+                cands = [p for p in nested if not self._is_bad_dot_underscore(p)]
+            if not cands:
+                out.append(pd.DataFrame()); continue
+            cands_sorted = sorted(cands, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            df = self._read_csv_safe(cands_sorted[0])
+            out.append(df if df is not None else pd.DataFrame())
+        return out
+
+    # ---------- trial extraction ----------
+    def extract_adc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        return self._extract_by_glob(trial_folders, pattern="data_adc*.csv")
+
+    def extract_imu_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        return self._extract_by_glob(trial_folders, pattern="data_imu*.csv")
+
+    def extract_rotenc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        return self._extract_by_glob(trial_folders, pattern="data_rotenc*.csv")
+
+    def extract_spacebar_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        return self._extract_by_glob(trial_folders, pattern="data_spacebar*.csv")
+
+    # ---------- calibration ----------
+    @staticmethod
+    def _polyfit_quadratic(x: np.ndarray, y: np.ndarray, robust: bool) -> Tuple[float, float, float]:
+        x = np.asarray(x, float).reshape(-1)
+        y = np.asarray(y, float).reshape(-1)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
+        if x.size < 3:
+            raise ValueError("Need at least 3 points for quadratic fit.")
+        if not robust:
+            c2, c1, c0 = np.polyfit(x, y, 2)
+            return c0, c1, c2
+        w = np.ones_like(y)
+        for _ in range(3):
+            X = np.vstack([np.ones_like(x), x, x**2]).T
+            W = np.diag(w)
+            beta = np.linalg.lstsq(W @ X, W @ y, rcond=None)[0]
+            yhat = X @ beta
+            r = y - yhat
+            s = 1.4826 * np.median(np.abs(r - np.median(r))) if np.any(r) else 1.0
+            s = max(s, 1e-8)
+            k = 1.345 * s
+            w = np.where(np.abs(r) <= k, 1.0, k / (np.abs(r) + 1e-12))
+        return float(beta[0]), float(beta[1]), float(beta[2])
+
+    def fit_and_set_calibration(
+        self,
+        angle_adc_df: pd.DataFrame,
+        angle_col: str = "angle",
+        adc_col: str = "adc_ch3",
+        robust: bool = True,
+        anchors_source: str = "fit_only",
+        deg_min: float = 0.0,
+        deg_max: float = 90.0,
+    ) -> Dict[str, float]:
+        x = angle_adc_df[angle_col].to_numpy(float)
+        y = angle_adc_df[adc_col].to_numpy(float)
+        c0, c1, c2 = self._polyfit_quadratic(x, y, robust=robust)
+        p = np.poly1d([c2, c1, c0])
+
+        if anchors_source == "empirical":
+            def endpoint_avg(target_deg: float, win: float = 2.5):
+                m = np.isfinite(x) & np.isfinite(y) & (np.abs(x - target_deg) <= win)
+                return float(np.nanmean(y[m])) if np.any(m) else float(p(target_deg))
+            y0  = endpoint_avg(deg_min)
+            y90 = endpoint_avg(deg_max)
+        else:
+            y0  = float(p(deg_min))
+            y90 = float(p(deg_max))
+
+        self.calib = dict(c0=c0, c1=c1, c2=c2, y0=y0, y90=y90, source=anchors_source)
+
+        yhat = p(x)
+        ss_res = np.sum((y - yhat) ** 2)
+        ss_tot = np.sum((y - np.nanmean(y)) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+        return dict(
+            anchors_source=anchors_source,
+            c0=c0, c1=c1, c2=c2,
+            y0_emp=y0, y90_emp=y90,
+            r2=r2,
         )
 
-        # Discover, split, and validate
-        self.run_folders = self._find_run_folders()          # list[(Path, datetime, [csvs])]
-        self.first_block, self.second_block = self._split_blocks()
-        self._check_counts(self.first_block,  "ball_bearing_first")
-        self._check_counts(self.second_block, "ball_bearing_second")
-
-    # --------------- discovery & parsing ---------------
-
-    def _parse_folder_dt(self, folder_name: str):
-        m = self.dt_pat.search(folder_name)
-        if not m:
-            return None
-        y, M, d, h, m, s = map(int, m.groups())
-        return datetime(y, M, d, h, m, s)
-
-    def _find_run_folders(self):
-        """Find folders matching '*_{suffix}' and parse timestamp."""
-        out = []
-        pattern = f"*_{self.folder_suffix}"   # e.g., *_R
-        for p in self.root.rglob(pattern):
-            if p.is_dir():
-                dt = self._parse_folder_dt(p.name)
-                csvs = sorted(p.rglob("*.csv"))
-                out.append((p, dt, csvs))
-        # keep only those with valid datetime
-        out = [(p, dt, csvs) for (p, dt, csvs) in out if dt is not None]
-        out.sort(key=lambda t: t[1])
-        print(f"Found {len(out)} *_{self.folder_suffix} folders total.")
-        return out
-
-    def _split_blocks(self):
-        needed = 2 * self.n_trials_per_set
-        if len(self.run_folders) < needed:
-            raise ValueError(
-                f"Expected at least {needed} *_{self.folder_suffix} folders "
-                f"(2×{self.n_trials_per_set}), found {len(self.run_folders)}."
-            )
-        first_block  = self.run_folders[:self.n_trials_per_set]
-        second_block = self.run_folders[self.n_trials_per_set:needed]
-        print("First set range:",  first_block[0][0].name,  "→", first_block[-1][0].name)
-        print("Second set range:", second_block[0][0].name, "→", second_block[-1][0].name)
-        return first_block, second_block
-
-    def _check_counts(self, block, label):
-        bad = []
-        for i, (folder, dt, csvs) in enumerate(block, 1):
-            if len(csvs) != self.files_per_trial:
-                bad.append((i, folder, len(csvs)))
-        if bad:
-            print(f"[WARN] {label}: Some trials do not have exactly {self.files_per_trial} CSVs:")
-            for i, folder, n in bad:
-                print(f"  • Trial {i:02d}: {folder.name} has {n} CSVs")
+    # ---------- normalization & mapping ----------
+    def adc_to_norm(self, adc: np.ndarray) -> np.ndarray:
+        if not self.calib:
+            raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
+        y0, y90 = self.calib["y0"], self.calib["y90"]
+        adc = np.asarray(adc, float)
+        if y90 >= y0:
+            z = (adc - y0) / max(1e-12, (y90 - y0))
         else:
-            print(f"{label}: All trials have {self.files_per_trial} CSVs ✅")
+            z = (y0 - adc) / max(1e-12, (y0 - y90))
+        return np.clip(z, 0.0, 1.0)
 
-    # ---------------- loading ----------------
+    @staticmethod
+    def norm_to_angle(z: np.ndarray, deg_min: float = 0.0, deg_max: float = 90.0) -> np.ndarray:
+        z = np.asarray(z, float)
+        return deg_min + z * (deg_max - deg_min)
 
-    def _load_block(self, block, application_set_label):
-        frames = []
-        for trial_idx, (folder, dt, csvs) in enumerate(block, 1):
-            for file_idx, csv_path in enumerate(csvs, 1):
-                try:
-                    df = pd.read_csv(csv_path, low_memory=False)
-                except Exception as e:
-                    print(f"[WARN] Skipping unreadable file: {csv_path} ({e})")
+    def _adc_to_theta_deg(self, adc_vals: np.ndarray, clamp: bool = True) -> np.ndarray:
+        if not self.calib:
+            raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
+        y0  = float(self.calib["y0"])
+        y90 = float(self.calib["y90"])
+        adc_vals = np.asarray(adc_vals, dtype=float)
+        if np.isnan(y0) or np.isnan(y90):
+            theta = np.full_like(adc_vals, np.nan, dtype=float)
+        elif y90 >= y0:
+            theta = (adc_vals - y0) / max(1e-12, (y90 - y0)) * 90.0
+        else:
+            theta = (y0 - adc_vals) / max(1e-12, (y0 - y90)) * 90.0
+        if clamp:
+            theta = np.clip(theta, 0.0, 90.0)
+        return theta
+
+    # ---------- tall DF builder ----------
+    def trials_to_tall_df(
+        self,
+        adc_trials: List[pd.DataFrame],
+        set_label: str,
+        trial_len_sec: float = 10.0,
+        adc_col: str = "adc_ch3",
+        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+        include_endpoint: bool = True,
+    ) -> pd.DataFrame:
+        if not self.calib:
+            raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
+
+        parts = []
+        for trial_idx, df in enumerate(adc_trials, start=1):
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+
+            if adc_col not in df.columns:
+                adc_like = [c for c in df.columns if str(c).lower().startswith("adc")]
+                if not adc_like:
                     continue
-                df["application_set"]  = application_set_label
-                df["trial_index"]      = trial_idx
-                df["file_index"]       = file_idx
-                df["folder_name"]      = folder.name
-                df["source_folder"]    = folder.as_posix()
-                df["source_file"]      = csv_path.name
-                df["source_path"]      = csv_path.as_posix()
-                df["timestamp_folder"] = dt
-                frames.append(df)
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, axis=0, ignore_index=True)
+                adc_use = adc_like[0]
+            else:
+                adc_use = adc_col
 
-    def load_first(self):
-        return self._load_block(self.first_block, "ball_bearing_first")
-
-    def load_second(self):
-        return self._load_block(self.second_block, "ball_bearing_second")
-
-    def load_all(self):
-        d1 = self.load_first()
-        d2 = self.load_second()
-        return pd.concat([d1, d2], ignore_index=True)
-
-    # --------------- extractors by trial ---------------
-
-    def extract_adc_dfs_by_trial(self, df: pd.DataFrame, trials=None):
-        """
-        Return one ADC DataFrame per trial.
-        Rule:
-          - keep rows where source_file contains 'adc' (case-insensitive)
-          - if multiple files in a trial, pick the file with the most rows
-        Returns:
-          list[pd.DataFrame] with index i → trial (i+1)
-        """
-        if trials is None:
-            trials = self.n_trials_per_set
-
-        required = {"source_file", "source_path", "trial_index"}
-        if not required.issubset(df.columns):
-            missing = sorted(required - set(df.columns))
-            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
-
-        adc_only = df[df["source_file"].str.contains("adc", case=False, na=False)].copy()
-
-        out = []
-        for trial_idx in range(1, trials + 1):
-            rows_t = adc_only[adc_only["trial_index"] == trial_idx]
-            if rows_t.empty:
-                out.append(pd.DataFrame()); continue
-            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
-            chosen_path = max(groups, key=lambda x: x[1])[0]
-            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
-            out.append(df_trial.reset_index(drop=True))
-        return out
-
-    def extract_imu_dfs_by_trial(self, df: pd.DataFrame, trials=None):
-        """
-        Return one IMU DataFrame per trial.
-        Rule:
-          - keep rows where source_file contains 'data_imu' (case-insensitive)
-          - if multiple files in a trial, pick the file with the most rows
-        Returns:
-          list[pd.DataFrame] with index i → trial (i+1)
-        """
-        if trials is None:
-            trials = self.n_trials_per_set
-
-        required = {"source_file", "source_path", "trial_index"}
-        if not required.issubset(df.columns):
-            missing = sorted(required - set(df.columns))
-            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
-
-        imu_only = df[df["source_file"].str.contains("data_imu", case=False, na=False)].copy()
-
-        out = []
-        for trial_idx in range(1, trials + 1):
-            rows_t = imu_only[imu_only["trial_index"] == trial_idx]
-            if rows_t.empty:
-                out.append(pd.DataFrame()); continue
-            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=True)]
-            chosen_path = max(groups, key=lambda x: x[1])[0]
-            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
-            out.append(df_trial.reset_index(drop=True))
-        return out
-
-    def extract_trigger_dfs_by_trial(self, df: pd.DataFrame, trials=None):
-        """
-        Return one Trigger-Time DataFrame per trial.
-        Rule:
-          - keep rows where source_file contains 'data_trigger_time' (case-insensitive)
-          - if multiple files in a trial: pick file with most rows; tie-break by path
-        Returns:
-          list[pd.DataFrame] with index i → trial (i+1)
-        """
-        if trials is None:
-            trials = self.n_trials_per_set
-
-        required = {"source_file", "source_path", "trial_index"}
-        if not required.issubset(df.columns):
-            missing = sorted(required - set(df.columns))
-            raise KeyError(f"df must contain columns {sorted(required)}; missing: {missing}")
-
-        trig_only = df[df["source_file"].str.contains("data_trigger_time", case=False, na=False)].copy()
-
-        out = []
-        for trial_idx in range(1, trials + 1):
-            rows_t = trig_only[trig_only["trial_index"] == trial_idx]
-            if rows_t.empty:
-                out.append(pd.DataFrame()); continue
-
-            groups = [(path, len(g)) for path, g in rows_t.groupby("source_path", sort=False)]
-            max_len = max(n for _, n in groups)
-            candidates = [p for p, n in groups if n == max_len]
-            chosen_path = sorted(candidates)[-1]  # tie-breaker
-            df_trial = rows_t[rows_t["source_path"] == chosen_path].copy()
-            out.append(df_trial.reset_index(drop=True))
-        return out
-
-    # ---------------- calibration state (ADC) ----------------
-
-    def set_calibration(self, angle_adc_df: pd.DataFrame, coeffs: tuple[float, float, float]):
-        """
-        Store the quadratic fit (c2,c1,c0) and compute empirical 0°/90° ADC anchors
-        from a calibration table with columns ['angle','adc_ch3'].
-        """
-        assert {"angle", "adc_ch3"}.issubset(angle_adc_df.columns), \
-            "angle_adc_df must contain 'angle' and 'adc_ch3'"
-
-        c2, c1, c0 = coeffs
-        self.c2, self.c1, self.c0 = float(c2), float(c1), float(c0)
-
-        # Fitted endpoints used for root selection
-        p = np.poly1d([self.c2, self.c1, self.c0])
-        self.y0_fit = float(p(0.0))
-        self.y90_fit = float(p(90.0))
-        self.increasing_fit = (self.y90_fit >= self.y0_fit)
-
-        # Empirical anchors for normalization
-        EXPECTED = np.array([0.0, 22.5, 45.0, 67.5, 90.0])
-
-        def _snap(a):
-            a = float(a)
-            j = int(np.argmin(np.abs(EXPECTED - a)))
-            return EXPECTED[j] if abs(EXPECTED[j] - a) < 1e-3 else a
-
-        cal = angle_adc_df.copy()
-        cal["angle"] = pd.to_numeric(cal["angle"], errors="coerce").map(_snap)
-        cal = cal.dropna(subset=["angle", "adc_ch3"])
-
-        g = cal.groupby("angle")["adc_ch3"]
-        self.y0_emp = float(g.get_group(0.0).mean())
-        self.y90_emp = float(g.get_group(90.0).mean())
-        self.increasing_emp = (self.y90_emp >= self.y0_emp)
-        den_emp = (self.y90_emp - self.y0_emp) if self.increasing_emp else (self.y0_emp - self.y90_emp)
-        if np.isclose(den_emp, 0.0):
-            raise ValueError("Empirical 0°/90° anchors too close; check calibration selections.")
-        self._den_emp = float(den_emp)
-
-    @staticmethod
-    def adc_to_theta_deg(adc_vals, c2, c1, c0,
-                         y0_fit, y90_fit,
-                         increasing_fit: bool, clamp: bool = True):
-        """
-        Invert ADC = c2*θ^2 + c1*θ + c0  →  θ (deg). Uses fitted endpoints to
-        pick the correct root when two real roots exist.
-        """
-        a = np.asarray(adc_vals, dtype=float)
-        theta = np.full_like(a, np.nan, dtype=float)
-
-        # near-linear fallback
-        if np.isclose(c2, 0.0, atol=1e-14):
-            if np.isclose(c1, 0.0, atol=1e-14):
-                return theta
-            theta = (a - c0) / c1
-            return np.clip(theta, 0.0, 90.0) if clamp else theta
-
-        A, B, C = c2, c1, c0 - a
-        D = B * B - 4 * A * C
-        valid = D >= 0
-        sqrtD = np.zeros_like(D)
-        sqrtD[valid] = np.sqrt(D[valid])
-        t1 = np.where(valid, (-B + sqrtD) / (2 * A), np.nan)
-        t2 = np.where(valid, (-B - sqrtD) / (2 * A), np.nan)
-
-        # build guess from endpoints to choose a consistent branch
-        t01 = (a - y0_fit) / (y90_fit - y0_fit + 1e-12) if increasing_fit \
-            else (y0_fit - a) / (y0_fit - y90_fit + 1e-12)
-        t_guess = np.clip(90.0 * t01, 0.0, 90.0)
-
-        d1, d2 = np.abs(t1 - t_guess), np.abs(t2 - t_guess)
-        in1 = (t1 >= 0.0) & (t1 <= 90.0)
-        in2 = (t2 >= 0.0) & (t2 <= 90.0)
-
-        choose2 = (d2 < d1)
-        theta_chosen = np.where(choose2, t2, t1)
-        theta_chosen = np.where(in1 & ~choose2, t1, theta_chosen)
-        theta_chosen = np.where(in2 & choose2, t2, theta_chosen)
-
-        return np.clip(theta_chosen, 0.0, 90.0) if clamp else theta_chosen
-
-    def _adc_to_norm_emp(self, a):
-        """Normalize raw ADC to [0,1] using stored empirical anchors."""
-        a = np.asarray(a, float)
-        if self.increasing_emp:
-            return (a - self.y0_emp) / (self._den_emp + 1e-12)
-        else:
-            return (self.y0_emp - a) / (self._den_emp + 1e-12)
-
-    @staticmethod
-    def _coerce_timestamp_series(df: pd.DataFrame) -> pd.Series:
-        """Return a 'timestamp' series from common names; else NaNs."""
-        for col in ("timestamp", "time", "datetime"):
-            if col in df.columns:
-                s = df[col].copy()
-                s.name = "timestamp"
-                return s
-        return pd.Series([np.nan] * len(df), name="timestamp")
-
-    def trials_to_tall_df(self, trials: list[pd.DataFrame], set_label: str, trial_len_sec: float = 10.0):
-        """
-        Convert a list of ADC trials into one tall DataFrame with:
-        ['time_s','theta_pred_deg','adc_norm_01','adc_ch3','timestamp','trial','set_label'].
-        Requires you called set_calibration(...) first.
-        """
-        # safety: ensure calibration present
-        for attr in ("c2", "c1", "c0", "y0_fit", "y90_fit", "increasing_fit",
-                     "y0_emp", "y90_emp", "increasing_emp", "_den_emp"):
-            if not hasattr(self, attr):
-                raise RuntimeError("Call set_calibration(angle_adc_df, (c2,c1,c0)) before trials_to_tall_df().")
-
-        pieces = []
-        for i, tdf in enumerate(trials, start=1):
-            if tdf is None or tdf.empty or "adc_ch3" not in tdf.columns:
-                continue
-
-            df = tdf.copy()
-            ts = self._coerce_timestamp_series(df)
-
-            # synthetic time axis per trial
             n = len(df)
-            time_s = np.linspace(0.0, float(trial_len_sec), n, dtype=float)
+            time_s = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=include_endpoint, dtype=float)
 
-            adc_raw = pd.to_numeric(df["adc_ch3"], errors="coerce").to_numpy()
-            adc_norm = np.clip(self._adc_to_norm_emp(adc_raw), 0.0, 1.0)
-            theta = self.adc_to_theta_deg(
-                adc_raw, self.c2, self.c1, self.c0,
-                y0_fit=self.y0_fit, y90_fit=self.y90_fit,
-                increasing_fit=self.increasing_fit, clamp=True
-            )
+            ts = None
+            for tcol in time_col_options:
+                if tcol in df.columns:
+                    ts = df[tcol].copy()
+                    break
+            if ts is None:
+                ts = pd.Series([np.nan] * n)
 
-            out = pd.DataFrame({
+            adc_vals = pd.to_numeric(df[adc_use], errors="coerce").to_numpy(float)
+            theta_deg = self._adc_to_theta_deg(adc_vals, clamp=True)
+
+            parts.append(pd.DataFrame({
+                "set_label": set_label,
+                "trial": trial_idx,
                 "time_s": time_s,
-                "theta_pred_deg": theta,
-                "adc_norm_01": adc_norm,
-                "adc_ch3": adc_raw,
-                "timestamp": ts.values if len(ts) == n else np.nan,
-                "trial": i,
-                "set_label": set_label
-            })
-            pieces.append(out)
+                "timestamp": ts,
+                "theta_pred_deg": theta_deg,
+                adc_use: adc_vals,
+            }))
 
-        if not pieces:
-            return pd.DataFrame(
-                columns=["time_s", "theta_pred_deg", "adc_norm_01", "adc_ch3", "timestamp", "trial", "set_label"]
-            )
-        return pd.concat(pieces, ignore_index=True)
+        if not parts:
+            return pd.DataFrame(columns=["set_label","trial","time_s","timestamp","theta_pred_deg",adc_col])
 
-    # ---------------- IMU helpers & API ----------------
+        return pd.concat(parts, ignore_index=True)
 
-    _INVALID = {"", "none", "null", "None", "NULL"}  # class-level constant
+    # ---------- .mat extraction ----------
+    def extract_mat_dfs_by_trial(
+        self,
+        trial_folders: List[str],
+        mat_name: str = "flir.mat",
+        prefix: str = "ts",
+    ) -> List[pd.DataFrame]:
+        out: List[pd.DataFrame] = []
+        for folder in trial_folders:
+            fp = Path(folder)
 
-    @staticmethod
-    def _pick_imu_cols_and_mask(df: pd.DataFrame):
-        """
-        Pick which IMU columns to use for this trial and build a validity mask.
-        Preference: ('euler1','euler2') if present; else ('quat1','quat2').
-        Returns: (cols_tuple, mask Series). If neither available → (None, None).
-        """
-        # Try Euler first
-        if all(c in df.columns for c in ("euler1", "euler2")):
-            s1 = df["euler1"].astype("string", errors="ignore")
-            s2 = df["euler2"].astype("string", errors="ignore")
-            m = s1.notna() & (~s1.isin(BallBearingData._INVALID)) & s2.notna() & (~s2.isin(BallBearingData._INVALID))
-            if m.any():
-                return ("euler1", "euler2"), m
+            cands: List[Path] = []
+            exact = fp / mat_name
+            if exact.exists() and not self._is_bad_dot_underscore(exact):
+                cands.append(exact)
+            if not cands:
+                cands = [p for p in fp.glob("flir*.mat") if not self._is_bad_dot_underscore(p)]
+            if not cands:
+                cands = [p for p in fp.glob("*.mat") if not self._is_bad_dot_underscore(p)]
+            if not cands:
+                nested = list(fp.glob("**/*.mat"))
+                cands = [p for p in nested if not self._is_bad_dot_underscore(p)]
 
-        # Fallback: quaternion pair
-        if all(c in df.columns for c in ("quat1", "quat2")):
-            s1 = df["quat1"].astype("string", errors="ignore")
-            s2 = df["quat2"].astype("string", errors="ignore")
-            m = s1.notna() & (~s1.isin(BallBearingData._INVALID)) & s2.notna() & (~s2.isin(BallBearingData._INVALID))
-            if m.any():
-                return ("quat1", "quat2"), m
+            if not cands:
+                out.append(pd.DataFrame()); continue
 
-        return None, None
-
-    @staticmethod
-    def _compute_angle_for_trial_using_class(trigger_df: pd.DataFrame,
-                                             imu_df: pd.DataFrame,
-                                             trial_len_sec: float = 10.0,
-                                             axis_imu1: str = "y",
-                                             axis_imu2: str = "x"):
-        """
-        Build a fresh DLC3DBendAngles instance from this trial's trigger df,
-        run pipeline on IMU tuple-string columns (Euler or Quat), and return:
-            (angle ndarray), (time_s ndarray), (kept_idx int array)
-        """
-        if imu_df is None or imu_df.empty:
-            return np.array([]), np.array([]), np.array([], dtype=int)
-
-        imu_cols, mask = BallBearingData._pick_imu_cols_and_mask(imu_df)
-        if imu_cols is None:
-            return np.array([]), np.array([]), np.array([], dtype=int)
-
-        kept_idx = np.flatnonzero(mask.to_numpy())
-        imu_in = imu_df.loc[mask, list(imu_cols)].reset_index(drop=True)
-
-        # Fresh instance PER TRIAL (avoid shared state)
-        inst = DLC3DBendAngles(trigger_df)
-
-        # Convert tuple-like strings to Euler using your class API
-        inst.imu_df = imu_in.copy()
-        # NOTE: DLC3DBendAngles.imu_quat_to_euler must accept imu_cols + out_prefix
-        inst.imu_quat_to_euler(imu_cols=imu_cols, out_prefix=("imu1", "imu2"))
-        inst.euler_to_unit_vec(prefix="imu1", axis=axis_imu1, out_col="imu1_yvec")
-        inst.euler_to_unit_vec(prefix="imu2", axis=axis_imu2, out_col="imu2_xvec")
-        inst.angle_between_vectors("imu1_yvec", "imu2_xvec", out_col="imu_joint_deg_rx_py")
-
-        if "imu_joint_deg_rx_py" not in inst.imu_df.columns or inst.imu_df.empty:
-            return np.array([]), np.array([]), np.array([], dtype=int)
-
-        n = len(inst.imu_df)
-        time_s = np.linspace(0.0, float(trial_len_sec), n, dtype=float)
-        angle = pd.to_numeric(inst.imu_df["imu_joint_deg_rx_py"], errors="coerce").to_numpy()
-
-        return angle, time_s, kept_idx
-
-    def imu_augment_trials_inplace(self,
-                                   trigger_trials: list[pd.DataFrame],
-                                   imu_trials: list[pd.DataFrame],
-                                   trial_len_sec: float = 10.0,
-                                   axis_imu1: str = "y",
-                                   axis_imu2: str = "x",
-                                   verbose: bool = True):
-        """
-        For each trial, compute IMU bend angle using DLC3DBendAngles and append:
-            • 'imu_joint_deg_rx_py' (deg)
-            • 'time_s' (0..trial_len_sec)
-        Writes results back into the original IMU trial DataFrames (timestamps preserved).
-        """
-        n = min(len(trigger_trials), len(imu_trials))
-        for i in range(n):
-            df_imu = imu_trials[i]
-            df_trg = trigger_trials[i]
-            if df_imu is None or df_imu.empty:
-                if verbose: print(f"[skip trial {i + 1}] IMU df empty")
-                continue
+            cands_sorted = sorted(cands, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            mat_path = cands_sorted[0]
 
             try:
-                angle, time_s, kept_idx = BallBearingData._compute_angle_for_trial_using_class(
-                    df_trg, df_imu, trial_len_sec=trial_len_sec,
-                    axis_imu1=axis_imu1, axis_imu2=axis_imu2
-                )
+                df = self._mat_to_df(mat_path, prefix=prefix)
             except Exception as e:
-                if verbose: print(f"[skip trial {i + 1}] {e}")
-                continue
+                print(f"[WARN] Skipping unreadable MAT: {mat_path} ({e})")
+                df = pd.DataFrame()
 
-            # ensure output columns exist
-            if "imu_joint_deg_rx_py" not in df_imu.columns:
-                df_imu["imu_joint_deg_rx_py"] = np.nan
-            if "time_s" not in df_imu.columns:
-                df_imu["time_s"] = np.nan
+            out.append(df)
+        return out
 
-            if kept_idx.size == 0:
-                if verbose: print(f"[skip trial {i + 1}] no usable IMU tuple cols (euler1/euler2 or quat1/quat2)")
-                continue
+    def extract_trigger_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        dfs = self._extract_by_glob(trial_folders, pattern="data_trigger_time*.csv")
+        if all((df is None or df.empty) for df in dfs):
+            dfs = self._extract_by_glob(trial_folders, pattern="*trigger*.csv")
+        return dfs
 
-            df_imu.loc[df_imu.index[kept_idx], "imu_joint_deg_rx_py"] = angle
-            df_imu.loc[df_imu.index[kept_idx], "time_s"] = time_s
+    def _mat_to_df(self, mat_path: Path, prefix: str = "ts") -> pd.DataFrame:
+        import numpy as _np
+        wanted = {}
+        pref_l = str(prefix).lower()
 
+        # try classic MAT
+        try:
+            from scipy.io import loadmat
+            loaded = loadmat(str(mat_path), squeeze_me=True, struct_as_record=False)
+            keys = [k for k in loaded.keys() if not k.startswith("__")]
+            for k in keys:
+                if not k.lower().startswith(pref_l):
+                    continue
+                arr = _np.asarray(loaded[k])
+                arr = _np.squeeze(arr)
+                if arr.ndim == 1:
+                    wanted[k] = _np.asarray(arr, dtype=float)
+                elif arr.ndim == 2 and 1 in arr.shape:
+                    wanted[k] = _np.asarray(arr.reshape(-1), dtype=float)
+        except Exception:
+            pass
+
+        # try HDF5 (v7.3)
+        if not wanted:
+            try:
+                import h5py
+                with h5py.File(str(mat_path), "r") as f:
+                    def _visit(name, obj):
+                        if not isinstance(obj, h5py.Dataset):
+                            return
+                        key = name.split("/")[-1]
+                        if not key.lower().startswith(pref_l):
+                            return
+                        data = _np.array(obj)
+                        data = _np.squeeze(data)
+                        if data.ndim == 1:
+                            wanted[key] = _np.asarray(data, dtype=float)
+                        elif data.ndim == 2 and 1 in data.shape:
+                            wanted[key] = _np.asarray(data.reshape(-1), dtype=float)
+                    f.visititems(_visit)
+            except Exception as e:
+                raise RuntimeError(f"Failed to open as HDF5 v7.3: {e}")
+
+        if not wanted:
+            return pd.DataFrame()
+
+        df = pd.DataFrame({k: v for k, v in wanted.items()})
+        if df.shape[1] == 1:
+            only = df.columns[0]
+            if only.lower().startswith(pref_l):
+                df = df.rename(columns={only: "timestamp"})
+        return df
+
+    # ============================================================
+    # Heuristic helper (kept for convenience, not used by DLC flow)
+    # ============================================================
     @staticmethod
-    def imu_collect_tall(imu_trials: list[pd.DataFrame], set_label: str) -> pd.DataFrame:
+    def _infer_imu_angle_deg(df: pd.DataFrame) -> np.ndarray:
         """
-        From augmented IMU trials (with 'time_s' and 'imu_joint_deg_rx_py'),
-        build a tall DataFrame: ['time_s','imu_joint_deg_rx_py','trial','set_label'].
+        Best-effort extractor for a single joint angle (deg) from a trial IMU df.
+        Preference order:
+          1) existing angle columns
+          2) roll/rx (deg or rad)
+          3) pitch/py (deg or rad)
+          4) quaternion -> pitch (deg), ZYX
         """
-        pieces = []
-        for i, tdf in enumerate(imu_trials, start=1):
-            if tdf is None or tdf.empty:
+        cols = {c.lower(): c for c in df.columns}
+
+        for key in ("imu_joint_deg_rx_py", "theta_deg", "angle_deg"):
+            if key in cols:
+                return pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float)
+
+        for key in ("rx_deg", "roll_deg", "roll (deg)", "roll (degrees)"):
+            if key in cols:
+                return pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float)
+
+        for key in ("rx", "roll", "rx_rad", "roll_rad"):
+            if key in cols:
+                v = pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float)
+                if np.nanmax(np.abs(v)) <= 3.5:
+                    v = np.degrees(v)
+                return v
+
+        for key in ("py_deg", "pitch_deg", "pitch (deg)", "pitch (degrees)"):
+            if key in cols:
+                return pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float)
+
+        for key in ("py", "pitch", "py_rad", "pitch_rad"):
+            if key in cols:
+                v = pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float)
+                if np.nanmax(np.abs(v)) <= 3.5:
+                    v = np.degrees(v)
+                return v
+
+        qnames = {k: cols[k] for k in ("qw", "qx", "qy", "qz") if k in cols}
+        if len(qnames) == 4:
+            w = pd.to_numeric(df[qnames["qw"]], errors="coerce").to_numpy(float)
+            x = pd.to_numeric(df[qnames["qx"]], errors="coerce").to_numpy(float)
+            y = pd.to_numeric(df[qnames["qy"]], errors="coerce").to_numpy(float)
+            z = pd.to_numeric(df[qnames["qz"]], errors="coerce").to_numpy(float)
+            s = 2.0 * (w * y - z * x)
+            s = np.clip(s, -1.0, 1.0)
+            pitch_rad = np.arcsin(s)
+            return np.degrees(pitch_rad)
+
+        return np.full(len(df), np.nan, dtype=float)
+
+    # =========================
+    # IMU (DLC-driven) pipeline
+    # =========================
+    def imu_augment_trials_inplace(
+            self,
+            trigger_trials,  # unused; kept for API symmetry
+            imu_trials: List[pd.DataFrame],
+            trial_len_sec: float = 10.0,
+            quat_cols: Tuple[str, str] = ("quat1", "quat2"),
+            fixed_axis: str = "y",
+            moving_axis: str = "y",
+            quat_order: str = "wxyz",
+    ) -> None:
+        dlc = DLC3DBendAngles(pd.DataFrame({"_": []}))
+        augmented, _ = dlc.compute_joint_angle_trials(
+            imu_trials,
+            set_label="unused",
+            trial_len_sec=trial_len_sec,
+            quat_cols=quat_cols,
+            fixed_axis=fixed_axis,
+            moving_axis=moving_axis,
+            quat_order=quat_order,
+        )
+
+        for i, df_src in enumerate(imu_trials):
+            if df_src is None or df_src.empty:
                 continue
-            if "imu_joint_deg_rx_py" not in tdf.columns or "time_s" not in tdf.columns:
+
+            n = len(df_src)
+            # Always give the caller a full-length synthetic time base
+            df_src["time_s"] = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=False, dtype=float)
+
+            # Prepare target column with NaNs
+            if "imu_joint_deg_rx_py" not in df_src.columns:
+                df_src["imu_joint_deg_rx_py"] = np.nan
+
+            df_aug = augmented[i]
+            if df_aug is None or df_aug.empty or "imu_joint_deg_rx_py" not in df_aug.columns:
                 continue
-            part = tdf.loc[tdf["imu_joint_deg_rx_py"].notna(), ["time_s", "imu_joint_deg_rx_py"]].copy()
-            if not part.empty:
-                part["trial"] = i
-                part["set_label"] = set_label
-                pieces.append(part)
-        if not pieces:
-            return pd.DataFrame(columns=["time_s", "imu_joint_deg_rx_py", "trial", "set_label"])
-        return pd.concat(pieces, ignore_index=True)
+
+            # Case A: same length → fast path
+            if len(df_aug) == n:
+                df_src["imu_joint_deg_rx_py"] = df_aug["imu_joint_deg_rx_py"].to_numpy()
+                continue
+
+            # Case B: try timestamp alignment if both have it
+            if "timestamp" in df_src.columns and "timestamp" in df_aug.columns:
+                left = df_src[["timestamp"]].copy()
+                right = df_aug[["timestamp", "imu_joint_deg_rx_py"]].copy()
+                # Coerce to numeric if they look numeric; otherwise do string join
+                try:
+                    lt = pd.to_numeric(left["timestamp"], errors="coerce")
+                    rt = pd.to_numeric(right["timestamp"], errors="coerce")
+                    if lt.notna().any() and rt.notna().any():
+                        left["_t"] = lt
+                        right["_t"] = rt
+                        # nearest-asof join
+                        left = left.sort_values("_t")
+                        right = right.sort_values("_t")
+                        merged = pd.merge_asof(
+                            left, right, on="_t", direction="nearest", tolerance=None
+                        ).sort_index()
+                        df_src["imu_joint_deg_rx_py"] = merged["imu_joint_deg_rx_py"].to_numpy()
+                        continue
+                except Exception:
+                    pass
+
+                # Fallback: exact timestamp join as strings
+                merged = left.merge(right.astype({"timestamp": str}), on="timestamp", how="left")
+                df_src["imu_joint_deg_rx_py"] = merged["imu_joint_deg_rx_py"].to_numpy()
+            else:
+                print(f"[imu_augment_trials_inplace] Trial {i + 1}: length mismatch "
+                      f"({n} vs {len(df_aug)}), no timestamp to align; leaving angle as NaN.")
+
+    def imu_collect_tall(
+        self,
+        imu_trials: List[pd.DataFrame],
+        set_label: str,
+        trial_len_sec: float = 10.0,
+        quat_cols: Tuple[str, str] = ("quat1", "quat2"),
+        fixed_axis: str = "y",
+        moving_axis: str = "y",
+        quat_order: str = "wxyz",
+    ) -> pd.DataFrame:
+        dlc = DLC3DBendAngles(pd.DataFrame({"_": []}))
+        _, tall = dlc.compute_joint_angle_trials(
+            imu_trials,
+            set_label=set_label,
+            trial_len_sec=trial_len_sec,
+            quat_cols=quat_cols,
+            fixed_axis=fixed_axis,
+            moving_axis=moving_axis,
+            quat_order=quat_order,
+        )
+        return tall
 
 
 
@@ -589,33 +618,25 @@ class DLC3DBendAngles:
       - 'wrist' : angle(forearm→hand, hand→MCP)
     """
 
-
     def __init__(self, data, bodyparts: Optional[Dict[str, str]] = None):
         """
         Initialize from:
           - one or two DLC 3D CSV file paths
           - OR an existing pandas DataFrame
         """
-        import pandas as pd
-
         self.csv_path = data
         self._match_map: Optional[pd.DataFrame] = None
         self.df = None
         self.imu_df = None
         self.enc_df = None
 
-        # Case 1: Directly a pandas DataFrame
         if isinstance(data, pd.DataFrame):
             self.df = data
-
-        # Case 2: Single CSV path
         elif isinstance(data, str):
             df = pd.read_csv(data, header=[0, 1, 2])
             if not isinstance(df.columns, pd.MultiIndex):
                 raise ValueError("Expected DLC 3D CSV with a 3-row MultiIndex header.")
             self.df = df
-
-        # Case 3: Two CSV paths
         elif isinstance(data, (list, tuple)) and len(data) == 2:
             dfs = []
             for path in data:
@@ -629,7 +650,6 @@ class DLC3DBendAngles:
         else:
             raise ValueError("Input must be a DataFrame, a CSV path, or a list/tuple of two CSV paths.")
 
-        # Default bodyparts mapping
         self.bp = {
             "forearm": "forearm",
             "hand": "hand",
@@ -638,6 +658,109 @@ class DLC3DBendAngles:
         }
         if bodyparts:
             self.bp.update(bodyparts)
+
+    # ---------- IMU augmentation & tall collector ----------
+
+    def imu_augment_trials_inplace(
+        self,
+        trigger_trials: List[pd.DataFrame],  # accepted for API symmetry; unused
+        imu_trials: List[pd.DataFrame],
+        trial_len_sec: float = 10.0,
+        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+    ) -> None:
+        """
+        In-place augments each IMU trial DataFrame with:
+          - time_s: synthetic time from 0..trial_len_sec, length=len(rows)
+          - imu_joint_deg_rx_py: best-available IMU joint angle in degrees
+        Preserves any existing timestamp column (not modified/overwritten).
+        """
+
+        def _deg_from_quat(df: pd.DataFrame) -> Optional[np.ndarray]:
+            qcols = {"qw", "qx", "qy", "qz"} & set(df.columns)
+            if len(qcols) == 4:
+                qw = pd.to_numeric(df["qw"], errors="coerce").to_numpy(float)
+                qx = pd.to_numeric(df["qx"], errors="coerce").to_numpy(float)
+                qy = pd.to_numeric(df["qy"], errors="coerce").to_numpy(float)
+                qz = pd.to_numeric(df["qz"], errors="coerce").to_numpy(float)
+                # roll = atan2(2(w x + y z), 1 - 2(x^2 + y^2))
+                num = 2.0 * (qw * qx + qy * qz)
+                den = 1.0 - 2.0 * (qx * qx + qy * qy)
+                roll_rad = np.arctan2(num, den)
+                return np.degrees(roll_rad)
+            return None
+
+        def _compute_imu_deg(df: pd.DataFrame) -> np.ndarray:
+            for name in ["imu_joint_deg_rx_py", "imu_joint_deg", "imu_deg", "theta_deg", "angle_deg"]:
+                if name in df.columns:
+                    return pd.to_numeric(df[name], errors="coerce").to_numpy(float)
+            for name in ["rx_deg", "roll_deg", "imu_rx_deg"]:
+                if name in df.columns:
+                    return pd.to_numeric(df[name], errors="coerce").to_numpy(float)
+            for name in ["rx", "roll", "imu_rx"]:
+                if name in df.columns:
+                    v = pd.to_numeric(df[name], errors="coerce").to_numpy(float)
+                    return np.degrees(v)
+            v = _deg_from_quat(df)
+            if v is not None:
+                return v
+            return np.full(len(df), np.nan, dtype=float)
+
+        for i, df in enumerate(imu_trials):
+            if df is None or df.empty:
+                continue
+
+            n = len(df)
+            df["time_s"] = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=False, dtype=float)
+
+            # ensure timestamp exists (pass-through if present, else create)
+            if not any(c in df.columns for c in time_col_options):
+                df["timestamp"] = np.nan
+
+            df["imu_joint_deg_rx_py"] = _compute_imu_deg(df)
+
+    def imu_collect_tall(
+        self,
+        imu_trials: List[pd.DataFrame],
+        set_label: str,
+        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+    ) -> pd.DataFrame:
+        """
+        Collects augmented IMU trials into a single tall DataFrame with:
+          ['set_label','trial','time_s','timestamp','imu_joint_deg_rx_py']
+        Assumes `imu_augment_trials_inplace` has run.
+        """
+        parts: List[pd.DataFrame] = []
+
+        def _pick_timestamp_col(d: pd.DataFrame) -> Optional[str]:
+            for c in time_col_options:
+                if c in d.columns:
+                    return c
+            return None
+
+        for trial_idx, df in enumerate(imu_trials, start=1):
+            if df is None or df.empty:
+                continue
+            dfx = df.copy()
+            if "time_s" not in dfx.columns:
+                n = len(dfx)
+                dfx["time_s"] = np.linspace(0.0, 10.0, num=n, endpoint=False, dtype=float)
+            if "imu_joint_deg_rx_py" not in dfx.columns:
+                # fallback: try to compute quickly
+                dfx["imu_joint_deg_rx_py"] = np.nan
+            tcol = _pick_timestamp_col(dfx)
+            ts = dfx[tcol] if tcol else pd.Series([np.nan] * len(dfx))
+
+            parts.append(pd.DataFrame({
+                "set_label": set_label,
+                "trial": trial_idx,
+                "time_s": pd.to_numeric(dfx["time_s"], errors="coerce"),
+                "timestamp": ts,
+                "imu_joint_deg_rx_py": pd.to_numeric(dfx["imu_joint_deg_rx_py"], errors="coerce"),
+            }))
+
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+            columns=["set_label", "trial", "time_s", "timestamp", "imu_joint_deg_rx_py"]
+        )
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -664,7 +787,6 @@ class DLC3DBendAngles:
         try:
             return (coord_map["x"], coord_map["y"], coord_map["z"])
         except KeyError:
-            # Preserve old behavior for explicit xyz requests
             raise KeyError(f"Missing x/y/z for bodypart '{label}'.")
 
     def get_xy(self, bodypart_key: str) -> Tuple[Tuple[str, str, str], Tuple[str, str, str]]:
@@ -681,38 +803,29 @@ class DLC3DBendAngles:
             raise KeyError(f"Missing x and/or y for bodypart '{label}'.")
 
     def get_points(
-            self,
-            bodypart_key: str,
-            allow_2d: bool = True,
-            pad_2d_with_z0: bool = True
+        self,
+        bodypart_key: str,
+        allow_2d: bool = True,
+        pad_2d_with_z0: bool = True
     ) -> np.ndarray:
         """
         Return Nx3 (preferred) or Nx2 coordinates for the bodypart.
-        - If (x,y,z) exist: returns Nx3.
-        - If only (x,y) exist and allow_2d:
-            * returns Nx3 with z=0 if pad_2d_with_z0=True,
-            * otherwise returns Nx2.
         """
         try:
-            # Try full (x,y,z)
             xyz_cols = self.get_xyz(bodypart_key)
             return self.df[list(xyz_cols)].to_numpy(dtype=float)
         except KeyError:
             if not allow_2d:
                 raise
-            # Fall back to 2D
             x_col, y_col = self.get_xy(bodypart_key)
             xy = self.df[[x_col, y_col]].to_numpy(dtype=float)
             if pad_2d_with_z0:
-                # Promote to 3D by padding z=0 so downstream 3D code keeps working
                 z = np.zeros((xy.shape[0], 1), dtype=float)
                 return np.hstack([xy, z])
             else:
-                # Return pure 2D; vector/angle ops still work (axis=1)
                 return xy
 
-        # ---------- Vector + angle math ----------
-
+    # ---------- Vector + angle math ----------
     @staticmethod
     def vector(A: np.ndarray, B: np.ndarray) -> np.ndarray:
         """Row-wise vector from A to B."""
@@ -743,59 +856,46 @@ class DLC3DBendAngles:
     @staticmethod
     def _project_onto_plane(vec: np.ndarray, n_hat: np.ndarray) -> np.ndarray:
         """Project rows of vec onto plane with unit normal n_hat (row-wise)."""
-        # Projection: v_proj = v - (v·n_hat) n_hat
         dot = np.sum(vec * n_hat, axis=1, keepdims=True)
         return vec - dot * n_hat
 
     def angle_from_vectors_in_plane(
-            self,
-            v1: np.ndarray,
-            v2: np.ndarray,
-            plane_v1: np.ndarray,
-            plane_v2: np.ndarray,
-            signed: bool = False,
-            eps: float = 1e-12,
+        self,
+        v1: np.ndarray,
+        v2: np.ndarray,
+        plane_v1: np.ndarray,
+        plane_v2: np.ndarray,
+        signed: bool = False,
+        eps: float = 1e-12,
     ):
         """
-        Row-wise: project v1 and v2 onto the plane spanned by plane_v1 and plane_v2,
-        then compute the angle between the projected vectors (in degrees).
-
-        Returns:
-            ang: (N,) array of angles in degrees (NaN where plane/inputs degenerate)
-            p1:  (N,3) projected v1 onto plane
-            p2:  (N,3) projected v2 onto plane
-            valid_plane: (N,) bool mask where plane normal is well-defined
+        Project v1 and v2 onto plane spanned by plane_v1 and plane_v2, then angle between them.
+        Returns: (ang_deg, p1, p2, valid_plane_mask)
         """
         v1 = np.asarray(v1, float)
         v2 = np.asarray(v2, float)
         p1a = np.asarray(plane_v1, float)
         p2a = np.asarray(plane_v2, float)
 
-        # Plane normal (row-wise)
         n = np.cross(p1a, p2a)
         n_norm = np.linalg.norm(n, axis=1)
         valid_plane = n_norm > eps
         n_hat = np.zeros_like(n)
         n_hat[valid_plane] = (n[valid_plane] / n_norm[valid_plane, None])
 
-        # Project v1, v2 into the plane
         p1 = self._project_onto_plane(v1, n_hat)
         p2 = self._project_onto_plane(v2, n_hat)
 
-        # Normalize to compute angles robustly
         p1n = np.linalg.norm(p1, axis=1)
         p2n = np.linalg.norm(p2, axis=1)
         good = valid_plane & (p1n > eps) & (p2n > eps)
 
         ang = np.full(v1.shape[0], np.nan, dtype=float)
-
         if not np.any(good):
             return ang, p1, p2, valid_plane
 
         if signed:
-            # Signed angle w.r.t. plane normal: atan2( (p1×p2)·n_hat, p1·p2 )
-            p1u = np.zeros_like(p1)
-            p2u = np.zeros_like(p2)
+            p1u = np.zeros_like(p1); p2u = np.zeros_like(p2)
             p1u[good] = p1[good] / p1n[good, None]
             p2u[good] = p2[good] / p2n[good, None]
             cross_p = np.cross(p1u[good], p2u[good])
@@ -803,7 +903,6 @@ class DLC3DBendAngles:
             cos_th = np.sum(p1u[good] * p2u[good], axis=1)
             ang[good] = np.degrees(np.arctan2(sin_th, cos_th))
         else:
-            # Unsigned angle via dot product
             cosang = np.sum(p1[good] * p2[good], axis=1) / (p1n[good] * p2n[good])
             cosang = np.clip(cosang, -1.0, 1.0)
             ang[good] = np.degrees(np.arccos(cosang))
@@ -837,7 +936,7 @@ class DLC3DBendAngles:
         v1, v2 = self.compute_vectors(angle_type)
         return self.angle_from_vectors(v1, v2)
 
-
+    # ---------------- column resolution & typing helpers ----------------
     @staticmethod
     def _resolve_col_key(df: pd.DataFrame, col_spec):
         """
@@ -846,14 +945,11 @@ class DLC3DBendAngles:
           - a tuple (true MultiIndex key)
           - a substring (returns first match)
         """
-        # exact (including tuple)
         if col_spec in df.columns:
             return col_spec
-        # substring search on stringified column names
         candidates = [c for c in df.columns if str(col_spec) in str(c)]
         if len(candidates) == 0:
             raise KeyError(f"Column matching '{col_spec}' not found.")
-        # pick first match (you can tighten this if needed)
         return candidates[0]
 
     @staticmethod
@@ -863,56 +959,232 @@ class DLC3DBendAngles:
             s = pd.to_numeric(s, errors="coerce")
         return s.astype("float64")
 
-    # ---------------- MAT loader ----------------
-    def load_mat_as_df(self, mat_path: str, prefix: str = None) -> pd.DataFrame:
+    # ---------------- Robust MAT loader (patched) ----------------
+    def load_mat_as_df(self, mat_path: str, prefix: str | None = None) -> pd.DataFrame:
         from scipy.io import loadmat
-        mat_data = loadmat(mat_path)
-        keys = [k for k in mat_data.keys() if not k.startswith("__")]
+
+        def _flatten_struct(name, obj):
+            cols = {}
+            if hasattr(obj, "dtype") and obj.dtype.names:
+                for f in obj.dtype.names:
+                    v = obj[f]
+                    col_name = f"{name}.{f}"
+                    if isinstance(v, np.ndarray):
+                        if v.ndim == 0:
+                            cols[col_name] = pd.Series([v.item()])
+                        elif v.ndim == 1:
+                            cols[col_name] = pd.Series(v.reshape(-1))
+                        else:
+                            if v.shape[0] == 0:
+                                cols[col_name] = pd.Series([], dtype=float)
+                            else:
+                                flat = v.reshape(v.shape[0], -1)
+                                for j in range(flat.shape[1]):
+                                    cols[f"{col_name}_{j}"] = pd.Series(flat[:, j])
+                    else:
+                        cols[col_name] = pd.Series([v])
+            return pd.DataFrame(cols) if cols else pd.DataFrame()
+
+        mat = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        keys = [k for k in mat.keys() if not k.startswith("__")]
         if prefix:
-            keys = [k for k in keys if k.startswith(prefix)]
+            keys = [k for k in keys if str(k).startswith(prefix)]
 
         dfs = []
         for k in keys:
-            val = mat_data[k]
+            val = mat[k]
+            if hasattr(val, "dtype") and getattr(val.dtype, "names", None):
+                df_k = _flatten_struct(k, val)
+                if not df_k.empty:
+                    dfs.append(df_k)
+                continue
             if isinstance(val, np.ndarray):
-                if val.ndim == 1:
-                    df_k = pd.DataFrame({k: val})
+                if val.ndim == 0:
+                    df_k = pd.DataFrame({k: [val.item()]})
+                elif val.ndim == 1:
+                    df_k = pd.DataFrame({k: val.reshape(-1)})
                 elif val.ndim == 2:
-                    col_names = [f"{k}_{i}" for i in range(val.shape[1])]
-                    df_k = pd.DataFrame(val, columns=col_names)
+                    df_k = pd.DataFrame(val, columns=[f"{k}_{i}" for i in range(val.shape[1])])
                 else:
                     flat = val.reshape(val.shape[0], -1)
-                    col_names = [f"{k}_{i}" for i in range(flat.shape[1])]
-                    df_k = pd.DataFrame(flat, columns=col_names)
+                    df_k = pd.DataFrame(flat, columns=[f"{k}_{i}" for i in range(flat.shape[1])])
                 dfs.append(df_k)
-            else:
-                print(f"Skipping non-array variable: {k}")
+                continue
+            dfs.append(pd.DataFrame({k: [val]}))
 
         if dfs:
-            return pd.concat(dfs, axis=1)
-        else:
-            raise ValueError(f"No array variables found in {mat_path} matching prefix='{prefix}'")
+            try:
+                return pd.concat(dfs, axis=1)
+            except Exception:
+                return pd.concat(dfs, axis=1, join="outer").reset_index(drop=True)
 
-    @staticmethod
-    def compare_row_counts(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[int, int]:
-        rows_df1 = len(df1)
-        rows_df2 = len(df2)
-        print(f"DataFrame 1: {rows_df1} rows")
-        print(f"DataFrame 2: {rows_df2} rows")
-        return rows_df1, rows_df2
+        raise ValueError(f"No variables found in {mat_path} matching prefix='{prefix}'")
 
+    # ======================
+    # 2) Quaternion → Euler
+    # ======================
+    def imu_quat_to_euler(
+        self,
+        imu_cols=('euler1', 'euler2'),
+        quat_order='wxyz',
+        sequence='zyx',
+        degrees=True,
+        out_prefix=('imu1', 'imu2'),
+    ):
+        """
+        Convert quaternion columns to Euler angles (roll, pitch, yaw).
+        Stores results in self.imu_df with prefixes.
+        """
+        def parse_tuple_string(s):
+            if isinstance(s, (list, tuple, np.ndarray)):
+                arr = np.array(s, dtype=float).reshape(-1)
+                if arr.size == 4:
+                    return arr
+                out = np.full(4, np.nan, dtype=float)
+                n = min(4, arr.size)
+                out[:n] = arr[:n]
+                return out
+            if s is None:
+                return np.full(4, np.nan, dtype=float)
+            s = str(s).strip()
+            if s == "" or s.lower() == "none":
+                return np.full(4, np.nan, dtype=float)
+            s = s.strip("[](){}")
+            parts = [p for p in s.replace(",", " ").split() if p]
+            vals = []
+            for p in parts[:4]:
+                try:
+                    vals.append(float(p))
+                except Exception:
+                    vals.append(np.nan)
+            if len(vals) < 4:
+                vals += [np.nan] * (4 - len(vals))
+            return np.array(vals, dtype=float)
 
-    def add_dataframe(self, other_df: pd.DataFrame, inplace: bool = True) -> pd.DataFrame:
-        if len(other_df) != len(self.df):
-            raise ValueError(
-                f"Row count mismatch: self.df has {len(self.df)} rows, other_df has {len(other_df)} rows")
+        def normalize(q):
+            q = np.asarray(q, dtype=float)
+            n = np.linalg.norm(q, axis=-1, keepdims=True)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                qn = q / n
+            return qn
+
+        def quat_to_euler(q, order='wxyz', seq='zyx', deg=True):
+            if order == 'wxyz':
+                w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+            elif order == 'xyzw':
+                x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+            else:
+                raise ValueError("quat_order must be 'wxyz' or 'xyzw'.")
+
+            ww, xx, yy, zz = w * w, x * x, y * y, z * z
+            R00 = 1 - 2 * (yy + zz)
+            R10 = 2 * (x * y + z * w)
+            R20 = 2 * (x * z - y * w)
+            R21 = 2 * (y * z + x * w)
+            R22 = 1 - 2 * (xx + yy)
+
+            if seq == 'zyx':
+                yaw = np.arctan2(R10, R00)
+                pitch = np.arcsin(-R20)
+                roll = np.arctan2(R21, R22)
+            else:
+                raise ValueError("Unsupported sequence; use 'zyx'.")
+
+            if deg:
+                roll, pitch, yaw = np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+            return roll, pitch, yaw
+
+        for col, prefix in zip(imu_cols, out_prefix):
+            if col not in self.imu_df.columns:
+                raise KeyError(f"Missing IMU quaternion column: {col}")
+            q_raw = self.imu_df[col].apply(parse_tuple_string).to_list()
+            q = normalize(np.array(q_raw))
+            r, p, y = quat_to_euler(q, order=quat_order, seq=sequence, deg=degrees)
+            self.imu_df[f'{prefix}_roll'] = r
+            self.imu_df[f'{prefix}_pitch'] = p
+            self.imu_df[f'{prefix}_yaw'] = y
+
+    # ======================
+    # 3) Euler → unit vector
+    # ======================
+    def euler_to_unit_vec(
+        self,
+        prefix='imu1',
+        sequence='zyx',
+        axis='z',
+        degrees=True,
+        out_col=None,
+    ):
+        r = self.imu_df[f'{prefix}_roll'].to_numpy()
+        p = self.imu_df[f'{prefix}_pitch'].to_numpy()
+        y = self.imu_df[f'{prefix}_yaw'].to_numpy()
+
+        if degrees:
+            r, p, y = np.deg2rad(r), np.deg2rad(p), np.deg2rad(y)
+
+        def Rx(a): return np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+        def Ry(a): return np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+        def Rz(a): return np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+
+        base = {'x': [1, 0, 0], 'y': [0, 1, 0], 'z': [0, 0, 1]}[axis]
+        vecs = []
+        for ri, pi, yi in zip(r, p, y):
+            R = Rz(yi) @ Ry(pi) @ Rx(ri) if sequence == 'zyx' else np.eye(3)
+            vecs.append(tuple((R @ base).tolist()))
+
+        if out_col is None:
+            out_col = f'{prefix}_{axis}vec'
+        self.imu_df[out_col] = vecs
+
+    # ======================
+    # 4) Vector → angle
+    # ======================
+    def angle_between_vectors(
+        self,
+        vec_col_a,
+        vec_col_b,
+        out_col='imu_vec_angle_deg',
+        degrees=True
+    ):
+        a = np.stack(self.imu_df[vec_col_a].apply(lambda v: np.array(v, float)).to_numpy())
+        b = np.stack(self.imu_df[vec_col_b].apply(lambda v: np.array(v, float)).to_numpy())
+
+        na = np.linalg.norm(a, axis=1, keepdims=True)
+        nb = np.linalg.norm(b, axis=1, keepdims=True)
+        mask = (na[:, 0] > 0) & (nb[:, 0] > 0)
+
+        ang = np.full(len(a), np.nan, float)
+        if np.any(mask):
+            aa = a[mask] / na[mask]
+            bb = b[mask] / nb[mask]
+            dot = np.clip(np.sum(aa * bb, axis=1), -1.0, 1.0)
+            val = np.arccos(dot)
+            if degrees:
+                val = np.degrees(val)
+            ang[mask] = val
+
+        self.imu_df[out_col] = ang
+
+    # ======================
+    # 5) Add angle column
+    # ======================
+    def add_imu_angle_column(
+        self,
+        values,
+        name=('metric', 'imu_joint_deg', 'deg'),
+        inplace=True
+    ):
+        target = self.imu_df if inplace else self.imu_df.copy()
+        colname = name
+        if isinstance(name, tuple) and not isinstance(target.columns, pd.MultiIndex):
+            colname = "_".join([str(x) for x in name])
+        target[colname] = values
         if inplace:
-            for col in other_df.columns:
-                self.df[col] = other_df[col].values
-            return self.df
-        else:
-            return pd.concat([self.df, other_df], axis=1)
+            self.imu_df = target
+            return self.imu_df
+        return target
 
+    # ---------------- Timestamp parsing helpers for matching ----------------
     @staticmethod
     def _series_time_of_day_to_timedelta(s: pd.Series) -> pd.Series:
         """
@@ -921,11 +1193,10 @@ class DLC3DBendAngles:
         """
         s = pd.Series(s, copy=False)
 
-        # Detect HHMMSSffffff pattern (int or str)
         def parse_hhmmssfff(val):
             if pd.isna(val):
                 return pd.NaT
-            val_str = str(int(val)).zfill(12)  # ensure zero-padded
+            val_str = str(int(val)).zfill(12)
             try:
                 t = datetime.strptime(val_str, "%H%M%S%f").time()
                 return (pd.to_timedelta(t.hour, unit="h") +
@@ -936,11 +1207,9 @@ class DLC3DBendAngles:
                 return pd.NaT
 
         if np.issubdtype(s.dtype, np.number) or s.dtype == object:
-            # Check if all values look like HHMMSSffffff
             if s.dropna().astype(str).str.fullmatch(r"\d{9,12}").all():
                 return s.apply(parse_hhmmssfff)
 
-        # Fallback to pandas parser
         try:
             return pd.to_timedelta(s, errors="coerce")
         except Exception:
@@ -949,10 +1218,7 @@ class DLC3DBendAngles:
     @staticmethod
     def _coerce_tolerance_to_timedelta(tolerance) -> pd.Timedelta:
         """
-        Tolerance interpretation:
-          - int   -> microseconds
-          - float -> seconds
-          - str   -> parsed by pandas ('10ms', '500us', '1s', etc.)
+        Tolerance: int→µs, float→s, str→pandas offset (e.g., '10ms','500us','1s').
         """
         if isinstance(tolerance, (np.integer, int)):
             return pd.to_timedelta(int(tolerance), unit="us")
@@ -960,18 +1226,18 @@ class DLC3DBendAngles:
             return pd.to_timedelta(float(tolerance), unit="s")
         return pd.to_timedelta(tolerance)
 
+    # ---------------- Core matching API ----------------
     def find_matching_indices(
-            self,
-            encoder_df: pd.DataFrame,
-            cam_time_col,
-            enc_time_col,
-            tolerance,
-            direction: str = "nearest",
+        self,
+        encoder_df: pd.DataFrame,
+        cam_time_col,
+        enc_time_col,
+        tolerance,
+        direction: str = "nearest",
     ) -> pd.DataFrame:
         """
         Build mapping of camera rows to encoder rows where |t_cam - t_enc| <= tolerance.
-        Accepts µs integers, datetimes, or strings; stores time_delta in **milliseconds (float)**.
-        NOTE: int tolerance = microseconds, float = seconds, str via pandas ('10ms','500us',...).
+        Stores time_delta in milliseconds (float).
         """
         if not isinstance(self.df, pd.DataFrame):
             raise ValueError("self.df must be a pandas DataFrame.")
@@ -979,18 +1245,11 @@ class DLC3DBendAngles:
         cam_col = self._resolve_col_key(self.df, cam_time_col)
         enc_col = self._resolve_col_key(encoder_df, enc_time_col)
 
-        # Convert to Timedelta since midnight / start
         cam_td = self._series_time_of_day_to_timedelta(self.df[cam_col]).rename("t_cam_td")
         enc_td = self._series_time_of_day_to_timedelta(encoder_df[enc_col]).rename("t_enc_td")
 
         cam_small = pd.DataFrame({"t_cam_td": cam_td, "cam_index": self.df.index})
         enc_small = pd.DataFrame({"t_enc_td": enc_td, "enc_index": encoder_df.index})
-
-        # Debug counts
-        cam_nan_count = cam_small["t_cam_td"].isna().sum()
-        enc_nan_count = enc_small["t_enc_td"].isna().sum()
-        print(f"[find_matching_indices] Dropping {cam_nan_count} camera rows with NaT timestamps.")
-        print(f"[find_matching_indices] Dropping {enc_nan_count} encoder rows with NaT timestamps.")
 
         cam_small = cam_small.dropna(subset=["t_cam_td"]).sort_values("t_cam_td")
         enc_small = enc_small.dropna(subset=["t_enc_td"]).sort_values("t_enc_td")
@@ -999,26 +1258,8 @@ class DLC3DBendAngles:
             self._match_map = pd.DataFrame(columns=["cam_index", "enc_index", "time_delta"])
             return self._match_map
 
-        # Merge on int64 nanoseconds for speed/safety
         cam_small["_t_cam_ns"] = cam_small["t_cam_td"].view("i8")
         enc_small["_t_enc_ns"] = enc_small["t_enc_td"].view("i8")
-
-        # ===== DEBUG: ranges and rough gap stats =====
-        print("[debug] cam range:", cam_small["t_cam_td"].min(), "→", cam_small["t_cam_td"].max())
-        print("[debug] enc range:", enc_small["t_enc_td"].min(), "→", enc_small["t_enc_td"].max())
-
-        probe = pd.merge_asof(
-            cam_small[["t_cam_td", "_t_cam_ns"]].iloc[::max(1, len(cam_small) // 20)].sort_values("_t_cam_ns"),
-            enc_small[["t_enc_td", "_t_enc_ns"]].sort_values("_t_enc_ns"),
-            left_on="_t_cam_ns",
-            right_on="_t_enc_ns",
-            direction="nearest"
-        )
-        probe["delta"] = pd.to_timedelta(probe["_t_enc_ns"] - probe["_t_cam_ns"], unit="ns")
-        probe["delta_ms"] = probe["delta"].dt.total_seconds() * 1000.0
-        print("[debug] probe |delta| (ms) stats:", probe["delta_ms"].abs().describe())
-
-        # =================================================
 
         merged = pd.merge_asof(
             cam_small,
@@ -1029,15 +1270,12 @@ class DLC3DBendAngles:
             allow_exact_matches=True,
         )
 
-        # Timedelta difference (ns → Timedelta → ms)
         merged["time_delta_td"] = pd.to_timedelta(merged["_t_enc_ns"] - merged["_t_cam_ns"], unit="ns")
         merged["time_delta_ms"] = merged["time_delta_td"].dt.total_seconds() * 1000.0
 
-        # Tolerance check still in Timedelta space
         tol_td = self._coerce_tolerance_to_timedelta(tolerance)
         keep = merged["time_delta_td"].abs() <= tol_td
 
-        # Output with time_delta as milliseconds (numeric)
         out = (merged.loc[keep, ["cam_index", "enc_index", "time_delta_ms"]]
                .rename(columns={"time_delta_ms": "time_delta"})
                .drop_duplicates(subset=["cam_index"], keep="first")
@@ -1046,19 +1284,86 @@ class DLC3DBendAngles:
         self._match_map = out
         return out
 
+    # --------- Row cleaner for IMU quaternion/euler strings ---------
+    @staticmethod
+    def drop_rows_with_none_in_euler(df, euler_cols=("euler1", "euler2")):
+        df = df.copy()
+        for c in euler_cols:
+            if c not in df.columns:
+                raise KeyError(f"Missing expected IMU column: {c}")
+            df[c] = df[c].replace(["None", "none", "NULL", "null", ""], np.nan)
+        mask_valid = df[list(euler_cols)].notna().all(axis=1)
+        return df.loc[mask_valid].copy()
+
+    # --------- Trial-wise quaternion pipeline ---------
+    def compute_joint_angle_trials(
+        self,
+        imu_trials: list[pd.DataFrame],
+        set_label: str,
+        trial_len_sec: float = 10.0,
+        quat_cols: tuple[str, str] = ("quat1", "quat2"),
+        fixed_axis: str = "y",
+        moving_axis: str = "y",
+        quat_order: str = "wxyz",
+    ):
+        augmented: list[pd.DataFrame] = []
+        parts: list[pd.DataFrame] = []
+
+        for trial_idx, df in enumerate(imu_trials, start=1):
+            if df is None or df.empty:
+                augmented.append(pd.DataFrame());
+                continue
+
+            d = self.drop_rows_with_none_in_euler(df, euler_cols=quat_cols).copy()
+
+            self.imu_df = d
+            self.imu_quat_to_euler(
+                imu_cols=quat_cols,
+                quat_order=quat_order,
+                sequence="zyx",
+                degrees=True,
+                out_prefix=("imu1", "imu2")
+            )
+
+            self.euler_to_unit_vec(prefix="imu1", axis=fixed_axis, out_col=f"imu1_{fixed_axis}vec")
+            self.euler_to_unit_vec(prefix="imu2", axis=moving_axis, out_col=f"imu2_{moving_axis}vec")
+
+            self.angle_between_vectors(
+                vec_col_a=f"imu1_{fixed_axis}vec",
+                vec_col_b=f"imu2_{moving_axis}vec",
+                out_col="imu_joint_deg_rx_py",
+                degrees=True
+            )
+
+            n = len(self.imu_df)
+            self.imu_df["time_s"] = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=False, dtype=float)
+            if "timestamp" not in self.imu_df.columns:
+                self.imu_df["timestamp"] = np.nan
+
+            augmented.append(self.imu_df.copy())
+            ts = self.imu_df["timestamp"]
+            parts.append(pd.DataFrame({
+                "set_label": set_label,
+                "trial": trial_idx,
+                "time_s": pd.to_numeric(self.imu_df["time_s"], errors="coerce"),
+                "timestamp": ts,
+                "imu_joint_deg_rx_py": pd.to_numeric(self.imu_df["imu_joint_deg_rx_py"], errors="coerce"),
+            }))
+
+        tall = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+            columns=["set_label", "trial", "time_s", "timestamp", "imu_joint_deg_rx_py"]
+        )
+        return augmented, tall
+
+    # --------- Encoder attach utilities ---------
     def attach_encoder_using_match(
-            self,
-            encoder_df: pd.DataFrame,
-            columns: Optional[List] = None,
-            suffix: str = "_renc",
-            keep_time_delta: bool = True,
-            drop_unmatched: bool = True,
+        self,
+        encoder_df: pd.DataFrame,
+        columns: Optional[List] = None,
+        suffix: str = "_renc",
+        keep_time_delta: bool = True,
+        drop_unmatched: bool = True,
     ) -> pd.DataFrame:
-        """
-        Use self._match_map to (a) optionally drop unmatched rows in self.df
-        and (b) attach chosen encoder columns (flattened + suffixed).
-        Note: 'time_delta' is a Timedelta. Set drop_unmatched=False to preserve all rows.
-        """
         if self._match_map is None or self._match_map.empty:
             raise RuntimeError("No matches stored. Run find_matching_indices(...) first.")
 
@@ -1070,7 +1375,6 @@ class DLC3DBendAngles:
             self.df = self.df.loc[keep_idx]
         self.df = self.df.sort_index()
 
-        # Choose encoder columns
         if columns is None:
             cols_to_take = encoder_df.columns
         else:
@@ -1091,26 +1395,22 @@ class DLC3DBendAngles:
         return self.df
 
     def match_encoder_to_imu(
-            self,
-            enc_time_col="timestamp",
-            imu_time_col="timestamp",
-            tolerance="200ms",
-            direction="nearest",
-            columns=None,  # e.g., ["imu_joint_deg"] or None for all
-            suffix="_imu",
-            keep_time_delta=True,
-            drop_unmatched=True,
+        self,
+        enc_time_col="timestamp",
+        imu_time_col="timestamp",
+        tolerance="200ms",
+        direction="nearest",
+        columns=None,
+        suffix="_imu",
+        keep_time_delta=True,
+        drop_unmatched=True,
     ):
-        """
-        Align encoder rows to nearest IMU rows by timestamp and attach IMU columns onto self.enc_df.
-        """
         if getattr(self, "enc_df", None) is None or getattr(self, "imu_df", None) is None:
             raise RuntimeError("enc_df and imu_df must be loaded before calling match_encoder_to_imu().")
 
         _prev_df = getattr(self, "df", None)
         self.df = self.enc_df
 
-        # Build match map Encoder <-> IMU
         self.find_matching_indices(
             encoder_df=self.imu_df,
             cam_time_col=enc_time_col,
@@ -1119,7 +1419,6 @@ class DLC3DBendAngles:
             direction=direction,
         )
 
-        # Attach IMU columns to matched encoder rows
         self.attach_encoder_using_match(
             encoder_df=self.imu_df,
             columns=columns,
@@ -1132,7 +1431,6 @@ class DLC3DBendAngles:
         self.df = _prev_df
         return self.enc_df
 
-    # ---------------- One-shot aligner (kept, now using helpers) ----------------
     def align_and_attach_encoder(
         self,
         encoder_df: pd.DataFrame,
@@ -1146,7 +1444,6 @@ class DLC3DBendAngles:
         inplace: bool = True,
         verbose: bool = True,
     ) -> pd.DataFrame:
-
         left = self._flatten_columns(self.df)
         right = self._flatten_columns(encoder_df)
 
@@ -1158,10 +1455,9 @@ class DLC3DBendAngles:
         left["_t"] = self._ensure_float_series(left[cam_time_col])
         right["_t_enc"] = self._ensure_float_series(right[enc_time_col])
 
-        left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)  # keep original idx
+        left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
         right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
 
-        # Suffix encoder columns (skip key)
         rename_map = {c: f"{c}{suffix}" for c in right.columns if c not in ("_t_enc", "index")}
         right = right.rename(columns=rename_map)
 
@@ -1179,15 +1475,11 @@ class DLC3DBendAngles:
             with np.errstate(invalid="ignore"):
                 merged[f"abs_dt{suffix}"] = (merged["_t"] - merged["_t_enc"]).abs()
 
-        if drop_unmatched:
-            matched = merged[merged["_t_enc"].notna()].copy()
-        else:
-            matched = merged
+        matched = merged[merged["_t_enc"].notna()].copy() if drop_unmatched else merged
 
         if verbose:
             print(f"[align_and_attach_encoder] camera rows in: {len(left)}, kept after match: {len(matched)}")
 
-        # Restore original index for rows we kept
         matched = matched.set_index("index").sort_index()
         if inplace:
             self.df = matched
@@ -1195,18 +1487,9 @@ class DLC3DBendAngles:
         return matched
 
     def load_imu_p_enc(self, imu_path, enc_path):
-        """
-        Load IMU and encoder CSV files into self.imu_df and self.enc_df.
-        Accepts str/Path-like or None. Avoids ambiguous truth checks.
-        """
-        import os
-        import pandas as pd
-        from pathlib import Path
-
         def _to_str_path(p):
             if p is None:
                 return None
-            # Handle Path, numpy.str_, etc.
             try:
                 return str(p)
             except Exception:
@@ -1230,38 +1513,16 @@ class DLC3DBendAngles:
         if not hasattr(self, "enc_df") or self.enc_df is None:
             raise ValueError("Encoder CSV was not loaded (enc_path was None or invalid).")
 
-    def drop_rows_with_none_in_euler(df, euler_cols=("euler1", "euler2")):
-        import numpy as np
-        import pandas as pd
-        df = df.copy()
-        for c in euler_cols:
-            if c not in df.columns:
-                raise KeyError(f"Missing expected IMU column: {c}")
-            # Normalize various string Nones to NaN
-            df[c] = df[c].replace(["None", "none", "NULL", "null", ""], np.nan)
-        mask_valid = df[list(euler_cols)].notna().all(axis=1)
-        return df.loc[mask_valid].copy()
-
-    def compute_joint_angle_from_body_axes(self,
-                                           fixed_prefix='imu1', fixed_axis='x',
-                                           moving_prefix='imu2', moving_axis='z',
-                                           out_col='imu_joint_deg_axes',
-                                           degrees=True):
-        """
-        Compute bend as the angle between two IMU body axes expressed in world:
-            angle = ∠( R_fixed * e_fixed_axis , R_moving * e_moving_axis ).
-
-        Requires that imu_quat_to_euler(...) has already populated:
-            '{prefix}_roll', '{prefix}_pitch', '{prefix}_yaw' for each prefix.
-
-        Args:
-            fixed_prefix, moving_prefix: which IMUs (matching your earlier out_prefix names)
-            fixed_axis, moving_axis: 'x'|'y'|'z' axes from each IMU body frame
-            out_col: output column name to store angle (degrees)
-        """
-        import numpy as np
-
-        # ensure world vectors exist (re-use your routine to build them)
+    # ======================
+    # Body-axes joint angle
+    # ======================
+    def compute_joint_angle_from_body_axes(
+        self,
+        fixed_prefix='imu1', fixed_axis='x',
+        moving_prefix='imu2', moving_axis='z',
+        out_col='imu_joint_deg_axes',
+        degrees=True
+    ):
         colA = f'{fixed_prefix}_{fixed_axis}vec'
         colB = f'{moving_prefix}_{moving_axis}vec'
         if colA not in self.imu_df.columns:
@@ -1271,12 +1532,20 @@ class DLC3DBendAngles:
 
         a = np.stack(self.imu_df[colA].apply(lambda v: np.array(v, float)).to_numpy())
         b = np.stack(self.imu_df[colB].apply(lambda v: np.array(v, float)).to_numpy())
-        a /= np.linalg.norm(a, axis=1, keepdims=True)
-        b /= np.linalg.norm(b, axis=1, keepdims=True)
-        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
-        ang = np.arccos(dot)
-        if degrees:
-            ang = np.degrees(ang)
+        na = np.linalg.norm(a, axis=1, keepdims=True)
+        nb = np.linalg.norm(b, axis=1, keepdims=True)
+        mask = (na[:, 0] > 0) & (nb[:, 0] > 0)
+
+        ang = np.full(len(a), np.nan, float)
+        if np.any(mask):
+            aa = a[mask] / na[mask]
+            bb = b[mask] / nb[mask]
+            dot = np.clip(np.sum(aa * bb, axis=1), -1.0, 1.0)
+            val = np.arccos(dot)
+            if degrees:
+                val = np.degrees(val)
+            ang[mask] = val
+
         self.imu_df[out_col] = ang
         return out_col
 
@@ -1284,74 +1553,53 @@ class DLC3DBendAngles:
         """
         Left-multiply a fixed mount rotation to every quaternion in `quat_col`:
             q_corrected = q_fixed ⊗ q_measured
-        This virtually reorients a sensor mounted with a known fixed rotation.
-
-        Args:
-            quat_col: name of quaternion column in self.imu_df (tuple-like or string "(w,x,y,z)")
-            axis: 'x'|'y'|'z' (right-hand rule)
-            angle_deg: fixed rotation in degrees
-            quat_order: 'wxyz' or 'xyzw' for input storage order
-            out_col: if None, overwrites quat_col; else write to new column
         """
-        import numpy as np
-        import pandas as pd
-
         def _parse_q(s):
             if isinstance(s, (list, tuple, np.ndarray)):
                 arr = np.array(s, dtype=float)
                 if arr.size == 4: return arr
-                out = np.full(4, np.nan);
-                out[:min(4, arr.size)] = arr[:min(4, arr.size)]
+                out = np.full(4, np.nan); out[:min(4, arr.size)] = arr[:min(4, arr.size)]
                 return out
             if s is None or (isinstance(s, float) and np.isnan(s)): return np.full(4, np.nan)
             s = str(s).strip().strip('[](){}')
             parts = [p for p in s.replace(',', ' ').split() if p]
             vals = []
             for p in parts[:4]:
-                try:
-                    vals.append(float(p))
-                except:
-                    vals.append(np.nan)
+                try: vals.append(float(p))
+                except: vals.append(np.nan)
             if len(vals) < 4: vals += [np.nan] * (4 - len(vals))
             return np.array(vals, dtype=float)
 
         def _qmul(q1, q2, order='wxyz'):
             if order == 'wxyz':
-                w1, x1, y1, z1 = q1;
-                w2, x2, y2, z2 = q2
+                w1, x1, y1, z1 = q1; w2, x2, y2, z2 = q2
                 return np.array([
-                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                    w1*z2 + x1*y2 - y1*x2 + z1*w2
                 ], dtype=float)
             else:  # 'xyzw'
-                x1, y1, z1, w1 = q1;
-                x2, y2, z2, w2 = q2
-                x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-                y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-                z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-                w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+                x1, y1, z1, w1 = q1; x2, y2, z2, w2 = q2
+                x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+                y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+                z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+                w = w1*w2 - x1*x2 - y1*y2 - z1*z2
                 return np.array([x, y, z, w], dtype=float)
 
-        # fixed rotation quaternion (axis–angle)
         ang = np.deg2rad(angle_deg)
-        ax = axis.lower()
-        v = {'x': np.array([1, 0, 0.0]),
-             'y': np.array([0, 1, 0.0]),
-             'z': np.array([0, 0, 1.0])}[ax]
-        s = np.sin(ang / 2.0);
-        c = np.cos(ang / 2.0)
+        v = {'x': np.array([1,0,0.0]), 'y': np.array([0,1,0.0]), 'z': np.array([0,0,1.0])}[axis.lower()]
+        s = np.sin(ang/2.0); c = np.cos(ang/2.0)
         if quat_order == 'wxyz':
-            q_fix = np.array([c, v[0] * s, v[1] * s, v[2] * s], dtype=float)
-        else:  # 'xyzw'
-            q_fix = np.array([v[0] * s, v[1] * s, v[2] * s, c], dtype=float)
+            q_fix = np.array([c, v[0]*s, v[1]*s, v[2]*s], dtype=float)
+        else:
+            q_fix = np.array([v[0]*s, v[1]*s, v[2]*s, c], dtype=float)
 
         q_meas = self.imu_df[quat_col].apply(_parse_q).to_list()
         q_corr = []
         for q in q_meas:
             if np.any(~np.isfinite(q)):
-                q_corr.append(np.array([np.nan] * 4))
+                q_corr.append(np.array([np.nan]*4))
             else:
                 qc = _qmul(q_fix, q, quat_order)
                 qc = qc / (np.linalg.norm(qc) or 1.0)
@@ -1361,801 +1609,9 @@ class DLC3DBendAngles:
         self.imu_df[out] = q_corr
         return out
 
-    def compute_joint_angle_from_body_axes(self,
-                                           fixed_prefix='imu1', fixed_axis='x',
-                                           moving_prefix='imu2', moving_axis='z',
-                                           out_col='imu_joint_deg_axes',
-                                           degrees=True):
-        """
-        Compute bend as the angle between two IMU body axes expressed in world:
-            angle = ∠( R_fixed * e_fixed_axis , R_moving * e_moving_axis ).
 
-        Requires that imu_quat_to_euler(...) has already populated:
-            '{prefix}_roll', '{prefix}_pitch', '{prefix}_yaw' for each prefix.
 
-        Args:
-            fixed_prefix, moving_prefix: which IMUs (matching your earlier out_prefix names)
-            fixed_axis, moving_axis: 'x'|'y'|'z' axes from each IMU body frame
-            out_col: output column name to store angle (degrees)
-        """
-        import numpy as np
 
-        # ensure world vectors exist (re-use your routine to build them)
-        colA = f'{fixed_prefix}_{fixed_axis}vec'
-        colB = f'{moving_prefix}_{moving_axis}vec'
-        if colA not in self.imu_df.columns:
-            self.euler_to_unit_vec(prefix=fixed_prefix, axis=fixed_axis, out_col=colA)
-        if colB not in self.imu_df.columns:
-            self.euler_to_unit_vec(prefix=moving_prefix, axis=moving_axis, out_col=colB)
-
-        a = np.stack(self.imu_df[colA].apply(lambda v: np.array(v, float)).to_numpy())
-        b = np.stack(self.imu_df[colB].apply(lambda v: np.array(v, float)).to_numpy())
-        a /= np.linalg.norm(a, axis=1, keepdims=True)
-        b /= np.linalg.norm(b, axis=1, keepdims=True)
-        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
-        ang = np.arccos(dot)
-        if degrees:
-            ang = np.degrees(ang)
-        self.imu_df[out_col] = ang
-        return out_col
-
-    # ======================
-    # 2) Quaternion → Euler
-    # ======================
-    def imu_quat_to_euler(
-            self,
-            imu_cols=('euler1', 'euler2'),
-            quat_order='wxyz',
-            sequence='zyx',
-            degrees=True,
-            out_prefix=('imu1', 'imu2'),
-    ):
-        """
-        Convert quaternion columns to Euler angles (roll, pitch, yaw).
-        Stores results in self.imu_df with prefixes.
-        """
-        import numpy as np
-        import pandas as pd
-
-        # --- robust parser: accepts list/tuple/np.array/string/'None'/NaN, pads/truncates to 4
-        def parse_tuple_string(s):
-            # already sequence-like
-            if isinstance(s, (list, tuple, np.ndarray)):
-                arr = np.array(s, dtype=float).reshape(-1)
-                if arr.size == 4:
-                    return arr
-                out = np.full(4, np.nan, dtype=float)
-                n = min(4, arr.size)
-                out[:n] = arr[:n]
-                return out
-
-            # None / NaN / empty
-            if s is None:
-                return np.full(4, np.nan, dtype=float)
-            s = str(s).strip()
-            if s == "" or s.lower() == "none":
-                return np.full(4, np.nan, dtype=float)
-
-            # strip delimiters and split
-            s = s.strip("[](){}")
-            parts = [p for p in s.replace(",", " ").split() if p]
-
-            vals = []
-            for p in parts[:4]:
-                try:
-                    vals.append(float(p))
-                except Exception:
-                    vals.append(np.nan)
-
-            if len(vals) < 4:
-                vals += [np.nan] * (4 - len(vals))
-
-            return np.array(vals, dtype=float)
-
-        # --- safe normalize
-        def normalize(q):
-            q = np.asarray(q, dtype=float)
-            n = np.linalg.norm(q, axis=-1, keepdims=True)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                qn = q / n
-            return qn
-
-        def quat_to_euler(q, order='wxyz', seq='zyx', deg=True):
-            if order == 'wxyz':
-                w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-            elif order == 'xyzw':
-                x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-            else:
-                raise ValueError("quat_order must be 'wxyz' or 'xyzw'.")
-
-            ww, xx, yy, zz = w * w, x * x, y * y, z * z
-            R00 = 1 - 2 * (yy + zz)
-            R10 = 2 * (x * y + z * w)
-            R20 = 2 * (x * z - y * w)
-            R21 = 2 * (y * z + x * w)
-            R22 = 1 - 2 * (xx + yy)
-
-            if seq == 'zyx':  # yaw, pitch, roll
-                yaw = np.arctan2(R10, R00)
-                pitch = np.arcsin(-R20)
-                roll = np.arctan2(R21, R22)
-            else:
-                raise ValueError("Unsupported sequence; use 'zyx'.")
-
-            if deg:
-                roll, pitch, yaw = np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
-            return roll, pitch, yaw
-
-        # ---- convert each listed column
-        for col, prefix in zip(imu_cols, out_prefix):
-            q_raw = self.imu_df[col].apply(parse_tuple_string).to_list()
-            q = normalize(np.array(q_raw))  # Nx4 (NaNs stay NaN)
-            r, p, y = quat_to_euler(q, order=quat_order, seq=sequence, deg=degrees)
-            self.imu_df[f'{prefix}_roll'] = r
-            self.imu_df[f'{prefix}_pitch'] = p
-            self.imu_df[f'{prefix}_yaw'] = y
-
-    # ======================
-    # 3) Euler → unit vector
-    # ======================
-    def euler_to_unit_vec(
-            self,
-            prefix='imu1',
-            sequence='zyx',
-            axis='z',
-            degrees=True,
-            out_col=None,
-    ):
-        import numpy as np
-
-        r = self.imu_df[f'{prefix}_roll'].to_numpy()
-        p = self.imu_df[f'{prefix}_pitch'].to_numpy()
-        y = self.imu_df[f'{prefix}_yaw'].to_numpy()
-
-        if degrees:
-            r, p, y = np.deg2rad(r), np.deg2rad(p), np.deg2rad(y)
-
-        def Rx(a):
-            return np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
-
-        def Ry(a):
-            return np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
-
-        def Rz(a):
-            return np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
-
-        base = {'x': [1, 0, 0], 'y': [0, 1, 0], 'z': [0, 0, 1]}[axis]
-        vecs = []
-        for ri, pi, yi in zip(r, p, y):
-            R = Rz(yi) @ Ry(pi) @ Rx(ri) if sequence == 'zyx' else np.eye(3)
-            vecs.append(tuple((R @ base).tolist()))
-
-        if out_col is None:
-            out_col = f'{prefix}_{axis}vec'
-        self.imu_df[out_col] = vecs
-
-    # ======================
-    # 4) Vector → angle
-    # ======================
-    def angle_between_vectors(
-            self,
-            vec_col_a,
-            vec_col_b,
-            out_col='imu_vec_angle_deg',
-            degrees=True
-    ):
-        import numpy as np
-        a = np.stack(self.imu_df[vec_col_a].apply(lambda v: np.array(v, float)).to_numpy())
-        b = np.stack(self.imu_df[vec_col_b].apply(lambda v: np.array(v, float)).to_numpy())
-        a /= np.linalg.norm(a, axis=1, keepdims=True)
-        b /= np.linalg.norm(b, axis=1, keepdims=True)
-        dot = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
-        ang = np.arccos(dot)
-        if degrees: ang = np.degrees(ang)
-        self.imu_df[out_col] = ang
-
-    # ======================
-    # 5) Add angle column
-    # ======================
-    def add_imu_angle_column(
-            self,
-            values,
-            name=('metric', 'imu_joint_deg', 'deg'),
-            inplace=True
-    ):
-        import pandas as pd
-        target = self.imu_df if inplace else self.imu_df.copy()
-        colname = name
-        if isinstance(name, tuple) and not isinstance(target.columns, pd.MultiIndex):
-            colname = "_".join([str(x) for x in name])
-        target[colname] = values
-        if inplace:
-            self.imu_df = target
-            return self.imu_df
-        return target
-
-    def compute_imu_vs_encoder_error(
-            self,
-            source="enc",  # "enc" -> use self.enc_df; "imu" -> use self.imu_df
-            enc_angle_col="angle_renc",  # ground-truth encoder angle (deg)
-            imu_angle_col="imu_joint_deg_imu",  # IMU estimate angle (deg)
-            time_col="timestamp",  # timestamp column for reference
-            thresholds=(1, 2, 5)  # report % within these absolute-error thresholds (deg)
-    ):
-        """
-        Compute IMU-vs-Encoder angular errors with encoder as truth.
-
-        Returns:
-            metrics (dict): {
-                "rmse": ...,
-                "mae": ...,
-                "bias": ...,
-                "max_abs_error": ...,
-                "abs_error_array": np.ndarray,
-                "within_deg": {thr: percent, ...},
-                "n": N
-            }
-            df_err (pd.DataFrame): [time_col, enc_angle_col, imu_angle_col, "error_deg", "abs_error_deg"]
-        """
-        # 1) pick table
-        if source == "enc":
-            if not hasattr(self, "enc_df") or self.enc_df is None:
-                raise RuntimeError("enc_df is not available. Load/align encoder data first.")
-            df = self.enc_df.copy()
-        elif source == "imu":
-            if not hasattr(self, "imu_df") or self.imu_df is None:
-                raise RuntimeError("imu_df is not available. Load/align IMU data first.")
-            df = self.imu_df.copy()
-        else:
-            raise ValueError("source must be 'enc' or 'imu'")
-
-        # 2) sanity checks
-        for col in (enc_angle_col, imu_angle_col):
-            if col not in df.columns:
-                raise KeyError(f"Column '{col}' not found in chosen table (source='{source}').")
-
-        # 3) numeric + drop NaNs
-        enc = pd.to_numeric(df[enc_angle_col], errors="coerce")
-        imu = pd.to_numeric(df[imu_angle_col], errors="coerce")
-        mask = enc.notna() & imu.notna()
-        enc = enc[mask].to_numpy()
-        imu = imu[mask].to_numpy()
-        ts = df.loc[mask, time_col] if time_col in df.columns else pd.Series(index=df.index[mask], dtype=float)
-
-        # 4) errors
-        err = imu - enc  # signed error (deg)
-        aerr = np.abs(enc - imu)  # absolute error (deg), encoder - imu
-        rmse = float(np.sqrt(np.mean(err ** 2))) if err.size else float("nan")
-        mae = float(np.mean(aerr)) if aerr.size else float("nan")
-        bias = float(np.mean(err)) if err.size else float("nan")
-        max_abs_error = float(np.max(aerr)) if aerr.size else float("nan")
-
-        within = {}
-        for thr in thresholds:
-            within[thr] = float(np.mean(aerr <= thr) * 100.0) if aerr.size else float("nan")
-
-        # 5) assemble output dataframe
-        out_cols = {
-            time_col: ts.values if len(ts) else [],
-            enc_angle_col: enc,
-            imu_angle_col: imu,
-            "error_deg": err,
-            "abs_error_deg": aerr,
-        }
-        df_err = pd.DataFrame(out_cols)
-
-        # 6) metrics include abs_error summary
-        metrics = {
-            "rmse": rmse,
-            "mae": mae,
-            "bias": bias,
-            "max_abs_error": max_abs_error,
-            "abs_error_array": aerr,  # full array if you want it directly
-            "within_deg": within,
-            "n": int(len(df_err)),
-        }
-        return metrics, df_err
-
-    def plot_imu_encoder_error_boxplot_grouped(
-            self,
-            sample_col,  # e.g. "sample_id" or "dataset" in the chosen source df
-            group_dict,  # dict: {sample_name -> group_label}
-            group_colors,  # list of colors, one per unique group (ordered to match group_names)
-            group_names,  # ordered list of group labels to display on x-axis
-            source="enc",  # "enc" -> self.enc_df; "imu" -> self.imu_df
-            enc_angle_col="angle_renc",  # encoder (truth)
-            imu_angle_col="imu_joint_deg_imu",  # IMU (estimate) after matching
-            time_col="timestamp",
-            box_alpha=0.5,
-            data_alpha=0.5,
-            jitter=0.2,
-            ylim=(0, 7),
-            save_path=None,
-            dpi=300,
-            title="IMU vs Encoder | Absolute Error by Sample (Grouped)",
-    ):
-        """
-        Build a box plot of |IMU - Encoder| per sample, color boxes by group, and
-        replace sample tick labels with centered group names (as in your earlier plot_box_plot).
-
-        Requires:
-          - sample_col exists in the chosen source dataframe (enc_df or imu_df)
-          - group_dict maps each sample (sample_col value) to a group label
-          - group_names defines the display order of groups
-          - group_colors aligns with group_names order
-        """
-        import matplotlib.pyplot as plt
-        import pandas as pd
-        import numpy as np
-        try:
-            import seaborn as sns
-        except ImportError:
-            raise ImportError("seaborn is required for this plot. pip install seaborn")
-
-        # 1) Compute errors from the chosen table (encoder or IMU)
-        metrics, df_err = self.compute_imu_vs_encoder_error(
-            source=source,
-            enc_angle_col=enc_angle_col,
-            imu_angle_col=imu_angle_col,
-            time_col=time_col,
-        )
-
-        # 2) Pull sample labels from the same source df and merge into error table via timestamp
-        df_src = self.enc_df if source == "enc" else self.imu_df
-        if sample_col not in df_src.columns:
-            raise KeyError(f"'{sample_col}' not in the chosen source dataframe (source='{source}').")
-
-        df_plot = df_err.merge(
-            df_src[[time_col, sample_col]].drop_duplicates(subset=[time_col]),
-            on=time_col, how="left"
-        ).rename(columns={sample_col: "Sample"})
-
-        # 3) Attach Group via mapping; drop rows with unknown samples or missing group
-        df_plot["Group"] = df_plot["Sample"].map(group_dict)
-        df_plot = df_plot.dropna(subset=["Sample", "Group", "abs_error_deg"]).copy()
-
-        # 4) Build color palette for groups (in the order of group_names)
-        unique_groups = list(group_names)
-        if len(unique_groups) != len(group_colors):
-            raise ValueError("group_colors length must match group_names length.")
-        group_palette = {g: c for g, c in zip(unique_groups, group_colors)}
-
-        # 5) Determine sample order grouped by group_names (keeps your grouped layout)
-        #    Only include samples present in df_plot
-        samples_in_data = df_plot["Sample"].dropna().unique().tolist()
-        grouped_samples = []
-        for g in unique_groups:
-            members = [s for s, gg in group_dict.items() if (gg == g) and (s in samples_in_data)]
-            # preserve appearance order or sort if you prefer: members.sort()
-            grouped_samples.extend(members)
-
-        if not grouped_samples:
-            raise ValueError("No samples found after grouping. Check group_dict and sample_col values.")
-
-        # 6) Make a color list aligned to sample order (each box gets the color of its group)
-        color_list = [group_palette[group_dict[s]] for s in grouped_samples]
-
-        # 7) Draw the box plot by sample, but color boxes by group
-        plt.figure(figsize=(12, 6))
-        ax = sns.boxplot(
-            data=df_plot, x="Sample", y="abs_error_deg",
-            order=grouped_samples,
-            palette=color_list,  # per-box colors
-            boxprops=dict(alpha=box_alpha),
-            medianprops=dict(alpha=box_alpha),
-            whiskerprops=dict(alpha=box_alpha),
-            capprops=dict(alpha=box_alpha),
-            flierprops=dict(marker="")  # hide outliers
-        )
-
-        # Optional: overlay jittered points, colored by group for visual density
-        sns.stripplot(
-            data=df_plot, x="Sample", y="abs_error_deg",
-            order=grouped_samples,
-            hue="Group", palette=group_palette,
-            jitter=jitter, alpha=data_alpha, dodge=False, size=3, edgecolor="w", linewidth=0.3
-        )
-
-        # 8) Replace x-tick labels with centered group names
-        #    Compute the mean x-position (index) of samples belonging to each group.
-        sample_positions = {s: i for i, s in enumerate(grouped_samples)}
-        group_positions = []
-        for g in unique_groups:
-            members = [s for s in grouped_samples if group_dict.get(s) == g]
-            if members:
-                idxs = [sample_positions[s] for s in members]
-                group_positions.append(np.mean(idxs))
-
-        # Re-label x-axis with group names at their cluster centers
-        ax.set_xticks(group_positions)
-        ax.set_xticklabels(unique_groups, rotation=45, ha="right")
-
-        # 9) Cosmetics
-        ax.set_xlabel("Group")
-        ax.set_ylabel("Absolute Angular Error (deg)")
-        ax.set_ylim(ylim)
-        ax.set_title(title)
-        #ax.grid(axis="y", linestyle="--", alpha=0.4)
-        ax.legend([], [], frameon=False)  # remove legend (groups are on x-axis)
-
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        plt.show()
-
-        # Return the plotting dataframe and metrics in case you want to reuse them
-        return df_plot, metrics
-
-    def compute_mcp_vs_encoder_error(
-            self,
-            mcp_angle_col=("metric", "mcp_bend_deg", "deg"),  # MCP bend angle in degrees
-            enc_angle_col="angle_renc",  # encoder angle column
-            time_col="timestamp",  # timestamp for optional merge/trace
-            thresholds=(1, 2, 5),  # report % within these abs-error thresholds
-            use_abs_encoder=True,  # compare against |encoder| if True
-            wrap=False  # set True only if 0–360 wrapping applies
-    ):
-        """
-        Compute MCP-vs-Encoder angular errors with encoder as truth.
-
-        Returns:
-            metrics (dict): {
-                "rmse", "mae", "bias", "max_abs_error",
-                "abs_error_array", "within_deg": {thr: percent, ...}, "n"
-            }
-            df_err (pd.DataFrame): [time_col (if present), enc_angle_col, mcp_angle_col, "error_deg", "abs_error_deg"]
-        """
-        import numpy as np
-        import pandas as pd
-
-        # --- Resolve a working table that has BOTH columns (prefer self.df) ---
-        if (mcp_angle_col in self.df.columns) and (enc_angle_col in self.df.columns):
-            df = self.df.copy()
-        else:
-            # Try merging encoder from self.enc_df into self.df by timestamp
-            if not hasattr(self, "enc_df") or self.enc_df is None:
-                raise RuntimeError(
-                    "Encoder column not found in self.df and self.enc_df is not available for merge."
-                )
-            for need, tab, col in [(mcp_angle_col, "self.df", mcp_angle_col), (time_col, "self.df", time_col)]:
-                if need not in self.df.columns:
-                    raise KeyError(f"Column {col} not found in {tab} (needed to merge).")
-            if time_col not in self.enc_df.columns or enc_angle_col not in self.enc_df.columns:
-                raise KeyError(f"'{time_col}' and/or '{enc_angle_col}' missing in self.enc_df; cannot merge.")
-
-            df = (
-                self.df[[time_col, mcp_angle_col]]
-                .merge(self.enc_df[[time_col, enc_angle_col]], on=time_col, how="inner")
-            )
-
-        # --- Coerce to numeric & mask NaNs ---
-        mcp = pd.to_numeric(df[mcp_angle_col], errors="coerce")
-        enc = pd.to_numeric(df[enc_angle_col], errors="coerce")
-        mask = mcp.notna() & enc.notna()
-        mcp = mcp[mask].to_numpy()
-        enc = enc[mask].to_numpy()
-        ts = df.loc[mask, time_col].to_numpy() if time_col in df.columns else None
-
-        # --- Prepare encoder reference (|encoder| optional) ---
-        enc_cmp = np.abs(enc) if use_abs_encoder else enc
-
-        # --- Signed diff (optionally circular) ---
-        if wrap:
-            # minimal signed diff in [-180, 180)
-            err = (mcp - enc_cmp + 180.0) % 360.0 - 180.0
-        else:
-            err = mcp - enc_cmp
-
-        aerr = np.abs(err)
-
-        # --- Build output table ---
-        out_cols = {
-            enc_angle_col: enc_cmp,
-            mcp_angle_col: mcp,
-            "error_deg": err,
-            "abs_error_deg": aerr,
-        }
-        if ts is not None:
-            out_cols[time_col] = ts
-        df_err = pd.DataFrame(out_cols)
-
-        # --- Metrics ---
-        if aerr.size:
-            rmse = float(np.sqrt(np.mean(err ** 2)))
-            mae = float(np.mean(aerr))
-            bias = float(np.mean(err))
-            max_abs_error = float(np.max(aerr))
-            within = {thr: float(np.mean(aerr <= thr) * 100.0) for thr in thresholds}
-        else:
-            rmse = mae = bias = max_abs_error = float("nan")
-            within = {thr: float("nan") for thr in thresholds}
-
-        metrics = {
-            "rmse": rmse,
-            "mae": mae,
-            "bias": bias,
-            "max_abs_error": max_abs_error,
-            "abs_error_array": aerr,  # full array if you want it
-            "within_deg": within,
-            "n": int(len(df_err)),
-        }
-        return metrics, df_err
-
-    def plot_mcp_encoder_error_boxplot_grouped(
-            self,
-            sample_col,  # e.g. "sample_id"
-            group_dict,  # {sample_name -> group_label}
-            group_colors,  # list of colors, aligned with group_names
-            group_names,  # ordered list of group labels to display
-            mcp_angle_col=("metric", "mcp_bend_deg", "deg"),
-            enc_angle_col="angle_renc",
-            time_col="timestamp",
-            thresholds=(1, 2, 5),
-            use_abs_encoder=True,
-            wrap=False,
-            box_alpha=0.5,
-            data_alpha=0.5,
-            jitter=0.2,
-            ylim=(0, 7),
-            save_path=None,
-            dpi=300,
-            title="MCP vs Encoder | Absolute Error by Sample (Grouped)",
-    ):
-        """
-        Box plot of |MCP - Encoder| per sample, colored by group, with group names centered on x-axis.
-
-        Assumes:
-          - Rows come from self.df (preferred) after encoder has been attached by timestamp,
-            OR encoder will be merged from self.enc_df via compute_mcp_vs_encoder_error.
-          - `sample_col` and `time_col` exist in whichever table provides the labels (self.df preferred).
-        """
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        try:
-            import seaborn as sns
-        except ImportError:
-            raise ImportError("seaborn is required for this plot. Try: pip install seaborn")
-
-        # 1) Compute MCP vs Encoder errors (handles merge if encoder not in self.df)
-        metrics, df_err = self.compute_mcp_vs_encoder_error(
-            mcp_angle_col=mcp_angle_col,
-            enc_angle_col=enc_angle_col,
-            time_col=time_col,
-            thresholds=thresholds,
-            use_abs_encoder=use_abs_encoder,
-            wrap=wrap
-        )
-
-        if df_err.empty or "abs_error_deg" not in df_err.columns:
-            raise ValueError("No error rows to plot: df_err is empty or missing 'abs_error_deg'.")
-
-        # 2) Attach sample labels (prefer self.df, else self.enc_df) — SAFE None checks
-        src_df = None
-        if getattr(self, "df", None) is not None and {sample_col, time_col}.issubset(self.df.columns):
-            src_df = self.df
-        elif getattr(self, "enc_df", None) is not None and {sample_col, time_col}.issubset(self.enc_df.columns):
-            src_df = self.enc_df
-
-        if src_df is None:
-            raise KeyError(
-                f"Could not find both '{sample_col}' and '{time_col}' in either self.df or self.enc_df "
-                "to label samples for the grouped boxplot."
-            )
-
-        df_samples = src_df[[time_col, sample_col]].drop_duplicates(subset=[time_col])
-        df_plot = (
-            df_err.merge(df_samples, on=time_col, how="left")
-            .rename(columns={sample_col: "Sample"})
-        )
-        df_plot["Group"] = df_plot["Sample"].map(group_dict)
-        df_plot = df_plot.dropna(subset=["Sample", "Group", "abs_error_deg"]).copy()
-
-        if df_plot.empty:
-            raise ValueError(
-                "No rows after joining labels/groups. Check sample_col, time_col, and group_dict mappings.")
-
-        # 3) Palette / order
-        unique_groups = list(group_names)
-        if len(unique_groups) != len(group_colors):
-            raise ValueError("group_colors length must match group_names length.")
-        group_palette = {g: c for g, c in zip(unique_groups, group_colors)}
-
-        # Keep only samples present in data, preserving group order
-        samples_in_data = df_plot["Sample"].dropna().unique().tolist()
-        grouped_samples = []
-        for g in unique_groups:
-            members = [s for s, gg in group_dict.items() if (gg == g) and (s in samples_in_data)]
-            grouped_samples.extend(members)
-
-        if not grouped_samples:
-            raise ValueError("No samples to plot after grouping; check group_dict/group_names/sample_col values.")
-
-        # Per-box colors matching sample order
-        color_list = [group_palette[group_dict[s]] for s in grouped_samples]
-
-        # 4) Plot
-        plt.figure(figsize=(12, 6))
-        ax = sns.boxplot(
-            data=df_plot, x="Sample", y="abs_error_deg",
-            order=grouped_samples,
-            palette=color_list,
-            showfliers=False,
-            boxprops=dict(alpha=box_alpha),
-            medianprops=dict(alpha=box_alpha),
-            whiskerprops=dict(alpha=box_alpha),
-            capprops=dict(alpha=box_alpha),
-        )
-
-        sns.stripplot(
-            data=df_plot, x="Sample", y="abs_error_deg",
-            order=grouped_samples,
-            hue="Group", palette=group_palette,
-            jitter=jitter, alpha=data_alpha, dodge=False, size=3, edgecolor="w", linewidth=0.3
-        )
-
-        # Center group labels on clusters
-        sample_positions = {s: i for i, s in enumerate(grouped_samples)}
-        group_positions = []
-        for g in unique_groups:
-            members = [s for s in grouped_samples if group_dict.get(s) == g]
-            if members:
-                idxs = [sample_positions[s] for s in members]
-                group_positions.append(np.mean(idxs))
-
-        ax.set_xticks(group_positions)
-        ax.set_xticklabels(unique_groups, rotation=45, ha="right")
-
-        ax.set_xlabel("Group")
-        ax.set_ylabel("Absolute Angular Error (deg)")
-        ax.set_ylim(ylim)
-        ax.set_title(title)
-
-        # Remove legend (group names are on x-axis)
-        try:
-            ax.legend_.remove()
-        except Exception:
-            ax.legend([], [], frameon=False)
-
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        plt.show()
-
-        return df_plot, metrics
-
-    def add_encoder_angular_velocity(
-            self,
-            angle_col: str = "angle_renc",
-            time_col: str = "timestamp",
-            out_col: str = "enc_angvel_dps",
-            smoothing: str = None,  # None | "mean" | "median"
-            window: int = 2,
-            center: bool = True,
-            min_periods: int = 1,
-            unwrap: bool = False,
-            time_format: str = "HMSfn",  # "HMSfn" | "s" | "ms" | "us" | "ns" | "datetime"
-            method: str = "diff"  # "diff" | "gradient"
-    ):
-        """
-        Compute instantaneous angular velocity (deg/s) from ENCODER angle vs timestamp.
-
-        time_format:
-          - "HMSfn": timestamps like HHMMSSffffff (no delimiters; any # of fractional digits)
-          - "s"|"ms"|"us"|"ns": numeric counters in those units
-          - "datetime": parseable datetime-like strings or pandas datetime dtype
-        """
-        import numpy as np
-        import pandas as pd
-
-        if not hasattr(self, "enc_df") or self.enc_df is None or len(self.enc_df) == 0:
-            raise ValueError("self.enc_df is empty; load encoder data first.")
-
-        df = self.enc_df
-        if angle_col not in df.columns:
-            raise KeyError(f"'{angle_col}' not in enc_df columns.")
-        if time_col not in df.columns:
-            raise KeyError(f"'{time_col}' not in enc_df columns.")
-
-        work = df[[time_col, angle_col]].copy()
-
-        # --- Angle (deg) ---
-        ang = pd.to_numeric(work[angle_col], errors="coerce")
-
-        # Optional unwrap (handles 360° wraparound)
-        if unwrap:
-            ang_rad = np.deg2rad(ang.to_numpy())
-            ang = pd.Series(np.rad2deg(np.unwrap(ang_rad)), index=work.index)
-
-        # --- Time → seconds ---
-        def hmsfn_to_seconds(vals):
-            """Parse HHMMSS + optional fractional digits into seconds since start of day."""
-            out = np.empty(len(vals), dtype="float64")
-            for i, v in enumerate(vals):
-                s = str(v)
-                # pad if needed; assume at least HHMMSS present
-                if len(s) < 6:
-                    s = s.zfill(6)
-                hh = int(s[0:2]);
-                mm = int(s[2:4]);
-                ss = int(s[4:6])
-                frac = 0.0
-                if len(s) > 6:
-                    frac_str = s[6:]
-                    # ignore non-digits gracefully
-                    if frac_str.isdigit():
-                        frac = int(frac_str) / (10 ** len(frac_str))
-                out[i] = hh * 3600 + mm * 60 + ss + frac
-            # handle midnight rollover (if sequence goes past midnight)
-            if len(out) > 1:
-                jumps = np.diff(out)
-                wrap_idx = np.where(jumps < -43200.0)[0]  # large negative step → crossed midnight
-                if wrap_idx.size:
-                    # add 86400 s after each rollover point (supports multiple days)
-                    add = np.zeros_like(out)
-                    for idx in wrap_idx:
-                        add[idx + 1:] += 86400.0
-                    out = out + add
-            return out
-
-        tf = str(time_format).lower()
-
-        if tf == "hmsfn":
-            t_vals = work[time_col].astype(str).to_numpy()
-            t_s = hmsfn_to_seconds(t_vals)
-        elif tf in {"s", "ms", "us", "ns"}:
-            unit_map = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
-            raw = pd.to_numeric(work[time_col], errors="coerce").to_numpy(dtype="float64")
-            t_s = (raw - raw[0]) * unit_map[tf]
-        elif tf == "datetime":
-            tt = pd.to_datetime(work[time_col], errors="coerce")
-            t_s = (tt - tt.iloc[0]).dt.total_seconds().to_numpy()
-        else:
-            raise ValueError(f"Unsupported time_format='{time_format}'. Use 'HMSfn'|'s'|'ms'|'us'|'ns'|'datetime'.")
-
-        # Ensure strictly increasing time (sort by t_s)
-        order = np.argsort(t_s)
-        t_s = t_s[order]
-        ang = ang.iloc[order]
-
-        # dt (s), guard against zeros/negatives
-        dt_s = np.r_[np.nan, np.diff(t_s)]
-        dt_s[dt_s <= 0] = np.nan
-
-        # --- Velocity (deg/s) ---
-        if method == "gradient":
-            vel_vals = np.gradient(ang.to_numpy(), t_s)
-        else:
-            vel_vals = pd.Series(ang).diff().to_numpy() / dt_s
-
-        vel = pd.Series(vel_vals, index=work.index[order])
-
-        # Optional smoothing
-        if smoothing == "mean":
-            vel = vel.rolling(window=window, center=center, min_periods=min_periods).mean()
-        elif smoothing == "median":
-            vel = vel.rolling(window=window, center=center, min_periods=min_periods).median()
-
-        # Write back
-        self.enc_df.loc[vel.index, out_col] = vel.values
-
-        # Stats
-        finite_vel = vel[np.isfinite(vel)]
-        median_dps = float(np.nanmedian(finite_vel)) if not finite_vel.empty else float("nan")
-        median_speed_dps = float(np.nanmedian(np.abs(finite_vel))) if not finite_vel.empty else float("nan")
-
-        finite_dt = dt_s[np.isfinite(dt_s)]
-        median_dt_s = float(np.median(finite_dt)) if finite_dt.size else float("nan")
-        est_rate_hz = float(1.0 / median_dt_s) if median_dt_s and np.isfinite(
-            median_dt_s) and median_dt_s > 0 else float("nan")
-
-        return self.enc_df, {
-            "median_dps": median_dps,
-            "median_speed_dps": median_speed_dps,
-            "median_dt_s": median_dt_s,
-            "est_rate_hz": est_rate_hz,
-            "time_format_used": time_format,
-        }
 
 
 class bender_class:
