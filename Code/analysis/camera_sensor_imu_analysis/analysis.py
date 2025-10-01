@@ -228,28 +228,33 @@ class BallBearingData:
         return float(beta[0]), float(beta[1]), float(beta[2])
 
     def fit_and_set_calibration(
-        self,
-        angle_adc_df: pd.DataFrame,
-        angle_col: str = "angle",
-        adc_col: str = "adc_ch3",
-        robust: bool = True,
-        anchors_source: str = "fit_only",
-        deg_min: float = 0.0,
-        deg_max: float = 90.0,
+            self,
+            angle_adc_df: pd.DataFrame,
+            angle_col: str = "angle",
+            adc_col: str = "adc_ch3",
+            robust: bool = True,
+            anchors_source: str = "fit_only",  # 'fit_only' | 'empirical' | 'empirical_minmax'
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
     ) -> Dict[str, float]:
         x = angle_adc_df[angle_col].to_numpy(float)
         y = angle_adc_df[adc_col].to_numpy(float)
         c0, c1, c2 = self._polyfit_quadratic(x, y, robust=robust)
         p = np.poly1d([c2, c1, c0])
 
-        if anchors_source == "empirical":
+        if anchors_source == "empirical_minmax":
+            # Map max ADC -> 0°, min ADC -> 90°
+            y0 = float(np.nanmax(y))  # ADC at 0°
+            y90 = float(np.nanmin(y))  # ADC at 90°
+        elif anchors_source == "empirical":
             def endpoint_avg(target_deg: float, win: float = 2.5):
                 m = np.isfinite(x) & np.isfinite(y) & (np.abs(x - target_deg) <= win)
                 return float(np.nanmean(y[m])) if np.any(m) else float(p(target_deg))
-            y0  = endpoint_avg(deg_min)
+
+            y0 = endpoint_avg(deg_min)
             y90 = endpoint_avg(deg_max)
-        else:
-            y0  = float(p(deg_min))
+        else:  # 'fit_only'
+            y0 = float(p(deg_min))
             y90 = float(p(deg_max))
 
         self.calib = dict(c0=c0, c1=c1, c2=c2, y0=y0, y90=y90, source=anchors_source)
@@ -299,15 +304,17 @@ class BallBearingData:
             theta = np.clip(theta, 0.0, 90.0)
         return theta
 
+    
     # ---------- tall DF builder ----------
     def trials_to_tall_df(
-        self,
-        adc_trials: List[pd.DataFrame],
-        set_label: str,
-        trial_len_sec: float = 10.0,
-        adc_col: str = "adc_ch3",
-        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
-        include_endpoint: bool = True,
+            self,
+            adc_trials: List[pd.DataFrame],
+            set_label: str,
+            trial_len_sec: float = 10.0,
+            adc_col: str = "adc_ch3",
+            time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+            include_endpoint: bool = True,
+            clamp_theta: bool = False,  # <-- new: no clipping by default
     ) -> pd.DataFrame:
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
@@ -318,6 +325,7 @@ class BallBearingData:
                 continue
             df = df.copy()
 
+            # choose ADC column
             if adc_col not in df.columns:
                 adc_like = [c for c in df.columns if str(c).lower().startswith("adc")]
                 if not adc_like:
@@ -329,6 +337,7 @@ class BallBearingData:
             n = len(df)
             time_s = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=include_endpoint, dtype=float)
 
+            # passthrough timestamp if present
             ts = None
             for tcol in time_col_options:
                 if tcol in df.columns:
@@ -338,7 +347,8 @@ class BallBearingData:
                 ts = pd.Series([np.nan] * n)
 
             adc_vals = pd.to_numeric(df[adc_use], errors="coerce").to_numpy(float)
-            theta_deg = self._adc_to_theta_deg(adc_vals, clamp=True)
+            # <-- key change: no clipping unless you ask for it
+            theta_deg = self._adc_to_theta_deg(adc_vals, clamp=clamp_theta)
 
             parts.append(pd.DataFrame({
                 "set_label": set_label,
@@ -350,7 +360,7 @@ class BallBearingData:
             }))
 
         if not parts:
-            return pd.DataFrame(columns=["set_label","trial","time_s","timestamp","theta_pred_deg",adc_col])
+            return pd.DataFrame(columns=["set_label", "trial", "time_s", "timestamp", "theta_pred_deg", adc_col])
 
         return pd.concat(parts, ignore_index=True)
 
