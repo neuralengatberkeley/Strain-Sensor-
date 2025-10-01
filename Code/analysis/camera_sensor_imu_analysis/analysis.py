@@ -32,6 +32,13 @@ from config import path_to_repository
 # from your_module import DLC3DBendAngles
 
 
+# --- Required imports (put these once at the top of your file) ---
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional, Sequence, Union
+import numpy as np
+import pandas as pd
+
+
 class BallBearingData:
     """
     Loader + calibration for ball-bearing / beaker trials.
@@ -76,21 +83,37 @@ class BallBearingData:
         return None
 
     def _find_trial_folders(self) -> List[Path]:
+        """
+        Find trial root folders whose name ends with `_<folder_suffix>` (case-insensitive).
+        Prefer direct children of root (current layout), and fall back to a recursive
+        search if none are found.
+        """
         if not self.root_dir.exists():
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        pat = re.compile(rf".*_{re.escape(self.folder_suffix)}$", flags=re.IGNORECASE)
-        folders = []
-        for dirpath, _, filenames in os.walk(self.root_dir):
-            if not any(f.lower().endswith(".csv") for f in filenames):
-                continue
-            d = Path(dirpath)
-            if pat.match(d.name):
-                folders.append(d)
+        suf = str(self.folder_suffix).strip()
+        # Pass 1: non-recursive (direct children)
+        direct = [p for p in self.root_dir.glob(f"*_{suf}") if p.is_dir()]
+        if not direct:
+            # Pass 2: recursive fallback, case-insensitive endswith
+            direct = []
+            suf_lower = f"_{suf}".lower()
+            for p in self.root_dir.rglob("*"):
+                if p.is_dir() and p.name.lower().endswith(suf_lower):
+                    direct.append(p)
 
-        folders = sorted(folders, key=lambda p: p.name)
-        self._all_folders = folders
+        folders = sorted(set(direct), key=lambda p: p.name)
+
+        if not folders:
+            print(f"[DEBUG] No *_{self.folder_suffix} dirs under {self.root_dir}")
+            print("[DEBUG] Show a few children of root:")
+            for i, p in enumerate(sorted(self.root_dir.glob("*"))[:12]):
+                print("  -", p)
+            return []
+
         print(f"Found {len(folders)} *_{self.folder_suffix} folders total (case-insensitive).")
+        print("  example:", folders[0])
+        self._all_folders = folders
         return folders
 
     def _split_sets(self) -> Tuple[List[Path], List[Path]]:
@@ -128,42 +151,56 @@ class BallBearingData:
     def _warn_counts(self, label: str, folders: List[Path]):
         problems = []
         for i, f in enumerate(folders, start=1):
+            # Try top-level first (old layout)
             csvs = [p for p in f.glob("*.csv") if not self._is_bad_dot_underscore(p)]
+            # If that looks short, count nested too (new layout)
+            if len(csvs) < self.files_per_trial:
+                csvs = [p for p in f.glob("**/*.csv") if not self._is_bad_dot_underscore(p)]
             if len(csvs) != self.files_per_trial:
                 problems.append((i, f.name, len(csvs)))
+
         if problems:
             print(f"[WARN] {label}: Some trials do not have exactly {self.files_per_trial} CSVs:")
             for i, name, n in problems:
-                print(f"  • Trial {i:02d}: {name} has {n} CSVs")
+                print(f"  • Trial {i:02d}: {name} has {n} CSVs (including nested)")
 
     # ---------- generic per-trial extractor ----------
-    def _extract_by_glob(self, trial_folders: List[str], pattern: str) -> List[pd.DataFrame]:
+    def _extract_by_glob(self, trial_folders: Sequence[Union[str, Path]], pattern: Union[str, Sequence[str]]):
+        pats = [pattern] if isinstance(pattern, str) else list(pattern)
         out: List[pd.DataFrame] = []
         for folder in trial_folders:
             fp = Path(folder)
-            cands = [p for p in fp.glob(pattern) if not self._is_bad_dot_underscore(p)]
-            if not cands:
-                nested = list(fp.glob(f"**/{pattern}"))
-                cands = [p for p in nested if not self._is_bad_dot_underscore(p)]
+            cands: List[Path] = []
+            for pat in pats:
+                cands.extend([p for p in fp.rglob(pat) if not self._is_bad_dot_underscore(p)])
             if not cands:
                 out.append(pd.DataFrame()); continue
-            cands_sorted = sorted(cands, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
-            df = self._read_csv_safe(cands_sorted[0])
+            # Prefer the largest (usually the full-length recording)
+            cands = sorted(set(cands), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            df = self._read_csv_safe(cands[0])
             out.append(df if df is not None else pd.DataFrame())
         return out
 
-    # ---------- trial extraction ----------
-    def extract_adc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_adc*.csv")
+    # Specific extractors
+    def extract_adc_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_adc*.csv", "data_adc*"])
 
-    def extract_imu_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_imu*.csv")
+    def extract_imu_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_imu*.csv", "data_imu*"])
 
-    def extract_rotenc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_rotenc*.csv")
+    def extract_spacebar_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_spacebar*.csv", "data_spacebar*"])
 
-    def extract_spacebar_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_spacebar*.csv")
+    def extract_rotenc_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_rotenc*.csv", "data_rotenc*"])
+
+    def extract_dlc3d_dfs_by_trial(
+        self,
+        trial_folders: List[str],
+        patterns: Tuple[str, ...] = ("data_DLC3D*.csv", "DLC3D*.csv", "*dlc3d*.csv"),
+    ) -> List[pd.DataFrame]:
+        """Find per-trial DLC3D CSV(s); returns one DataFrame per trial."""
+        return self._extract_by_glob(trial_folders, pattern=list(patterns))
 
     # ---------- calibration ----------
     @staticmethod
@@ -317,13 +354,158 @@ class BallBearingData:
 
         return pd.concat(parts, ignore_index=True)
 
-    # ---------- .mat extraction ----------
+    def compute_dlc3d_angles_by_trial(
+        self,
+        dlc3d_trials: List[pd.DataFrame],
+        *,
+        set_label: str,
+        signed_in_plane: bool = True,
+        add_plane_ok: bool = True,
+    ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
+        """
+        From per-trial DLC3D DataFrames (3-row MultiIndex columns), compute:
+          • wrist_bend_deg  = angle(forearm→hand, hand→MCP)
+          • mcp_bend_deg    = angle(hand→MCP, MCP→PIP)
+          • mcp_bend_in_wrist_plane_deg = MCP bend projected into wrist plane
+        Returns (augmented_trials, tall_df).
+        """
+        augmented: List[pd.DataFrame] = []
+        parts: List[pd.DataFrame] = []
+
+        for trial_idx, dlc_df in enumerate(dlc3d_trials, start=1):
+            if dlc_df is None or dlc_df.empty:
+                augmented.append(pd.DataFrame()); continue
+
+            cam = DLC3DBendAngles(dlc_df)
+
+            # MCP bend
+            hand_pts = cam.get_points("hand")
+            mcp_pts  = cam.get_points("MCP")
+            pip_pts  = cam.get_points("PIP")
+            v1_mcp = cam.vector(hand_pts, mcp_pts)  # hand→MCP
+            v2_mcp = cam.vector(mcp_pts, pip_pts)  # MCP→PIP
+
+            # Wrist bend (+ plane)
+            forearm_pts = cam.get_points("forearm")
+            v1_wrist = cam.vector(forearm_pts, hand_pts)  # forearm→hand
+            v2_wrist = cam.vector(hand_pts, mcp_pts)      # hand→MCP
+
+            angles_mcp   = cam.angle_from_vectors(v1_mcp, v2_mcp)
+            angles_wrist = cam.angle_from_vectors(v1_wrist, v2_wrist)
+
+            angles_mcp_plane, _, _, plane_ok = cam.angle_from_vectors_in_plane(
+                v1=v1_mcp, v2=v2_mcp, plane_v1=v1_wrist, plane_v2=v2_wrist, signed=signed_in_plane
+            )
+
+            df_out = cam.df.copy()
+            df_out[("metric", "mcp_bend_deg", "deg")]                 = angles_mcp
+            df_out[("metric", "wrist_bend_deg", "deg")]               = angles_wrist
+            df_out[("metric", "mcp_bend_in_wrist_plane_deg", "deg")]  = angles_mcp_plane
+            if add_plane_ok:
+                df_out[("metric", "wrist_plane_ok", "")] = plane_ok
+
+            augmented.append(df_out)
+
+            # try to carry a useful time axis if present
+            time_col = None
+            for c in df_out.columns:
+                if "time" in str(c).lower() or "timestamp" in str(c).lower():
+                    time_col = c; break
+            time_vals = df_out[time_col] if time_col is not None else pd.Series([np.nan] * len(df_out))
+
+            parts.append(pd.DataFrame({
+                "set_label": set_label,
+                "trial": trial_idx,
+                "frame": np.arange(len(df_out), dtype=int),
+                "time_or_timestamp": pd.to_numeric(time_vals, errors="coerce"),
+                "mcp_bend_deg": pd.to_numeric(df_out[("metric", "mcp_bend_deg", "deg")], errors="coerce"),
+                "wrist_bend_deg": pd.to_numeric(df_out[("metric", "wrist_bend_deg", "deg")], errors="coerce"),
+                "mcp_bend_in_wrist_plane_deg": pd.to_numeric(
+                    df_out[("metric", "mcp_bend_in_wrist_plane_deg", "deg")], errors="coerce"),
+                "wrist_plane_ok": plane_ok if add_plane_ok else True,
+            }))
+
+        tall = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+            columns=["set_label","trial","frame","time_or_timestamp",
+                     "mcp_bend_deg","wrist_bend_deg","mcp_bend_in_wrist_plane_deg","wrist_plane_ok"]
+        )
+        return augmented, tall
+
+    # --- DLC3D header coercion ---
+    @staticmethod
+    def _coerce_dlc3d_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert common DLC 3D flat export into MultiIndex (scorer, bodypart, coord).
+        Expected flat form:
+            col0='scorer', row0='bodyparts', row1='coords', data from row2 onward.
+        If already MultiIndex, returns a normalized copy (coords lowercased).
+        """
+        if isinstance(df.columns, pd.MultiIndex):
+            new_cols = []
+            for c in df.columns:
+                if isinstance(c, tuple) and len(c) >= 3:
+                    new_cols.append((str(c[0]), str(c[1]), str(c[2]).lower()))
+                else:
+                    new_cols.append(c)
+            out = df.copy()
+            out.columns = pd.MultiIndex.from_tuples(new_cols)
+            return out
+
+        # Quick sanity checks
+        if df.shape[0] < 3 or df.shape[1] < 4:
+            return df
+
+        try:
+            first_col_name = str(df.columns[0]).strip().lower()
+            row0_first = str(df.iloc[0, 0]).strip().lower()
+            row1_first = str(df.iloc[1, 0]).strip().lower()
+        except Exception:
+            return df
+
+        looks_like_dlc3d_flat = ("scorer" in first_col_name and
+                                 row0_first.startswith("bodypart") and
+                                 row1_first.startswith("coord"))
+        if not looks_like_dlc3d_flat:
+            return df
+
+        tuples = []
+        use_cols = []
+        for j in range(1, df.shape[1]):  # skip first 'scorer' column
+            scorer = str(df.columns[j]).strip()
+            bpart  = str(df.iloc[0, j]).strip()
+            coord  = str(df.iloc[1, j]).strip().lower()
+            if bpart == "" and coord == "":
+                continue
+            if coord not in ("x", "y", "z"):
+                continue
+            tuples.append((scorer, bpart, coord))
+            use_cols.append(j)
+
+        if not tuples:
+            return df
+
+        df2 = df.iloc[2:, use_cols].reset_index(drop=True).copy()
+        df2.columns = pd.MultiIndex.from_tuples(tuples)
+        df2 = df2.apply(pd.to_numeric, errors="coerce")
+        return df2
+
+    # ---------- triggers / camera timestamps ----------
+    def extract_trigger_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
+        dfs = self._extract_by_glob(trial_folders, pattern="data_trigger_time*.csv")
+        if all((df is None or df.empty) for df in dfs):
+            dfs = self._extract_by_glob(trial_folders, pattern="*trigger*.csv")
+        return dfs
+
     def extract_mat_dfs_by_trial(
         self,
         trial_folders: List[str],
         mat_name: str = "flir.mat",
         prefix: str = "ts",
     ) -> List[pd.DataFrame]:
+        """
+        For each trial folder, find a FLIR .mat file and load variables whose names start with `prefix`
+        (e.g., 'ts*') into a single DataFrame per trial.
+        """
         out: List[pd.DataFrame] = []
         for folder in trial_folders:
             fp = Path(folder)
@@ -355,15 +537,136 @@ class BallBearingData:
             out.append(df)
         return out
 
-    def extract_trigger_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        dfs = self._extract_by_glob(trial_folders, pattern="data_trigger_time*.csv")
-        if all((df is None or df.empty) for df in dfs):
-            dfs = self._extract_by_glob(trial_folders, pattern="*trigger*.csv")
-        return dfs
+    def attach_dlc_angles_to_cam_by_trial(
+        self,
+        cam_trials: List[pd.DataFrame],
+        dlc_aug_trials: List[pd.DataFrame],
+        *,
+        cam_time_col: Optional[str] = None,   # e.g. 'ts_25183199'; auto-detect if None
+        cam_time_prefix: str = "ts",          # auto-detect columns starting with this
+        tolerance: Union[str, float, int] = "10ms",  # '10ms' or seconds(float) or microseconds(int)
+        direction: str = "nearest",
+        suffix: str = "_dlc",                 # suffix for appended metric columns
+    ) -> List[pd.DataFrame]:
+        """
+        Append DLC angle columns (from compute_dlc3d_angles_by_trial) to each camera ts_* DataFrame.
+
+        Per trial:
+          • If lengths match: index-wise join (fast path).
+          • Else if both sides have a time column: merge_asof on coerced seconds.
+          • Else: nearest join on frame index.
+        """
+        out: List[pd.DataFrame] = []
+
+        def _pick_cam_time(df: pd.DataFrame) -> Optional[str]:
+            if cam_time_col and cam_time_col in df.columns:
+                return cam_time_col
+            cands = [c for c in df.columns if str(c).lower().startswith(cam_time_prefix)]
+            return cands[0] if cands else None
+
+        def _find_dlc_time_col(df: pd.DataFrame):
+            for c in df.columns:
+                s = str(c)
+                if "ts" in s.lower() or "timestamp" in s.lower():
+                    return c
+            return None
+
+        def _flatten_metrics(df: pd.DataFrame) -> pd.DataFrame:
+            cols = [
+                ("metric", "mcp_bend_deg", "deg"),
+                ("metric", "wrist_bend_deg", "deg"),
+                ("metric", "mcp_bend_in_wrist_plane_deg", "deg"),
+                ("metric", "wrist_plane_ok", ""),
+            ]
+            present = [c for c in cols if c in df.columns]
+            if not present:
+                return pd.DataFrame(index=df.index)
+            sub = df[present].copy()
+            new_names = []
+            for c in sub.columns:
+                base = "_".join([x for x in c if str(x) != ""]) if isinstance(c, tuple) else str(c)
+                new_names.append(base + suffix)
+            sub.columns = new_names
+            return sub
+
+        def _tol_seconds_local(tol) -> float:
+            if isinstance(tol, str):
+                return pd.to_timedelta(tol).total_seconds()
+            return float(tol)
+
+        for cam_df, dlc_df in zip(cam_trials, dlc_aug_trials):
+            if cam_df is None or cam_df.empty or dlc_df is None or dlc_df.empty:
+                out.append(cam_df if isinstance(cam_df, pd.DataFrame) else pd.DataFrame())
+                continue
+
+            dlc_metrics = _flatten_metrics(dlc_df)
+
+            # Case A: identical lengths → fast index join
+            if len(cam_df) == len(dlc_metrics) and len(dlc_metrics) > 0:
+                joined = cam_df.reset_index(drop=True).join(dlc_metrics.reset_index(drop=True))
+                out.append(joined)
+                continue
+
+            cam_col  = _pick_cam_time(cam_df)
+            dlc_tcol = _find_dlc_time_col(dlc_df)
+
+            # Case B: time-based merge_asof if possible
+            if cam_col is not None and dlc_tcol is not None and len(dlc_metrics) > 0:
+                left = cam_df[[cam_col]].copy()
+                right = dlc_df[[dlc_tcol]].copy()
+
+                left["_t"]     = self._coerce_time_series_numeric_seconds(left[cam_col])
+                right["_t_enc"] = self._coerce_time_series_numeric_seconds(right[dlc_tcol])
+
+                left  = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
+                right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
+
+                right = right.join(dlc_metrics.reset_index(drop=True))
+
+                m = pd.merge_asof(
+                    left, right,
+                    left_on="_t", right_on="_t_enc",
+                    direction=direction,
+                    tolerance=_tol_seconds_local(tolerance),
+                    allow_exact_matches=True,
+                )
+
+                m = m.set_index("index").reindex(cam_df.index)
+                keep_cols = [c for c in m.columns if c.endswith(suffix)]
+                joined = pd.concat([cam_df, m[keep_cols]], axis=1)
+                out.append(joined)
+                continue
+
+            # Case C: fallback to frame-index nearest
+            if len(dlc_metrics) == 0:
+                out.append(cam_df.copy())
+                continue
+
+            cam_tmp = cam_df.copy()
+            dlc_tmp = dlc_metrics.copy()
+            cam_tmp["_frame"] = np.arange(len(cam_tmp), dtype=float)
+            dlc_tmp["_frame"] = np.linspace(0, max(0, len(cam_tmp) - 1), num=len(dlc_tmp))
+
+            cam_small = cam_tmp[["_frame"]].copy().reset_index(drop=False)
+            dlc_small = dlc_tmp.copy().reset_index(drop=True)
+
+            m = pd.merge_asof(
+                cam_small.sort_values("_frame"),
+                dlc_small.sort_values("_frame"),
+                on="_frame",
+                direction=direction,
+                allow_exact_matches=True,
+            ).set_index("index").reindex(cam_df.index)
+
+            keep_cols = [c for c in m.columns if c.endswith(suffix)]
+            joined = pd.concat([cam_df, m[keep_cols]], axis=1)
+            out.append(joined)
+
+        return out
 
     def _mat_to_df(self, mat_path: Path, prefix: str = "ts") -> pd.DataFrame:
         import numpy as _np
-        wanted = {}
+        wanted: Dict[str, np.ndarray] = {}
         pref_l = str(prefix).lower()
 
         # try classic MAT
@@ -472,14 +775,14 @@ class BallBearingData:
     # IMU (DLC-driven) pipeline
     # =========================
     def imu_augment_trials_inplace(
-            self,
-            trigger_trials,  # unused; kept for API symmetry
-            imu_trials: List[pd.DataFrame],
-            trial_len_sec: float = 10.0,
-            quat_cols: Tuple[str, str] = ("quat1", "quat2"),
-            fixed_axis: str = "y",
-            moving_axis: str = "y",
-            quat_order: str = "wxyz",
+        self,
+        trigger_trials,  # unused; kept for API symmetry
+        imu_trials: List[pd.DataFrame],
+        trial_len_sec: float = 10.0,
+        quat_cols: Tuple[str, str] = ("quat1", "quat2"),
+        fixed_axis: str = "y",
+        moving_axis: str = "y",
+        quat_order: str = "wxyz",
     ) -> None:
         dlc = DLC3DBendAngles(pd.DataFrame({"_": []}))
         augmented, _ = dlc.compute_joint_angle_trials(
@@ -497,10 +800,8 @@ class BallBearingData:
                 continue
 
             n = len(df_src)
-            # Always give the caller a full-length synthetic time base
             df_src["time_s"] = np.linspace(0.0, float(trial_len_sec), num=n, endpoint=False, dtype=float)
 
-            # Prepare target column with NaNs
             if "imu_joint_deg_rx_py" not in df_src.columns:
                 df_src["imu_joint_deg_rx_py"] = np.nan
 
@@ -508,34 +809,25 @@ class BallBearingData:
             if df_aug is None or df_aug.empty or "imu_joint_deg_rx_py" not in df_aug.columns:
                 continue
 
-            # Case A: same length → fast path
             if len(df_aug) == n:
                 df_src["imu_joint_deg_rx_py"] = df_aug["imu_joint_deg_rx_py"].to_numpy()
                 continue
 
-            # Case B: try timestamp alignment if both have it
             if "timestamp" in df_src.columns and "timestamp" in df_aug.columns:
                 left = df_src[["timestamp"]].copy()
                 right = df_aug[["timestamp", "imu_joint_deg_rx_py"]].copy()
-                # Coerce to numeric if they look numeric; otherwise do string join
                 try:
                     lt = pd.to_numeric(left["timestamp"], errors="coerce")
                     rt = pd.to_numeric(right["timestamp"], errors="coerce")
                     if lt.notna().any() and rt.notna().any():
-                        left["_t"] = lt
-                        right["_t"] = rt
-                        # nearest-asof join
+                        left["_t"] = lt; right["_t"] = rt
                         left = left.sort_values("_t")
                         right = right.sort_values("_t")
-                        merged = pd.merge_asof(
-                            left, right, on="_t", direction="nearest", tolerance=None
-                        ).sort_index()
+                        merged = pd.merge_asof(left, right, on="_t", direction="nearest", tolerance=None).sort_index()
                         df_src["imu_joint_deg_rx_py"] = merged["imu_joint_deg_rx_py"].to_numpy()
                         continue
                 except Exception:
                     pass
-
-                # Fallback: exact timestamp join as strings
                 merged = left.merge(right.astype({"timestamp": str}), on="timestamp", how="left")
                 df_src["imu_joint_deg_rx_py"] = merged["imu_joint_deg_rx_py"].to_numpy()
             else:
@@ -564,8 +856,7 @@ class BallBearingData:
         )
         return tall
 
-    # ======== ADC→θ builders + ADC↔CAM alignment (per set / both sets) ========
-
+    # ======== ADC→θ builders + ADC↔CAM alignment ========
     def _detect_cam_time_col(self, cam_df: pd.DataFrame, prefix: str = "ts") -> Optional[str]:
         """Pick the first column that looks like a camera timestamp (e.g., 'ts_25183199')."""
         cands = [c for c in cam_df.columns if str(c).lower().startswith(prefix)]
@@ -578,18 +869,15 @@ class BallBearingData:
         """
         sn = pd.to_numeric(s, errors="coerce")
         if sn.notna().any():
-            # If scale looks micro/nano, down-scale to ~seconds for stability
             m = sn[sn.notna()]
             if len(m) > 2:
                 span = float(m.max() - m.min())
-                if span > 1e6:  # heuristic: big numbers → probably µs or ns
-                    # choose scale based on magnitude
+                if span > 1e6:  # likely µs/ns domain
                     med = float(m.abs().median())
                     scale = 1e9 if med > 1e9 else (1e6 if med > 1e6 else 1.0)
                     return sn.astype(float) / scale
             return sn.astype(float)
 
-        # Try datetime-like
         try:
             dt = pd.to_datetime(s, errors="coerce", utc=True)
             if dt.notna().any():
@@ -598,27 +886,24 @@ class BallBearingData:
         except Exception:
             pass
 
-        # give up → NaNs
         return pd.Series(np.nan, index=s.index, dtype=float)
 
     def _theta_trials_from_adc(
-            self,
-            adc_trials: List[pd.DataFrame],
-            trial_len_sec: float = 10.0,
-            adc_col: str = "adc_ch3",
-            time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
-            include_endpoint: bool = True,
+        self,
+        adc_trials: List[pd.DataFrame],
+        trial_len_sec: float = 10.0,
+        adc_col: str = "adc_ch3",
+        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+        include_endpoint: bool = True,
     ) -> List[pd.DataFrame]:
         """
         Produce per-trial frames with columns:
           ['time_s','timestamp','theta_pred_deg', <adc_col>]
-        Uses self.calib via trials_to_tall_df (and self._adc_to_theta_deg internally).
         """
         out = []
         for df in adc_trials:
             if df is None or df.empty:
-                out.append(pd.DataFrame());
-                continue
+                out.append(pd.DataFrame()); continue
             tall_one = self.trials_to_tall_df(
                 [df],
                 set_label="set",
@@ -633,32 +918,25 @@ class BallBearingData:
         return out
 
     def align_adc_to_cam_for_set(
-            self,
-            adc_trials: List[pd.DataFrame],
-            cam_trials: List[pd.DataFrame],
-            *,
-            trial_len_sec: float = 10.0,
-            adc_col: str = "adc_ch3",
-            enc_time_col: str = "timestamp",
-            cam_time_col: Optional[str] = None,  # auto-detect if None (e.g., 'ts_25183199')
-            cam_time_prefix: str = "ts",
-            tolerance: str | float = "10ms",
-            direction: str = "nearest",
-            attach_cols: Tuple[str, ...] = ("theta_pred_deg",),
-            keep_time_delta: bool = True,
-            drop_unmatched: bool = True,
-            # DLC/“cam” object hook (optional)
-            dlc_cam_obj: Optional[object] = None,
-            # object exposing find_matching_indices(...) and attach_encoder_using_match(...)
+        self,
+        adc_trials: List[pd.DataFrame],
+        cam_trials: List[pd.DataFrame],
+        *,
+        trial_len_sec: float = 10.0,
+        adc_col: str = "adc_ch3",
+        enc_time_col: str = "timestamp",
+        cam_time_col: Optional[str] = None,  # auto-detect if None (e.g., 'ts_25183199')
+        cam_time_prefix: str = "ts",
+        tolerance: str | float = "10ms",
+        direction: str = "nearest",
+        attach_cols: Tuple[str, ...] = ("theta_pred_deg",),
+        keep_time_delta: bool = True,
+        drop_unmatched: bool = True,
+        dlc_cam_obj: Optional[object] = None,
     ) -> List[pd.DataFrame]:
         """
         Align per-trial angle-converted ADC (θ_pred from self.calib) to camera timestamps.
-        If dlc_cam_obj is provided and has the expected methods, we use it; otherwise we use merge_asof fallback.
-        Returns: list of merged DataFrames (one per trial).
         """
-        import pandas as pd
-        import numpy as np
-
         # 1) Safety: need calibration first
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) before aligning.")
@@ -674,35 +952,31 @@ class BallBearingData:
 
         merged = []
         use_dlc = (
-                dlc_cam_obj is not None
-                and hasattr(dlc_cam_obj, "find_matching_indices")
-                and hasattr(dlc_cam_obj, "attach_encoder_using_match")
+            dlc_cam_obj is not None
+            and hasattr(dlc_cam_obj, "find_matching_indices")
+            and hasattr(dlc_cam_obj, "attach_encoder_using_match")
         )
 
         for i, (cam_df, th_df) in enumerate(zip(cam_trials, theta_trials), start=1):
             if cam_df is None or cam_df.empty or th_df is None or th_df.empty:
-                merged.append(pd.DataFrame());
-                continue
+                merged.append(pd.DataFrame()); continue
 
             cam_col = cam_time_col or self._detect_cam_time_col(cam_df, prefix=cam_time_prefix)
             if cam_col is None or cam_col not in cam_df.columns:
                 print(f"[align] Trial {i}: camera time column not found (prefix='{cam_time_prefix}').")
-                merged.append(pd.DataFrame());
-                continue
+                merged.append(pd.DataFrame()); continue
 
             if enc_time_col not in th_df.columns:
                 print(f"[align] Trial {i}: encoder time column '{enc_time_col}' not found in theta trial.")
-                merged.append(pd.DataFrame());
-                continue
+                merged.append(pd.DataFrame()); continue
 
             if use_dlc:
-                # --- Path A: delegate to DLC/“cam” helper (user-provided object) ---
                 try:
                     dlc_cam_obj.find_matching_indices(
                         encoder_df=th_df.rename(columns={enc_time_col: "timestamp"}),
                         cam_time_col=(cam_col, "", ""),
                         enc_time_col="timestamp",
-                        tolerance=tolerance,  # DLC util can accept the string form
+                        tolerance=tolerance,
                         direction=direction,
                     )
                     mdf = dlc_cam_obj.attach_encoder_using_match(
@@ -712,101 +986,70 @@ class BallBearingData:
                         keep_time_delta=keep_time_delta,
                         drop_unmatched=drop_unmatched,
                     )
-                    merged.append(mdf)
-                    continue
+                    merged.append(mdf); continue
                 except Exception as e:
                     print(f"[align] Trial {i}: DLC path failed ({e}); falling back to merge_asof).")
 
-            # --- Path B: merge_asof fallback ---
-            left = cam_df[[cam_col]].copy()
+            left  = cam_df[[cam_col]].copy()
             right = th_df[[enc_time_col] + [c for c in attach_cols if c in th_df.columns]].copy()
 
-            # coerce to comparable float-seconds domain for asof
-            left["_t"] = self._coerce_time_series_numeric_seconds(left[cam_col])
+            left["_t"]  = self._coerce_time_series_numeric_seconds(left[cam_col])
             right["_t"] = self._coerce_time_series_numeric_seconds(right[enc_time_col])
 
-            # drop NaN times (can happen if coercion failed on some rows)
-            left = left.loc[left["_t"].notna()].sort_values("_t")
+            left  = left.loc[left["_t"].notna()].sort_values("_t")
             right = right.loc[right["_t"].notna()].sort_values("_t")
 
-            # NOTE: when joining on float "_t", tolerance must be a FLOAT (seconds), not Timedelta
             m = pd.merge_asof(
                 left, right,
                 on="_t",
                 direction=direction,
-                tolerance=self._tol_seconds(tolerance),  # <-- key fix
+                tolerance=self._tol_seconds(tolerance),
                 allow_exact_matches=True,
             )
 
-            # keep raw time delta if requested (best-effort)
             if keep_time_delta:
                 try:
                     lraw = pd.to_numeric(cam_df.loc[left.index, cam_col], errors="coerce")
-                    # map matched encoder timestamp back to raw domain by re-merge on _t
                     rr = right[["_t", enc_time_col]].copy()
                     mm = m.merge(rr, on="_t", how="left", suffixes=("", ""))
                     rraw = pd.to_numeric(mm[enc_time_col], errors="coerce")
                     if lraw.notna().any() and rraw.notna().any():
-                        # align series lengths
                         lraw_aligned = lraw.reset_index(drop=True)
                         rraw_aligned = rraw.reset_index(drop=True)
                         m["_delta_raw"] = rraw_aligned - lraw_aligned
                 except Exception:
                     pass
 
-            # Optionally drop rows that failed to match within tolerance
             if drop_unmatched and attach_cols:
                 first_col = next((c for c in attach_cols if c in m.columns), None)
                 if first_col is not None:
                     m = m.loc[m[first_col].notna()].copy()
 
-            # keep original cam time too
             m[cam_col] = left[cam_col].values
-
             merged.append(m.reset_index(drop=True))
 
         return merged
 
     def align_theta_all_to_cam_for_set(
-            self,
-            theta_all_set: pd.DataFrame,
-            cam_trials: List[pd.DataFrame],
-            *,
-            enc_time_col: str = "timestamp",  # from trials_to_tall_df
-            cam_time_col: Optional[str] = None,  # auto-detect if None (e.g., 'ts_25183199')
-            cam_time_prefix: str = "ts",
-            tolerance: str | int | float = "10ms",  # str -> Timedelta (e.g., '10ms'); int->µs; float->s
-            direction: str = "nearest",
-            theta_col: str = "theta_pred_deg",
-            keep_time_delta: bool = True,
-            drop_unmatched: bool = True,
-            return_concatenated: bool = False,
+        self,
+        theta_all_set: pd.DataFrame,
+        cam_trials: List[pd.DataFrame],
+        *,
+        enc_time_col: str = "timestamp",
+        cam_time_col: Optional[str] = None,
+        cam_time_prefix: str = "ts",
+        tolerance: Union[str, int, float] = "10ms",
+        direction: str = "nearest",
+        theta_col: str = "theta_pred_deg",
+        keep_time_delta: bool = True,
+        drop_unmatched: bool = True,
+        return_concatenated: bool = False,
     ) -> List[pd.DataFrame] | pd.DataFrame:
         """
-        Align a tall per-set θ table (theta_all_first or theta_all_second) to per-trial camera ts_* DataFrames.
-
-        • Uses the same plumbing as your cam helper:
-          - convert both sides to int64 nanoseconds
-          - tolerance is a Timedelta converted to integer nanoseconds
-          - pandas.merge_asof on the ns axis, nearest with tolerance
-
-        • Keeps ALL camera columns; appends theta/ADC/time_s, plus deltas in ns/ms/s.
-
-        Parameters
-        ----------
-        enc_time_col : encoder/ADC timestamp column in theta_all_set
-        cam_time_col : camera time column to use (e.g., 'ts_25185174'); if None, auto-detect by `cam_time_prefix`
-        tolerance    : '10ms' / '500us' / '1s' (str) or int→microseconds, float→seconds
-        direction    : 'nearest' | 'forward' | 'backward'
-        drop_unmatched : if True, remove rows where theta could not be attached
-        return_concatenated : if True, return a single DataFrame (concat of trials)
+        Align a tall per-set θ table to per-trial camera ts_* DataFrames.
+        Keeps ALL camera columns; appends theta/ADC/time_s, plus deltas in ns/ms/s.
         """
-
-        import numpy as np
-        import pandas as pd
-
         def _coerce_tolerance_to_timedelta(tol) -> pd.Timedelta:
-            """ ints→µs, floats→s, str→pandas offset """
             if isinstance(tol, (np.integer, int)):
                 return pd.to_timedelta(int(tol), unit="us")
             if isinstance(tol, (np.floating, float)):
@@ -814,34 +1057,16 @@ class BallBearingData:
             return pd.to_timedelta(tol)
 
         def _to_int64_ns(series: pd.Series) -> pd.Series:
-            """
-            Coerce a timestamp-like series to int64 nanoseconds.
-            Priority:
-              1) if already datetime/timedelta64[ns] -> view('i8')
-              2) numeric -> assume already ns (int-like); coerce to Int64
-              3) parseable datetime strings -> to_datetime(...).view('i8')
-            Returns Int64 dtype (nullable) aligned to original index.
-            """
-            # case 1: datetime-like / timedelta-like
             if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
                 return series.view("i8").astype("Int64")
-
-            # case 2: numeric
             sn = pd.to_numeric(series, errors="coerce")
             if sn.notna().any():
-                # keep as integer ns if possible; otherwise round
-                sn_i8 = sn.round().astype("Int64")
-                return sn_i8
-
-            # case 3: try datetime parsing
+                return sn.round().astype("Int64")
             dt = pd.to_datetime(series, errors="coerce", utc=True)
             if dt.notna().any():
                 return dt.view("i8").astype("Int64")
-
-            # give up -> all <NA>
             return pd.Series(pd.array([pd.NA] * len(series), dtype="Int64"), index=series.index)
 
-        # sanity checks
         if theta_col not in theta_all_set.columns:
             raise KeyError(f"'{theta_col}' not found in theta_all_set.")
         if enc_time_col not in theta_all_set.columns:
@@ -849,18 +1074,13 @@ class BallBearingData:
 
         tol_td = _coerce_tolerance_to_timedelta(tolerance)
         tol_ns = int(tol_td / pd.to_timedelta(1, unit="ns"))
-
         merged_trials: List[pd.DataFrame] = []
 
-        # iterate 1..N, pairing trial i from theta_all_set with cam_trials[i-1]
         for trial_idx, cam_df in enumerate(cam_trials, start=1):
             th_df = theta_all_set.loc[theta_all_set["trial"] == trial_idx].copy()
-
             if cam_df is None or cam_df.empty or th_df.empty:
-                merged_trials.append(pd.DataFrame());
-                continue
+                merged_trials.append(pd.DataFrame()); continue
 
-            # camera time column autodetect (e.g., 'ts_25183199')
             if cam_time_col is None:
                 cam_cands = [c for c in cam_df.columns if str(c).lower().startswith(cam_time_prefix)]
                 cam_col = cam_cands[0] if cam_cands else None
@@ -869,53 +1089,38 @@ class BallBearingData:
 
             if cam_col is None or cam_col not in cam_df.columns:
                 print(f"[alignθ] Trial {trial_idx}: camera time column not found (prefix='{cam_time_prefix}').")
-                merged_trials.append(pd.DataFrame());
-                continue
+                merged_trials.append(pd.DataFrame()); continue
 
-            # --- build LEFT (camera) and RIGHT (theta) tables on int64 ns axis ---
-
-            # 1) LEFT: keep ALL camera columns; create _t_ns
             left = cam_df.copy()
             left["_t_ns"] = _to_int64_ns(left[cam_col])
             left = left.dropna(subset=["_t_ns"]).sort_values("_t_ns")
 
-            # 2) RIGHT: only attach selected cols from theta table; create _t_ns
-            extra_cols = ["time_s", "adc_ch3"]  # add other ADC cols as needed
+            extra_cols = ["time_s", "adc_ch3"]
             right_cols = [enc_time_col, theta_col] + [c for c in extra_cols if c in th_df.columns]
             right = th_df[right_cols].copy()
             right["_t_ns"] = _to_int64_ns(right[enc_time_col])
             right = right.dropna(subset=["_t_ns"]).sort_values("_t_ns")
-
-            # keep raw encoder ns for precise deltas
             right["_t_enc_ns"] = right["_t_ns"].copy()
 
             if left.empty or right.empty:
-                merged_trials.append(pd.DataFrame());
-                continue
+                merged_trials.append(pd.DataFrame()); continue
 
-            # --- asof merge on ns axis ---
             m = pd.merge_asof(
-                left,
-                right,
-                left_on="_t_ns",
-                right_on="_t_ns",
+                left, right,
+                left_on="_t_ns", right_on="_t_ns",
                 direction=direction,
                 tolerance=tol_ns,
                 allow_exact_matches=True,
             )
 
-            # --- deltas like cam helper ---
             if keep_time_delta and "_t_enc_ns" in m.columns:
-                m["_delta_ns"] = (m["_t_enc_ns"] - m["_t_ns"]).astype("Int64")
-                # ms/s as float for convenience
-                m["_delta_ms"] = m["_delta_ns"].astype("float64") / 1e6
+                m["_delta_ns"]  = (m["_t_enc_ns"] - m["_t_ns"]).astype("Int64")
+                m["_delta_ms"]  = m["_delta_ns"].astype("float64") / 1e6
                 m["_delta_sec"] = m["_delta_ns"].astype("float64") / 1e9
 
-            # Optionally drop rows that failed to match within tolerance (theta stayed NaN)
             if drop_unmatched and theta_col in m.columns:
                 m = m.loc[m[theta_col].notna()].copy()
 
-            # tag trial/set for convenience
             m["trial"] = trial_idx
             if "set_label" in theta_all_set.columns:
                 vals = th_df["set_label"].dropna()
@@ -932,26 +1137,26 @@ class BallBearingData:
 
     def _tol_seconds(self, tol):
         """Return tolerance in float seconds (handles strings like '10ms')."""
-        import pandas as pd
         if isinstance(tol, str):
             return pd.to_timedelta(tol).total_seconds()
         return float(tol)
 
     def align_adc_to_cam_both_sets(
-            self,
-            adc_trials_first: List[pd.DataFrame],
-            cam_trials_first: List[pd.DataFrame],
-            adc_trials_second: List[pd.DataFrame],
-            cam_trials_second: List[pd.DataFrame],
-            **kwargs,
+        self,
+        adc_trials_first: List[pd.DataFrame],
+        cam_trials_first: List[pd.DataFrame],
+        adc_trials_second: List[pd.DataFrame],
+        cam_trials_second: List[pd.DataFrame],
+        **kwargs,
     ) -> Tuple[List[pd.DataFrame], List[pd.DataFrame]]:
         """
         Convenience wrapper: runs align_adc_to_cam_for_set for first and second sets.
         kwargs are passed through to align_adc_to_cam_for_set.
         """
-        first = self.align_adc_to_cam_for_set(adc_trials_first, cam_trials_first, **kwargs)
+        first  = self.align_adc_to_cam_for_set(adc_trials_first,  cam_trials_first,  **kwargs)
         second = self.align_adc_to_cam_for_set(adc_trials_second, cam_trials_second, **kwargs)
         return first, second
+
 
 
 class DLC3DBendAngles:

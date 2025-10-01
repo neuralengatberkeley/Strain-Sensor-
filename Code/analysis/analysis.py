@@ -78,7 +78,7 @@ class BallBearingData:
     def _find_trial_folders(self) -> list[Path]:
         """
         Find trial root folders whose name ends with `_<folder_suffix>` (case-insensitive).
-        Prefer direct children of root (your current layout), and fall back to a recursive
+        Prefer direct children of root (current layout), and fall back to a recursive
         search if none are found.
         """
         if not self.root_dir.exists():
@@ -158,33 +158,58 @@ class BallBearingData:
                 print(f"  • Trial {i:02d}: {name} has {n} CSVs (including nested)")
 
     # ---------- generic per-trial extractor ----------
-    def _extract_by_glob(self, trial_folders: List[str], pattern: str) -> List[pd.DataFrame]:
-        out: List[pd.DataFrame] = []
+    # 1) Replace your _extract_by_glob with this flexible version
+    from typing import Sequence, Union
+
+    from typing import Sequence, Union
+    from pathlib import Path
+    import pandas as pd
+
+    def _extract_by_glob(self, trial_folders, pattern: Union[str, Sequence[str]]):
+        pats = [pattern] if isinstance(pattern, str) else list(pattern)
+        out = []
         for folder in trial_folders:
             fp = Path(folder)
-            cands = [p for p in fp.glob(pattern) if not self._is_bad_dot_underscore(p)]
+            cands = []
+            for pat in pats:
+                cands.extend([p for p in fp.rglob(pat) if not self._is_bad_dot_underscore(p)])
             if not cands:
-                nested = list(fp.glob(f"**/{pattern}"))
-                cands = [p for p in nested if not self._is_bad_dot_underscore(p)]
-            if not cands:
-                out.append(pd.DataFrame()); continue
-            cands_sorted = sorted(cands, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
-            df = self._read_csv_safe(cands_sorted[0])
+                out.append(pd.DataFrame());
+                continue
+            # Prefer the largest (usually the full-length recording)
+            cands = sorted(set(cands), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            df = self._read_csv_safe(cands[0])
             out.append(df if df is not None else pd.DataFrame())
         return out
 
-    # ---------- trial extraction ----------
-    def extract_adc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_adc*.csv")
+    # Then let your extractors allow “no extension” belt-and-suspenders:
+    def extract_adc_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_adc*.csv", "data_adc*"])
 
-    def extract_imu_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_imu*.csv")
+    def extract_imu_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_imu*.csv", "data_imu*"])
 
-    def extract_rotenc_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_rotenc*.csv")
+    def extract_spacebar_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_spacebar*.csv", "data_spacebar*"])
 
-    def extract_spacebar_dfs_by_trial(self, trial_folders: List[str]) -> List[pd.DataFrame]:
-        return self._extract_by_glob(trial_folders, pattern="data_spacebar*.csv")
+    def extract_rotenc_dfs_by_trial(self, trial_folders):
+        return self._extract_by_glob(trial_folders, ["data_rotenc*.csv", "data_rotenc*"])
+
+    def extract_dlc3d_dfs_by_trial(
+            self,
+            trial_folders: List[str],
+            patterns: Tuple[str, ...] = ("data_DLC3D*.csv", "DLC3D*.csv", "*dlc3d*.csv"),
+    ) -> List[pd.DataFrame]:
+        """
+        Locate per-trial DLC 3D CSV(s) (e.g., 'data_DLC3D_..._R.csv') and return a list of DataFrames,
+        one per trial. Uses the same robust, recursive search strategy as _extract_by_glob:
+          • searches recursively under each trial folder
+          • accepts multiple filename patterns (case-insensitive by glob)
+          • skips '._' resource-fork files
+          • picks the largest matching file when multiples exist
+        """
+        # Reuse your flexible _extract_by_glob that accepts multiple patterns
+        return self._extract_by_glob(trial_folders, pattern=list(patterns))
 
     # ---------- calibration ----------
     @staticmethod
