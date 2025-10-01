@@ -75,22 +75,38 @@ class BallBearingData:
         print(f"[WARN] Skipping unreadable file: {p} (failed UTF-8/UTF-8-SIG/latin1)")
         return None
 
-    def _find_trial_folders(self) -> List[Path]:
+    def _find_trial_folders(self) -> list[Path]:
+        """
+        Find trial root folders whose name ends with `_<folder_suffix>` (case-insensitive).
+        Prefer direct children of root (your current layout), and fall back to a recursive
+        search if none are found.
+        """
         if not self.root_dir.exists():
             raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
 
-        pat = re.compile(rf".*_{re.escape(self.folder_suffix)}$", flags=re.IGNORECASE)
-        folders = []
-        for dirpath, _, filenames in os.walk(self.root_dir):
-            if not any(f.lower().endswith(".csv") for f in filenames):
-                continue
-            d = Path(dirpath)
-            if pat.match(d.name):
-                folders.append(d)
+        suf = str(self.folder_suffix).strip()
+        # Pass 1: non-recursive (direct children) — matches your printed listing
+        direct = [p for p in self.root_dir.glob(f"*_{suf}") if p.is_dir()]
+        if not direct:
+            # Pass 2: recursive fallback, case-insensitive endswith
+            direct = []
+            suf_lower = f"_{suf}".lower()
+            for p in self.root_dir.rglob("*"):
+                if p.is_dir() and p.name.lower().endswith(suf_lower):
+                    direct.append(p)
 
-        folders = sorted(folders, key=lambda p: p.name)
-        self._all_folders = folders
+        folders = sorted(set(direct), key=lambda p: p.name)
+
+        if not folders:
+            print(f"[DEBUG] No *_{self.folder_suffix} dirs under {self.root_dir}")
+            print("[DEBUG] Show a few children of root:")
+            for i, p in enumerate(sorted(self.root_dir.glob("*"))[:12]):
+                print("  -", p)
+            return []
+
         print(f"Found {len(folders)} *_{self.folder_suffix} folders total (case-insensitive).")
+        print("  example:", folders[0])
+        self._all_folders = folders
         return folders
 
     def _split_sets(self) -> Tuple[List[Path], List[Path]]:
@@ -128,13 +144,18 @@ class BallBearingData:
     def _warn_counts(self, label: str, folders: List[Path]):
         problems = []
         for i, f in enumerate(folders, start=1):
+            # Try top-level first (old layout)
             csvs = [p for p in f.glob("*.csv") if not self._is_bad_dot_underscore(p)]
+            # If that looks short, count nested too (new layout)
+            if len(csvs) < self.files_per_trial:
+                csvs = [p for p in f.glob("**/*.csv") if not self._is_bad_dot_underscore(p)]
             if len(csvs) != self.files_per_trial:
                 problems.append((i, f.name, len(csvs)))
+
         if problems:
             print(f"[WARN] {label}: Some trials do not have exactly {self.files_per_trial} CSVs:")
             for i, name, n in problems:
-                print(f"  • Trial {i:02d}: {name} has {n} CSVs")
+                print(f"  • Trial {i:02d}: {name} has {n} CSVs (including nested)")
 
     # ---------- generic per-trial extractor ----------
     def _extract_by_glob(self, trial_folders: List[str], pattern: str) -> List[pd.DataFrame]:
