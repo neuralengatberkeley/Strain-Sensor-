@@ -38,6 +38,13 @@ from typing import List, Tuple, Dict, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional, Sequence, Union
+import numpy as np
+import pandas as pd
+
+# Assuming DLC3DBendAngles and bender_class live elsewhere in your codebase
+# from your_module import DLC3DBendAngles
 
 class BallBearingData:
     """
@@ -61,7 +68,8 @@ class BallBearingData:
         self._second_set: List[Path] = []
 
         # calibration state
-        self.calib: Dict[str, float] = {}   # {c0,c1,c2,y0,y90,source}
+        # keys: {c0,c1,c2,y0,y90,deg_min,deg_max,source,"_theta_of_z"}
+        self.calib: Dict[str, float] = {}
 
     # ---------- file system helpers ----------
     @staticmethod
@@ -227,37 +235,90 @@ class BallBearingData:
             w = np.where(np.abs(r) <= k, 1.0, k / (np.abs(r) + 1e-12))
         return float(beta[0]), float(beta[1]), float(beta[2])
 
-    def fit_and_set_calibration(
-            self,
-            angle_adc_df: pd.DataFrame,
-            angle_col: str = "angle",
-            adc_col: str = "adc_ch3",
-            robust: bool = True,
-            anchors_source: str = "fit_only",  # 'fit_only' | 'empirical' | 'empirical_minmax'
-            deg_min: float = 0.0,
-            deg_max: float = 90.0,
+    def set_calibration_from_adc_minmax(
+        self,
+        adc: Union[pd.Series, np.ndarray],
+        *,
+        deg_min: float = 0.0,
+        deg_max: float = 90.0,
+        robust: bool = True,
+        lo_q: float = 0.005,
+        hi_q: float = 0.995,
     ) -> Dict[str, float]:
+        """
+        Set calibration using only an ADC series:
+          - near-max ADC -> deg_min (0°)
+          - near-min ADC -> deg_max (90°)
+        Optionally robustify by using quantiles to ignore spikes.
+        """
+        a = np.asarray(adc, float).reshape(-1)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            raise ValueError("No finite ADC values provided.")
+
+        if robust:
+            y0  = float(np.nanquantile(a, hi_q))  # 0° anchor
+            y90 = float(np.nanquantile(a, lo_q))  # 90° anchor
+        else:
+            y0, y90 = float(np.nanmax(a)), float(np.nanmin(a))
+
+        self.calib = dict(
+            c0=np.nan, c1=np.nan, c2=np.nan,
+            y0=y0, y90=y90,
+            deg_min=float(deg_min), deg_max=float(deg_max),
+            source="adc_minmax",
+        )
+        # clear any previous inverse
+        self.calib["_theta_of_z"] = None
+
+        return dict(
+            anchors_source="adc_minmax",
+            y0_emp=y0, y90_emp=y90,
+            c0=np.nan, c1=np.nan, c2=np.nan, r2=np.nan,
+            deg_min=deg_min, deg_max=deg_max,
+        )
+
+    def fit_and_set_calibration(
+        self,
+        angle_adc_df: pd.DataFrame,
+        angle_col: str = "angle",
+        adc_col: str = "adc_ch3",
+        robust: bool = True,
+        anchors_source: str = "fit_only",  # 'fit_only' | 'empirical' | 'empirical_minmax'
+        deg_min: float = 0.0,
+        deg_max: float = 90.0,
+    ) -> Dict[str, float]:
+        """
+        Fit a quadratic ADC vs angle (for diagnostics/shape), and set y0/y90 anchors
+        according to anchors_source. Mapping ADC→θ is still linear between y0/y90
+        unless you explicitly use the poly inverse helpers.
+        """
         x = angle_adc_df[angle_col].to_numpy(float)
         y = angle_adc_df[adc_col].to_numpy(float)
         c0, c1, c2 = self._polyfit_quadratic(x, y, robust=robust)
         p = np.poly1d([c2, c1, c0])
 
         if anchors_source == "empirical_minmax":
-            # Map max ADC -> 0°, min ADC -> 90°
-            y0 = float(np.nanmax(y))  # ADC at 0°
-            y90 = float(np.nanmin(y))  # ADC at 90°
+            y0 = float(np.nanmax(y))   # ADC at deg_min
+            y90 = float(np.nanmin(y))  # ADC at deg_max
         elif anchors_source == "empirical":
             def endpoint_avg(target_deg: float, win: float = 2.5):
                 m = np.isfinite(x) & np.isfinite(y) & (np.abs(x - target_deg) <= win)
                 return float(np.nanmean(y[m])) if np.any(m) else float(p(target_deg))
-
-            y0 = endpoint_avg(deg_min)
+            y0  = endpoint_avg(deg_min)
             y90 = endpoint_avg(deg_max)
         else:  # 'fit_only'
-            y0 = float(p(deg_min))
+            y0  = float(p(deg_min))
             y90 = float(p(deg_max))
 
-        self.calib = dict(c0=c0, c1=c1, c2=c2, y0=y0, y90=y90, source=anchors_source)
+        self.calib = dict(
+            c0=c0, c1=c1, c2=c2,
+            y0=y0, y90=y90,
+            deg_min=float(deg_min), deg_max=float(deg_max),
+            source=anchors_source,
+        )
+        # clear any previous inverse; it depends on current poly + anchors
+        self.calib["_theta_of_z"] = None
 
         yhat = p(x)
         ss_res = np.sum((y - yhat) ** 2)
@@ -269,6 +330,7 @@ class BallBearingData:
             c0=c0, c1=c1, c2=c2,
             y0_emp=y0, y90_emp=y90,
             r2=r2,
+            deg_min=deg_min, deg_max=deg_max,
         )
 
     # ---------- normalization & mapping ----------
@@ -289,32 +351,122 @@ class BallBearingData:
         return deg_min + z * (deg_max - deg_min)
 
     def _adc_to_theta_deg(self, adc_vals: np.ndarray, clamp: bool = True) -> np.ndarray:
+        """
+        Linear ADC→θ map from anchors (y0,y90) over [deg_min,deg_max].
+        """
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
         y0  = float(self.calib["y0"])
         y90 = float(self.calib["y90"])
+        deg_min = float(self.calib.get("deg_min", 0.0))
+        deg_max = float(self.calib.get("deg_max", 90.0))
+        span = max(1e-12, deg_max - deg_min)
+
         adc_vals = np.asarray(adc_vals, dtype=float)
         if np.isnan(y0) or np.isnan(y90):
             theta = np.full_like(adc_vals, np.nan, dtype=float)
         elif y90 >= y0:
-            theta = (adc_vals - y0) / max(1e-12, (y90 - y0)) * 90.0
+            z = (adc_vals - y0) / max(1e-12, (y90 - y0))
         else:
-            theta = (y0 - adc_vals) / max(1e-12, (y0 - y90)) * 90.0
+            z = (y0 - adc_vals) / max(1e-12, (y0 - y90))
+        theta = deg_min + z * span
         if clamp:
-            theta = np.clip(theta, 0.0, 90.0)
+            lo, hi = min(deg_min, deg_max), max(deg_min, deg_max)
+            theta = np.clip(theta, lo, hi)
         return theta
 
-    
+    # ---------- poly-shaped inverse (optional nonlinear ADC→θ using the fitted shape) ----------
+    # inside class BallBearingData
+    def build_poly_inverse(self, grid_size: int = 1001, *, clip_z: bool = True, extrapolate: bool = False) -> None:
+        """
+        Build θ(z) from stored polynomial (c0,c1,c2) and anchors (y0,y90)
+        so we can map ADC→θ using the quadratic shape normalized to [0,1].
+        Stores an interpolator under self.calib["_theta_of_z"].
+        """
+        need = ("c0", "c1", "c2", "y0", "y90")
+        if not self.calib or any(np.isnan(self.calib.get(k, np.nan)) for k in need):
+            raise RuntimeError("Need c0,c1,c2 and y0,y90 in calib before building poly inverse.")
+
+        c0 = float(self.calib["c0"])
+        c1 = float(self.calib["c1"])
+        c2 = float(self.calib["c2"])
+        y0 = float(self.calib["y0"])  # ADC @ deg_min (0°)
+        y90 = float(self.calib["y90"])  # ADC @ deg_max (90°)
+
+        deg_min = float(self.calib.get("deg_min", 0.0))
+        deg_max = float(self.calib.get("deg_max", 90.0))
+
+        p = np.poly1d([c2, c1, c0])
+        theta_grid = np.linspace(deg_min, deg_max, grid_size)
+        y_curve = p(theta_grid)
+
+        # Normalize polynomial into z(θ) using external anchors
+        if y90 >= y0:
+            z_curve = (y_curve - y0) / max(1e-12, (y90 - y0))
+        else:
+            z_curve = (y0 - y_curve) / max(1e-12, (y0 - y90))
+
+        if clip_z:
+            z_curve = np.clip(z_curve, 0.0, 1.0)
+
+        # guard tiny non-monotonic wiggles
+        if not np.all(np.diff(z_curve) >= -1e-6):
+            z_curve = np.maximum.accumulate(z_curve)
+
+        z_unique, idx = np.unique(z_curve, return_index=True)
+        theta_unique = theta_grid[idx]
+        if z_unique.size < 2 or (z_unique[-1] - z_unique[0]) < 1e-6:
+            self.calib["_theta_of_z"] = None  # degenerate → fallback to linear
+            return
+
+        from scipy.interpolate import interp1d
+        inv = interp1d(
+            z_unique, theta_unique,
+            kind="linear",
+            bounds_error=False,
+            fill_value=("extrapolate" if extrapolate else (deg_min, deg_max)),
+            assume_sorted=True
+        )
+        self.calib["_theta_of_z"] = inv
+
+    def adc_to_theta_via_poly(self, adc_vals: np.ndarray, clamp: bool = True, clip_z: bool = True) -> np.ndarray:
+        if not self.calib or "y0" not in self.calib or "y90" not in self.calib:
+            raise RuntimeError("Calibration anchors missing. Set y0/y90 first.")
+        y0 = float(self.calib["y0"])
+        y90 = float(self.calib["y90"])
+        deg_min = float(self.calib.get("deg_min", 0.0))
+        deg_max = float(self.calib.get("deg_max", 90.0))
+        lo, hi = min(deg_min, deg_max), max(deg_min, deg_max)
+
+        adc_vals = np.asarray(adc_vals, float)
+        if y90 >= y0:
+            z = (adc_vals - y0) / max(1e-12, (y90 - y0))
+        else:
+            z = (y0 - adc_vals) / max(1e-12, (y0 - y90))
+        if clip_z:
+            z = np.clip(z, 0.0, 1.0)
+
+        inv = self.calib.get("_theta_of_z", None)
+        if inv is None:
+            theta = self._adc_to_theta_deg(adc_vals, clamp=False)  # linear fallback
+        else:
+            theta = inv(z)
+
+        if clamp:
+            theta = np.clip(theta, lo, hi)
+        return np.asarray(theta, float)
+
     # ---------- tall DF builder ----------
     def trials_to_tall_df(
-            self,
-            adc_trials: List[pd.DataFrame],
-            set_label: str,
-            trial_len_sec: float = 10.0,
-            adc_col: str = "adc_ch3",
-            time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
-            include_endpoint: bool = True,
-            clamp_theta: bool = False,  # <-- new: no clipping by default
+        self,
+        adc_trials: List[pd.DataFrame],
+        set_label: str,
+        trial_len_sec: float = 10.0,
+        adc_col: str = "adc_ch3",
+        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+        include_endpoint: bool = True,
+        clamp_theta: bool = False,
+        use_poly_inverse: bool = False,   # set True to use polynomial-shaped mapping
     ) -> pd.DataFrame:
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
@@ -347,8 +499,11 @@ class BallBearingData:
                 ts = pd.Series([np.nan] * n)
 
             adc_vals = pd.to_numeric(df[adc_use], errors="coerce").to_numpy(float)
-            # <-- key change: no clipping unless you ask for it
-            theta_deg = self._adc_to_theta_deg(adc_vals, clamp=clamp_theta)
+
+            if use_poly_inverse and self.calib.get("_theta_of_z", None) is not None:
+                theta_deg = self.adc_to_theta_via_poly(adc_vals, clamp=clamp_theta)
+            else:
+                theta_deg = self._adc_to_theta_deg(adc_vals, clamp=clamp_theta)
 
             parts.append(pd.DataFrame({
                 "set_label": set_label,
@@ -364,6 +519,7 @@ class BallBearingData:
 
         return pd.concat(parts, ignore_index=True)
 
+    # ---------- DLC3D / triggers / MAT loaders & aligners ----------
     def compute_dlc3d_angles_by_trial(
         self,
         dlc3d_trials: List[pd.DataFrame],
@@ -441,7 +597,6 @@ class BallBearingData:
         )
         return augmented, tall
 
-    # --- DLC3D header coercion ---
     @staticmethod
     def _coerce_dlc3d_multiindex(df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -560,18 +715,13 @@ class BallBearingData:
     ) -> List[pd.DataFrame]:
         """
         Append DLC angle columns (from compute_dlc3d_angles_by_trial) to each camera ts_* DataFrame.
-
-        Per trial:
-          • If lengths match: index-wise join (fast path).
-          • Else if both sides have a time column: merge_asof on coerced seconds.
-          • Else: nearest join on frame index.
         """
         out: List[pd.DataFrame] = []
 
         def _pick_cam_time(df: pd.DataFrame) -> Optional[str]:
             if cam_time_col and cam_time_col in df.columns:
                 return cam_time_col
-            cands = [c for c in df.columns if str(c).lower().startswith(cam_time_prefix)]
+            cands = [c for c in df.columns if str(c).lower().startsWith(cam_time_prefix)]
             return cands[0] if cands else None
 
         def _find_dlc_time_col(df: pd.DataFrame):
@@ -625,10 +775,10 @@ class BallBearingData:
                 left = cam_df[[cam_col]].copy()
                 right = dlc_df[[dlc_tcol]].copy()
 
-                left["_t"]     = self._coerce_time_series_numeric_seconds(left[cam_col])
+                left["_t"]      = self._coerce_time_series_numeric_seconds(left[cam_col])
                 right["_t_enc"] = self._coerce_time_series_numeric_seconds(right[dlc_tcol])
 
-                left  = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
+                left  = left.dropna(subset=["._t" if False else "_t"]).sort_values("_t").reset_index(drop=False)
                 right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
 
                 right = right.join(dlc_metrics.reset_index(drop=True))
@@ -947,11 +1097,9 @@ class BallBearingData:
         """
         Align per-trial angle-converted ADC (θ_pred from self.calib) to camera timestamps.
         """
-        # 1) Safety: need calibration first
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) before aligning.")
 
-        # 2) Build θ-from-ADC tables per trial
         theta_trials = self._theta_trials_from_adc(
             adc_trials,
             trial_len_sec=trial_len_sec,
@@ -1166,6 +1314,7 @@ class BallBearingData:
         first  = self.align_adc_to_cam_for_set(adc_trials_first,  cam_trials_first,  **kwargs)
         second = self.align_adc_to_cam_for_set(adc_trials_second, cam_trials_second, **kwargs)
         return first, second
+
 
 
 
