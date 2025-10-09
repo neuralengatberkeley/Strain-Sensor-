@@ -1417,15 +1417,33 @@ class DLC3DBendAngles:
         return B - A
 
     @staticmethod
-    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-        """Row-wise angle (deg) via dot product."""
+    def angle_from_vectors(v1: np.ndarray, v2: np.ndarray, signed=False, ref=np.array([0,0,1])) -> np.ndarray:
+        """Row-wise angle (deg) between 3D vectors.
+        Parameters
+        ----------
+        v1, v2 : np.ndarray
+            Shape (N, 3), arrays of 3D vectors.
+        ref : np.ndarray
+            Reference axis (default z-axis). Defines the orientation
+            for positive vs negative angles.
+        """
         n1 = np.linalg.norm(v1, axis=1)
         n2 = np.linalg.norm(v2, axis=1)
         denom = n1 * n2
+
+        if v1.shape != v2.shape or v1.shape[1] != 3:
+            raise ValueError("Inputs must be of shape (N, 3)")
         with np.errstate(invalid="ignore", divide="ignore"):
             cosang = np.sum(v1 * v2, axis=1) / denom
         cosang = np.clip(cosang, -1.0, 1.0)
         ang = np.degrees(np.arccos(cosang))
+
+        if signed:
+            # Determine sign using reference axis
+            cross = np.cross(v1, v2)                # (N, 3)
+            sign = np.sign(cross @ ref)  # projection on ref axis
+            ang *= sign
+
         ang[~np.isfinite(ang)] = np.nan
         return ang
 
