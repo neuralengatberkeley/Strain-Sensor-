@@ -22,6 +22,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn import preprocessing
+from sklearn.linear_model import LinearRegression
 
 # Local
 from config import path_to_repository
@@ -38,13 +39,6 @@ from typing import List, Tuple, Dict, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Sequence, Union
-import numpy as np
-import pandas as pd
-
-# Assuming DLC3DBendAngles and bender_class live elsewhere in your codebase
-# from your_module import DLC3DBendAngles
 
 class BallBearingData:
     """
@@ -68,8 +62,7 @@ class BallBearingData:
         self._second_set: List[Path] = []
 
         # calibration state
-        # keys: {c0,c1,c2,y0,y90,deg_min,deg_max,source,"_theta_of_z"}
-        self.calib: Dict[str, float] = {}
+        self.calib: Dict[str, float] = {}   # {c0,c1,c2,y0,y90,source}
 
     # ---------- file system helpers ----------
     @staticmethod
@@ -189,6 +182,179 @@ class BallBearingData:
             out.append(df if df is not None else pd.DataFrame())
         return out
 
+    def compare_block_quadratic_vs_angle(
+            self,
+            *,
+            h_cal_path_first,
+            ranges_first: list[tuple[int, int]],
+            h_cal_path_second,
+            ranges_second: list[tuple[int, int]],
+            angles: list[float],
+            adc_col: str = "adc_ch3",
+            max_points_per_range: int | None = None,
+            figsize=(9.5, 5.0),
+            jitter: float = 0.25,
+            scatter_alpha: float = 0.35,
+            scatter_size: float = 8,
+            color_first: str = "red",
+            color_second: str = "C0",
+            ax=None,
+            show: bool = True,
+    ):
+        """
+        Build ADC-vs-ANGLE datasets from row-index windows, do quadratic fits for two block
+        calibrations, and plot both (first=red, second=blue).
+
+        Parameters
+        ----------
+        h_cal_path_first, h_cal_path_second : str | Path | array-like | pd.Series
+            CSV path containing `adc_col`, or raw ADC series/array.
+        ranges_first, ranges_second : list[(start, end)]
+            One window per angle; len(ranges_*) must equal len(angles). end is exclusive.
+        angles : list[float]
+            Angles corresponding to each (start, end) window, e.g., [0, 22.5, 45, 67.5, 90].
+        adc_col : str
+            ADC column name when loading from CSV.
+        max_points_per_range : int | None
+            If set, keeps the flattest consecutive window of this many points inside each range.
+        """
+
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        from pathlib import Path
+
+        # ---- helpers ----
+        def _load_adc_series(src):
+            if isinstance(src, (list, tuple, np.ndarray, pd.Series)):
+                s = pd.Series(src, dtype="float64")
+                return pd.to_numeric(s, errors="coerce")
+            if isinstance(src, (str, Path)):
+                p = Path(src)
+                if not p.exists():
+                    raise FileNotFoundError(f"CSV not found: {p}")
+                df = self._read_csv_safe(p)
+                if df is None or df.empty:
+                    raise ValueError(f"Empty/unreadable CSV: {p}")
+                col = adc_col if adc_col in df.columns else next(
+                    (c for c in df.columns if str(c).lower().startswith("adc")), None
+                )
+                if col is None:
+                    raise KeyError(f"No ADC-like column in {p.name}")
+                return pd.to_numeric(df[col], errors="coerce")
+            return pd.to_numeric(pd.Series(src), errors="coerce")
+
+        def _flattest_window(vals: np.ndarray, k: int) -> np.ndarray:
+            if k is None or vals.size <= (k or 0):
+                return vals
+            k = int(k)
+            if k < 1 or vals.size <= k:
+                return vals
+            c1 = np.concatenate(([0.0], np.cumsum(vals)))
+            c2 = np.concatenate(([0.0], np.cumsum(vals * vals)))
+            sum_y = c1[k:] - c1[:-k]
+            sum_y2 = c2[k:] - c2[:-k]
+            mean_y = sum_y / k
+            var_y = np.maximum(sum_y2 / k - mean_y ** 2, 0.0)
+            i0 = int(np.argmin(var_y))
+            return vals[i0:i0 + k]
+
+        def _build_angle_adc_table(y_series: pd.Series, win_list: list[tuple[int, int]],
+                                   angs: list[float]) -> pd.DataFrame:
+            if len(win_list) != len(angs):
+                raise ValueError("ranges length must equal angles length.")
+            y = pd.to_numeric(pd.Series(y_series), errors="coerce").to_numpy(float)
+            n = len(y)
+            parts = []
+            for (start, end), ang in zip(win_list, angs):
+                start = int(max(0, start));
+                end = int(min(n, end))
+                if end <= start:
+                    continue
+                vals = y[start:end]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                if max_points_per_range is not None and vals.size > max_points_per_range:
+                    vals = _flattest_window(vals, int(max_points_per_range))
+                parts.append(pd.DataFrame({"angle": float(ang), "adc": vals}))
+            return (pd.concat(parts, ignore_index=True)
+                    if parts else pd.DataFrame(columns=["angle", "adc"]))
+
+        def _quad_fit_xy(x: np.ndarray, y: np.ndarray):
+            uniq = np.unique(x[np.isfinite(x)])
+            if x.size < 3 or uniq.size < 3:
+                return np.nan, np.nan, np.nan, np.nan
+            c2, c1, c0 = np.polyfit(x, y, deg=2)
+            yhat = c0 + c1 * x + c2 * (x ** 2)
+            ss_res = np.sum((y - yhat) ** 2)
+            ss_tot = np.sum((y - np.nanmean(y)) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+            return float(c0), float(c1), float(c2), float(r2)
+
+        # ---- load data & make tables ----
+        y_first = _load_adc_series(h_cal_path_first)
+        y_second = _load_adc_series(h_cal_path_second)
+
+        df_first = _build_angle_adc_table(y_first, ranges_first, angles)
+        df_second = _build_angle_adc_table(y_second, ranges_second, angles)
+
+        x1 = df_first["angle"].to_numpy(float) if not df_first.empty else np.array([])
+        y1 = df_first["adc"].to_numpy(float) if not df_first.empty else np.array([])
+        x2 = df_second["angle"].to_numpy(float) if not df_second.empty else np.array([])
+        y2 = df_second["adc"].to_numpy(float) if not df_second.empty else np.array([])
+
+        c0_1, c1_1, c2_1, r2_1 = _quad_fit_xy(x1, y1)
+        c0_2, c1_2, c2_2, r2_2 = _quad_fit_xy(x2, y2)
+
+        # ---- plot ----
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        # jittered scatter per angle
+        def _scatter_by_angle(df, color, label):
+            if df.empty:
+                return
+            rng = np.random.default_rng(12345)
+            for ang in sorted(set(df["angle"].astype(float))):
+                ys = df.loc[df["angle"] == ang, "adc"].to_numpy(float)
+                if ys.size:
+                    xs = ang + rng.uniform(-jitter, jitter, size=ys.size)
+                    ax.scatter(xs, ys, s=scatter_size, alpha=scatter_alpha, color=color, label=None)
+            # tiny transparent handle for legend consistency
+            ax.scatter([], [], color=color, alpha=scatter_alpha, s=scatter_size, label=label)
+
+        _scatter_by_angle(df_first, color_first, "First (raw)")
+        _scatter_by_angle(df_second, color_second, "Second (raw)")
+
+        if len(angles) >= 2:
+            xx = np.linspace(min(angles), max(angles), 400)
+            if np.isfinite([c0_1, c1_1, c2_1]).all():
+                ax.plot(xx, c0_1 + c1_1 * xx + c2_1 * (xx ** 2),
+                        color=color_first, linewidth=2.0, label=f"First fit (R²={r2_1:.4f})")
+            if np.isfinite([c0_2, c1_2, c2_2]).all():
+                ax.plot(xx, c0_2 + c1_2 * xx + c2_2 * (xx ** 2),
+                        color=color_second, linewidth=2.0, label=f"Second fit (R²={r2_2:.4f})")
+
+        ax.set_xlabel("Angle (deg)")
+        ax.set_ylabel(adc_col if isinstance(h_cal_path_first, (str, Path)) else "adc_ch3 (raw)")
+        ax.set_title("Quadratic fit: ADC vs Angle — First (red) vs Second (blue)")
+        ax.grid(alpha=0.25)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        if show:
+            plt.show()
+
+        return {
+            "first": {"c0": c0_1, "c1": c1_1, "c2": c2_1, "r2": r2_1, "n": int(y1.size)},
+            "second": {"c0": c0_2, "c1": c1_2, "c2": c2_2, "r2": r2_2, "n": int(y2.size)},
+            "df_first": df_first,
+            "df_second": df_second,
+            "fig": fig, "ax": ax,
+        }
+
     # Specific extractors
     def extract_adc_dfs_by_trial(self, trial_folders):
         return self._extract_by_glob(trial_folders, ["data_adc*.csv", "data_adc*"])
@@ -202,15 +368,507 @@ class BallBearingData:
     def extract_rotenc_dfs_by_trial(self, trial_folders):
         return self._extract_by_glob(trial_folders, ["data_rotenc*.csv", "data_rotenc*"])
 
-    def extract_dlc3d_dfs_by_trial(
-        self,
-        trial_folders: List[str],
-        patterns: Tuple[str, ...] = ("data_DLC3D*.csv", "DLC3D*.csv", "*dlc3d*.csv"),
-    ) -> List[pd.DataFrame]:
-        """Find per-trial DLC3D CSV(s); returns one DataFrame per trial."""
-        return self._extract_by_glob(trial_folders, pattern=list(patterns))
+    # --- add inside class BallBearingData ---
 
-    # ---------- calibration ----------
+    def extract_dlc3d_dfs_by_trial(
+            self,
+            trial_folders: list[str] | list[Path],
+            file_patterns: tuple[str, ...] = (
+                    "*DLC*.csv", "*DLC3D*.csv", "*dlc3d*.csv", "*3d*.csv", "*3D*.csv"
+            ),
+    ) -> list[pd.DataFrame]:
+        """
+        Find DLC 3D csv per trial folder. Picks the largest matching csv in each folder (or nested).
+        Returns a list of DataFrames (already coerced to MultiIndex if possible).
+        """
+        out: list[pd.DataFrame] = []
+        for folder in trial_folders:
+            fp = Path(folder)
+
+            # find candidates
+            cands: list[Path] = []
+            for pat in file_patterns:
+                cands.extend([p for p in fp.glob(pat) if not self._is_bad_dot_underscore(p)])
+            if not cands:
+                for pat in file_patterns:
+                    cands.extend([p for p in fp.rglob(pat) if not self._is_bad_dot_underscore(p)])
+
+            if not cands:
+                out.append(pd.DataFrame());
+                continue
+
+            # prefer largest file (full export)
+            cands = sorted(set(cands), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            df0 = self._read_csv_safe(cands[0])
+            if df0 is None or df0.empty:
+                out.append(pd.DataFrame());
+                continue
+
+            # normalize to MultiIndex if it looks like a flat DLC export
+            try:
+                df_coerced = self._coerce_dlc3d_multiindex(df0)
+            except Exception:
+                df_coerced = df0
+
+            out.append(df_coerced)
+        return out
+
+    def calibrate_from_pairs_and_stream(
+            self,
+            angle_adc_df: pd.DataFrame,
+            *,
+            adc_trials_first: list[pd.DataFrame] | None = None,
+            adc_trials_second: list[pd.DataFrame] | None = None,
+            adc_col_pairs: str = "adc_ch3",
+            enc_col_pairs: str = "angle",
+            # how many trials to stack for the external stream (first set)
+            stack_limit: int = 15,
+            # robust external anchors from quantiles of the stream
+            q_hi: float = 0.999,  # maps to 0° (y0)
+            q_lo: float = 0.001,  # maps to 90° (y90)
+            # inversion config
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
+            clip_z: bool = True,
+            extrapolate: bool = False,
+            # tall-table config
+            set_label_first: str = "first",
+            set_label_second: str = "second",
+            trial_len_sec: float = 10.0,
+            clamp_theta: bool = True,
+            verbose: bool = True,
+    ) -> dict:
+        """
+        Convenience orchestrator:
+          1) Fit quadratic (c0,c1,c2) on labeled angle–ADC pairs WITHOUT setting anchors.
+          2) Build an external ADC stream from adc_trials_first (or fall back to pairs).
+          3) Compute robust anchors (y0,y90) from stream quantiles and update self.calib.
+          4) Build quadratic inverse (ADC→θ).
+          5) Produce tall θ tables for first/second sets, with OOB flags against anchors.
+
+        Returns dict with:
+          {
+            'anchors': {'y0':..., 'y90':..., 'source':...},
+            'theta_first': <DataFrame>,
+            'theta_second': <DataFrame>,
+            'theta_all': <DataFrame>,
+            'oob_counts': {'first': {'over_hi': int, 'under_lo': int},
+                           'second': {'over_hi': int, 'under_lo': int}}
+          }
+        """
+        import numpy as _np
+        import pandas as _pd
+
+        # -------- 1) Fit only the shape on labeled pairs --------
+        if verbose:
+            print("[cal] fitting quadratic (shape only) on labeled pairs…")
+        if enc_col_pairs not in angle_adc_df.columns:
+            raise KeyError(f"enc_col_pairs '{enc_col_pairs}' missing from angle_adc_df")
+        if adc_col_pairs not in angle_adc_df.columns:
+            # permissive fallback: pick first 'adc*' column
+            cand = next((c for c in angle_adc_df.columns if str(c).lower().startswith("adc")), None)
+            if cand is None:
+                raise KeyError(f"adc_col_pairs '{adc_col_pairs}' missing and no 'adc*' fallback found.")
+            adc_col_pairs = cand
+
+        angle_adc_local = angle_adc_df[[enc_col_pairs, adc_col_pairs]].rename(
+            columns={enc_col_pairs: "angle", adc_col_pairs: "adc"}
+        ).copy()
+        angle_adc_local["angle"] = _pd.to_numeric(angle_adc_local["angle"], errors="coerce")
+        angle_adc_local["adc"] = _pd.to_numeric(angle_adc_local["adc"], errors="coerce")
+        angle_adc_local = angle_adc_local.dropna()
+        # restrict to [0,90] with a forgiving widen-then-clip if sparse
+        m = angle_adc_local["angle"].between(0.0, 90.0)
+        if m.sum() < 5:
+            m = angle_adc_local["angle"].between(-5.0, 95.0)
+        angle_adc_local = angle_adc_local.loc[m].copy()
+        angle_adc_local["angle"] = angle_adc_local["angle"].clip(deg_min, deg_max)
+
+        # Fit quadratic + set calib c0,c1,c2; DO NOT set y0,y90 yet
+        self.fit_and_set_calibration(
+            angle_adc_local.rename(columns={"angle": "angle", "adc": adc_col_pairs}),
+            angle_col="angle",
+            adc_col=adc_col_pairs,
+            robust=True,
+            anchors_source="fit_only",
+            deg_min=deg_min,
+            deg_max=deg_max,
+        )
+        if verbose:
+            print(f"[cal] calib (shape): c0={self.calib.get('c0'):.6g}, "
+                  f"c1={self.calib.get('c1'):.6g}, c2={self.calib.get('c2'):.6g}")
+
+        # -------- 2) Build an external ADC stream (prefer first-set trials) --------
+        def _stack_adc(trials, limit=15, adc_col="adc_ch3"):
+            parts = []
+            for df in trials[:limit]:
+                if df is None or df.empty:
+                    continue
+                col = adc_col if adc_col in df.columns else next(
+                    (c for c in df.columns if str(c).lower().startswith("adc")), None
+                )
+                if col is None:
+                    continue
+                parts.append(_pd.to_numeric(df[col], errors="coerce"))
+            return _pd.concat(parts, ignore_index=True) if parts else _pd.Series(dtype=float)
+
+        if verbose:
+            print("[cal] building external ADC stream for robust anchors…")
+        adc_series_calib = _pd.Series(dtype=float)
+        if isinstance(adc_trials_first, (list, tuple)) and len(adc_trials_first) > 0:
+            adc_series_calib = _stack_adc(adc_trials_first, limit=stack_limit, adc_col="adc_ch3")
+
+        if adc_series_calib.empty:
+            # fallback: use the pairs table
+            base_adc_col = adc_col_pairs if adc_col_pairs in angle_adc_df.columns else next(
+                (c for c in angle_adc_df.columns if str(c).lower().startswith("adc")), None
+            )
+            if base_adc_col is None:
+                raise KeyError("No ADC column available in angle_adc_df for fallback.")
+            adc_series_calib = _pd.to_numeric(angle_adc_df[base_adc_col], errors="coerce").dropna()
+
+        y_raw = _np.asarray(adc_series_calib, float)
+        y0 = float(_np.nanquantile(y_raw, q_hi))  # near-maximum -> maps to 0°
+        y90 = float(_np.nanquantile(y_raw, q_lo))  # near-minimum -> maps to 90°
+        self.calib.update(y0=y0, y90=y90, source="fit+external_minmax")
+        if verbose:
+            print(f"[cal] anchors from stream: y0={y0:.6g} (q={q_hi}), y90={y90:.6g} (q={q_lo})")
+
+        # -------- 3) Build inverse (ADC→θ) --------
+        self.build_poly_inverse(clip_z=clip_z, extrapolate=extrapolate, deg_min=deg_min, deg_max=deg_max)
+
+        # -------- 4) Tall θ tables for first & second sets --------
+        if verbose:
+            print("[cal] building tall θ tables (use_poly_inverse=True)…")
+        theta_first = self.trials_to_tall_df(
+            adc_trials_first if isinstance(adc_trials_first, (list, tuple)) else [],
+            set_label=set_label_first,
+            trial_len_sec=trial_len_sec,
+            use_poly_inverse=True,
+            clamp_theta=clamp_theta,
+        ) if adc_trials_first else _pd.DataFrame(
+            columns=["set_label", "trial", "time_s", "timestamp", "theta_pred_deg", "adc_ch3"])
+
+        theta_second = self.trials_to_tall_df(
+            adc_trials_second if isinstance(adc_trials_second, (list, tuple)) else [],
+            set_label=set_label_second,
+            trial_len_sec=trial_len_sec,
+            use_poly_inverse=True,
+            clamp_theta=clamp_theta,
+        ) if adc_trials_second else _pd.DataFrame(
+            columns=["set_label", "trial", "time_s", "timestamp", "theta_pred_deg", "adc_ch3"])
+
+        # -------- 5) OOB flags v. anchors --------
+        lo, hi = (y90, y0) if y90 < y0 else (y0, y90)
+
+        def _flag_oob(adc_array):
+            adc = _np.asarray(adc_array, float)
+            over = adc > hi
+            under = adc < lo
+            return _pd.DataFrame({
+                "adc_raw": adc,
+                "oob_over_hi": over,
+                "oob_under_lo": under,
+                "oob_margin": _np.where(over, adc - hi, _np.where(under, lo - adc, 0.0)),
+            })
+
+        def _attach_flags(df):
+            if df.empty:
+                return df
+            if "adc_ch3" not in df.columns:
+                # permissive fallback to any 'adc*' col
+                cand = next((c for c in df.columns if str(c).lower().startswith("adc")), None)
+                if cand is None:
+                    return df
+                adc_col_use = cand
+            else:
+                adc_col_use = "adc_ch3"
+            vals = _pd.to_numeric(df[adc_col_use], errors="coerce")
+            flags = _flag_oob(vals)
+            return _pd.concat([df.reset_index(drop=True), flags], axis=1)
+
+        theta_first_f = _attach_flags(theta_first)
+        theta_second_f = _attach_flags(theta_second)
+        theta_all = _pd.concat([theta_first_f, theta_second_f],
+                               ignore_index=True) if not theta_first_f.empty or not theta_second_f.empty else _pd.DataFrame()
+
+        oob_counts = {
+            "first": {
+                "over_hi": int(theta_first_f["oob_over_hi"].sum()) if not theta_first_f.empty else 0,
+                "under_lo": int(theta_first_f["oob_under_lo"].sum()) if not theta_first_f.empty else 0,
+            },
+            "second": {
+                "over_hi": int(theta_second_f["oob_over_hi"].sum()) if not theta_second_f.empty else 0,
+                "under_lo": int(theta_second_f["oob_under_lo"].sum()) if not theta_second_f.empty else 0,
+            },
+        }
+        if verbose:
+            print(f"OOB counts: first(over={oob_counts['first']['over_hi']}, under={oob_counts['first']['under_lo']}), "
+                  f"second(over={oob_counts['second']['over_hi']}, under={oob_counts['second']['under_lo']})")
+
+        # quick θ range sanity
+        for name, df in [("first", theta_first_f), ("second", theta_second_f)]:
+            if df.empty or "theta_pred_deg" not in df.columns:
+                continue
+            s = _pd.to_numeric(df["theta_pred_deg"], errors="coerce")
+            if s.notna().any() and verbose:
+                print(f"[{name}] θ_pred (deg): min..max {float(_np.nanmin(s)):.3f} .. "
+                      f"{float(_np.nanmax(s)):.3f} (median {float(_np.nanmedian(s)):.3f}) n={int(s.notna().sum())}")
+
+        return {
+            "anchors": {"y0": y0, "y90": y90, "source": "fit+external_minmax"},
+            "theta_first": theta_first_f,
+            "theta_second": theta_second_f,
+            "theta_all": theta_all,
+            "oob_counts": oob_counts,
+        }
+
+    def extract_calib_means_by_set(
+            self,
+            *,
+            adc_col_preferred: str = "adc_ch3",
+            file_patterns: tuple[str, ...] = ("data_adc*.csv", "data_adc*"),
+            angles_expected: tuple[float, ...] = (0.0, 22.5, 45.0, 67.5, 90.0),
+            exclude_name_contains: tuple[str, ...] = ("C_Block",),
+            exclude_sets: tuple[object, ...] = (),  # e.g., (3, 4) or ("3rd","fourth","set3")
+            make_plot: bool = False,
+            overlay_mean: bool = False,
+            point_alpha: float = 0.25,
+            point_size: float = 10,
+            jitter: float = 0.25,
+            ax=None,
+    ) -> pd.DataFrame:
+        """
+        Find folders whose names contain 'calib' immediately followed by an angle number.
+        Accepts calib0, calib22, calib22.5/22p5/22-5/22_5, calib67.5, calib90 (etc.).
+        Returns tidy DataFrame with columns:
+            ['set_label','set_idx','angle_deg','mean_adc','n','folder','adc_col'].
+
+        If make_plot=True, scatters all points and (optionally) overlays per-set means.
+        """
+        import re as _re
+        import numpy as _np
+        import pandas as _pd
+        from pathlib import Path as _Path
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
+
+        angles_set = set(float(a) for a in angles_expected)
+
+        # -------- parsing helpers (no regex needed) --------
+        def _parse_after_calib_token(name: str):
+            s = name.lower()
+            k = s.find("calib")
+            if k < 0:
+                return None, None
+            i = k + 5  # start after 'calib'
+            n = len(s)
+
+            # read integer part
+            start = i
+            while i < n and s[i].isdigit():
+                i += 1
+            if i == start:  # no digits after 'calib'
+                return None, None
+
+            whole = int(s[start:i])
+
+            # optional fractional part
+            frac = None
+            if i < n and s[i] in ('.', 'p', '-', '_'):
+                i += 1
+                start2 = i
+                while i < n and s[i].isdigit():
+                    i += 1
+                if i > start2:
+                    frac = int(s[start2:i])
+
+            return whole, frac
+
+        def _angle_from_tokens(whole: int, frac: int | None) -> float | None:
+            if frac is not None:
+                scale = 10.0 if frac < 10 else (100.0 if frac < 100 else 1.0)
+                val = float(whole) + (float(frac) / scale)
+                return val if val in angles_set else None
+
+            if float(whole) in angles_set:
+                return float(whole)
+            if (float(whole) + 0.5) in angles_set and (float(whole) not in angles_set):
+                return float(whole) + 0.5
+            return None
+
+        # -------- collect candidate folders --------
+        def _has_calib_token(p: _Path) -> bool:
+            return "calib" in p.name.lower()
+
+        cands = [p for p in self.root_dir.glob("*") if p.is_dir() and _has_calib_token(p)]
+        if not cands:
+            cands = [p for p in self.root_dir.rglob("*") if p.is_dir() and _has_calib_token(p)]
+
+        # Exclude blocked substrings (case-insensitive)
+        if exclude_name_contains:
+            bad_l = tuple(s.lower() for s in exclude_name_contains)
+            cands = [p for p in cands if all(b not in p.name.lower() for b in bad_l)]
+
+        if not cands:
+            print("[extract_calib_means_by_set] No calib folders found after exclusions.")
+            return _pd.DataFrame(columns=["set_label", "set_idx", "angle_deg", "mean_adc", "n", "folder", "adc_col"])
+
+        cands = sorted(set(cands), key=lambda p: p.name)
+
+        rows_summary = []
+        rows_points = []  # store every individual adc value
+
+        for folder in cands:
+            tok = _parse_after_calib_token(folder.name)
+            if tok is None:
+                continue
+            whole, frac = tok
+            ang = _angle_from_tokens(whole, frac)
+            if ang is None:
+                continue
+
+            # pick largest data_adc*.csv
+            adc_files = []
+            for pat in file_patterns:
+                adc_files.extend([p for p in folder.glob(pat) if not self._is_bad_dot_underscore(p)])
+            if not adc_files:
+                for pat in file_patterns:
+                    adc_files.extend([p for p in folder.rglob(pat) if not self._is_bad_dot_underscore(p)])
+            if not adc_files:
+                print(f"[WARN] No ADC CSVs in calib folder: {folder}")
+                continue
+
+            adc_files = sorted(
+                set(adc_files),
+                key=lambda p: p.stat().st_size if p.exists() else 0,
+                reverse=True
+            )
+            df0 = self._read_csv_safe(adc_files[0])
+            if df0 is None or df0.empty:
+                print(f"[WARN] Unreadable/empty ADC CSV in calib folder: {folder}")
+                continue
+
+            # choose ADC column
+            adc_col = adc_col_preferred if adc_col_preferred in df0.columns else None
+            if adc_col is None:
+                adc_like = [c for c in df0.columns if str(c).lower().startswith("adc")]
+                if not adc_like:
+                    print(f"[WARN] No ADC-like columns in {adc_files[0].name}")
+                    continue
+                adc_col = adc_like[0]
+
+            vals = _pd.to_numeric(df0[adc_col], errors="coerce").to_numpy(float)
+            vals = vals[_np.isfinite(vals)]
+            if vals.size == 0:
+                print(f"[WARN] All-NaN ADC in {adc_files[0].name}")
+                continue
+
+            # summary row
+            rows_summary.append(dict(angle_deg=float(ang),
+                                     mean_adc=float(_np.nanmean(vals)),
+                                     n=int(vals.size),
+                                     folder=str(folder),
+                                     adc_col=str(adc_col)))
+
+            # point rows
+            for v in vals:
+                rows_points.append(dict(angle_deg=float(ang),
+                                        adc_val=float(v),
+                                        folder=str(folder),
+                                        adc_col=str(adc_col)))
+
+        if not rows_summary:
+            return _pd.DataFrame(columns=["set_label", "set_idx", "angle_deg", "mean_adc", "n", "folder", "adc_col"])
+
+        import pandas as _pd
+        df = _pd.DataFrame(rows_summary).sort_values(["folder", "angle_deg"]).reset_index(drop=True)
+        df_pts = _pd.DataFrame(rows_points).sort_values(["folder", "angle_deg"]).reset_index(drop=True)
+
+        # Assign set indices/labels by blocks of k in sorted order
+        k = len(angles_expected)
+        set_idx = [(i // k) + 1 for i in range(len(df))]  # 1-based
+        df["set_idx"] = set_idx
+
+        def _label_for(idx: int) -> str:
+            return "first" if idx == 1 else ("second" if idx == 2 else f"set{idx}")
+
+        df["set_label"] = [_label_for(i) for i in df["set_idx"]]
+
+        # Map same set info onto point table
+        df["_block_key"] = list(zip(df["folder"], df["angle_deg"].astype(float)))
+        df_pts["_block_key"] = list(zip(df_pts["folder"], df_pts["angle_deg"].astype(float)))
+        df_pts = df_pts.merge(
+            df[["_block_key", "set_idx", "set_label"]],
+            on="_block_key",
+            how="left"
+        ).drop(columns=["_block_key"])
+
+        # Exclude sets if requested
+        import re as _re
+        def _parse_set_token(tok) -> int | None:
+            if isinstance(tok, int):
+                return tok
+            s = str(tok).strip().lower()
+            named = {
+                "first": 1, "1st": 1,
+                "second": 2, "2nd": 2,
+                "third": 3, "3rd": 3,
+                "fourth": 4, "4th": 4,
+                "fifth": 5, "5th": 5,
+            }
+            if s in named:
+                return named[s]
+            m = _re.match(r"^(?:set)?\s*(\d+)(?:st|nd|rd|th)?$", s)
+            if m:
+                return int(m.group(1))
+            return None
+
+        if exclude_sets:
+            bad_idxs = {i for i in (_parse_set_token(t) for t in exclude_sets) if i is not None}
+            if bad_idxs:
+                df = df[~df["set_idx"].isin(bad_idxs)].reset_index(drop=True)
+                df_pts = df_pts[~df_pts["set_idx"].isin(bad_idxs)].reset_index(drop=True)
+
+        # Order columns & angle category
+        if df.empty:
+            return _pd.DataFrame(columns=["set_label", "set_idx", "angle_deg", "mean_adc", "n", "folder", "adc_col"])
+
+        df["angle_deg"] = _pd.Categorical(df["angle_deg"], categories=list(angles_expected), ordered=True)
+        df = df.sort_values(["set_idx", "angle_deg"]).reset_index(drop=True)
+
+        # ---------- PLOTTING ----------
+        if make_plot and not df_pts.empty:
+            import numpy as _np
+            import matplotlib.pyplot as plt
+            if ax is None:
+                _, ax = plt.subplots(figsize=(6, 4))
+
+            angle_to_x = {float(a): float(a) for a in angles_expected}
+
+            for (idx, lbl), sub_pts in df_pts.groupby(["set_idx", "set_label"], sort=False):
+                x = sub_pts["angle_deg"].astype(float).map(angle_to_x).to_numpy()
+                x = x + _np.random.uniform(-jitter, jitter, size=x.size)
+                ax.scatter(x, sub_pts["adc_val"].to_numpy(), s=point_size, alpha=point_alpha, label=None)
+
+                if overlay_mean:
+                    sub_mean = (
+                        sub_pts.groupby("angle_deg", sort=False)["adc_val"]
+                        .mean()
+                        .reset_index()
+                    )
+                    ax.plot(sub_mean["angle_deg"].astype(float), sub_mean["adc_val"], lw=1.0, label=str(lbl))
+
+            ax.set_xlabel("Angle (deg)")
+            ax.set_ylabel("ADC")
+            ax.set_title("Calibration samples (ADC vs angle)")
+            ax.grid(alpha=0.25)
+            if overlay_mean:
+                ax.legend(title="Set")
+
+        return df
+
     @staticmethod
     def _polyfit_quadratic(x: np.ndarray, y: np.ndarray, robust: bool) -> Tuple[float, float, float]:
         x = np.asarray(x, float).reshape(-1)
@@ -235,90 +893,36 @@ class BallBearingData:
             w = np.where(np.abs(r) <= k, 1.0, k / (np.abs(r) + 1e-12))
         return float(beta[0]), float(beta[1]), float(beta[2])
 
-    def set_calibration_from_adc_minmax(
-        self,
-        adc: Union[pd.Series, np.ndarray],
-        *,
-        deg_min: float = 0.0,
-        deg_max: float = 90.0,
-        robust: bool = True,
-        lo_q: float = 0.005,
-        hi_q: float = 0.995,
-    ) -> Dict[str, float]:
-        """
-        Set calibration using only an ADC series:
-          - near-max ADC -> deg_min (0°)
-          - near-min ADC -> deg_max (90°)
-        Optionally robustify by using quantiles to ignore spikes.
-        """
-        a = np.asarray(adc, float).reshape(-1)
-        a = a[np.isfinite(a)]
-        if a.size == 0:
-            raise ValueError("No finite ADC values provided.")
-
-        if robust:
-            y0  = float(np.nanquantile(a, hi_q))  # 0° anchor
-            y90 = float(np.nanquantile(a, lo_q))  # 90° anchor
-        else:
-            y0, y90 = float(np.nanmax(a)), float(np.nanmin(a))
-
-        self.calib = dict(
-            c0=np.nan, c1=np.nan, c2=np.nan,
-            y0=y0, y90=y90,
-            deg_min=float(deg_min), deg_max=float(deg_max),
-            source="adc_minmax",
-        )
-        # clear any previous inverse
-        self.calib["_theta_of_z"] = None
-
-        return dict(
-            anchors_source="adc_minmax",
-            y0_emp=y0, y90_emp=y90,
-            c0=np.nan, c1=np.nan, c2=np.nan, r2=np.nan,
-            deg_min=deg_min, deg_max=deg_max,
-        )
-
     def fit_and_set_calibration(
-        self,
-        angle_adc_df: pd.DataFrame,
-        angle_col: str = "angle",
-        adc_col: str = "adc_ch3",
-        robust: bool = True,
-        anchors_source: str = "fit_only",  # 'fit_only' | 'empirical' | 'empirical_minmax'
-        deg_min: float = 0.0,
-        deg_max: float = 90.0,
+            self,
+            angle_adc_df: pd.DataFrame,
+            angle_col: str = "angle",
+            adc_col: str = "adc_ch3",
+            robust: bool = True,
+            anchors_source: str = "fit_only",  # 'fit_only' | 'empirical' | 'empirical_minmax'
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
     ) -> Dict[str, float]:
-        """
-        Fit a quadratic ADC vs angle (for diagnostics/shape), and set y0/y90 anchors
-        according to anchors_source. Mapping ADC→θ is still linear between y0/y90
-        unless you explicitly use the poly inverse helpers.
-        """
         x = angle_adc_df[angle_col].to_numpy(float)
         y = angle_adc_df[adc_col].to_numpy(float)
         c0, c1, c2 = self._polyfit_quadratic(x, y, robust=robust)
         p = np.poly1d([c2, c1, c0])
 
         if anchors_source == "empirical_minmax":
-            y0 = float(np.nanmax(y))   # ADC at deg_min
-            y90 = float(np.nanmin(y))  # ADC at deg_max
+            # Map max ADC -> 0°, min ADC -> 90°
+            y0 = float(np.nanmax(y))   # ADC at 0°
+            y90 = float(np.nanmin(y))  # ADC at 90°
         elif anchors_source == "empirical":
             def endpoint_avg(target_deg: float, win: float = 2.5):
                 m = np.isfinite(x) & np.isfinite(y) & (np.abs(x - target_deg) <= win)
                 return float(np.nanmean(y[m])) if np.any(m) else float(p(target_deg))
-            y0  = endpoint_avg(deg_min)
+            y0 = endpoint_avg(deg_min)
             y90 = endpoint_avg(deg_max)
         else:  # 'fit_only'
-            y0  = float(p(deg_min))
+            y0 = float(p(deg_min))
             y90 = float(p(deg_max))
 
-        self.calib = dict(
-            c0=c0, c1=c1, c2=c2,
-            y0=y0, y90=y90,
-            deg_min=float(deg_min), deg_max=float(deg_max),
-            source=anchors_source,
-        )
-        # clear any previous inverse; it depends on current poly + anchors
-        self.calib["_theta_of_z"] = None
+        self.calib = dict(c0=c0, c1=c1, c2=c2, y0=y0, y90=y90, source=anchors_source)
 
         yhat = p(x)
         ss_res = np.sum((y - yhat) ** 2)
@@ -330,7 +934,6 @@ class BallBearingData:
             c0=c0, c1=c1, c2=c2,
             y0_emp=y0, y90_emp=y90,
             r2=r2,
-            deg_min=deg_min, deg_max=deg_max,
         )
 
     # ---------- normalization & mapping ----------
@@ -351,125 +954,139 @@ class BallBearingData:
         return deg_min + z * (deg_max - deg_min)
 
     def _adc_to_theta_deg(self, adc_vals: np.ndarray, clamp: bool = True) -> np.ndarray:
-        """
-        Linear ADC→θ map from anchors (y0,y90) over [deg_min,deg_max].
-        """
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
         y0  = float(self.calib["y0"])
         y90 = float(self.calib["y90"])
-        deg_min = float(self.calib.get("deg_min", 0.0))
-        deg_max = float(self.calib.get("deg_max", 90.0))
-        span = max(1e-12, deg_max - deg_min)
-
         adc_vals = np.asarray(adc_vals, dtype=float)
         if np.isnan(y0) or np.isnan(y90):
             theta = np.full_like(adc_vals, np.nan, dtype=float)
         elif y90 >= y0:
-            z = (adc_vals - y0) / max(1e-12, (y90 - y0))
+            theta = (adc_vals - y0) / max(1e-12, (y90 - y0)) * 90.0
         else:
-            z = (y0 - adc_vals) / max(1e-12, (y0 - y90))
-        theta = deg_min + z * span
+            theta = (y0 - adc_vals) / max(1e-12, (y0 - y90)) * 90.0
         if clamp:
-            lo, hi = min(deg_min, deg_max), max(deg_min, deg_max)
-            theta = np.clip(theta, lo, hi)
+            theta = np.clip(theta, 0.0, 90.0)
         return theta
 
-    # ---------- poly-shaped inverse (optional nonlinear ADC→θ using the fitted shape) ----------
-    # inside class BallBearingData
-    def build_poly_inverse(self, grid_size: int = 1001, *, clip_z: bool = True, extrapolate: bool = False) -> None:
+    # ---------- quadratic inverse (NEW) ----------
+    def _adc_to_theta_deg_poly(self, adc_vals: np.ndarray, *, clamp: bool = True) -> np.ndarray:
         """
-        Build θ(z) from stored polynomial (c0,c1,c2) and anchors (y0,y90)
-        so we can map ADC→θ using the quadratic shape normalized to [0,1].
-        Stores an interpolator under self.calib["_theta_of_z"].
+        Invert the fitted quadratic y = c2*x^2 + c1*x + c0 to get angle x (deg) from ADC y.
+        Chooses the root consistent with the global slope between anchors. Falls back to
+        linear normalized mapping when allowed by config and no real root exists.
         """
-        need = ("c0", "c1", "c2", "y0", "y90")
-        if not self.calib or any(np.isnan(self.calib.get(k, np.nan)) for k in need):
-            raise RuntimeError("Need c0,c1,c2 and y0,y90 in calib before building poly inverse.")
+        if not self.calib:
+            raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
+        if not getattr(self, "_poly_inv_cfg", None):
+            raise RuntimeError("Poly inverse not built. Call build_poly_inverse(...) first.")
 
-        c0 = float(self.calib["c0"])
-        c1 = float(self.calib["c1"])
-        c2 = float(self.calib["c2"])
-        y0 = float(self.calib["y0"])  # ADC @ deg_min (0°)
-        y90 = float(self.calib["y90"])  # ADC @ deg_max (90°)
+        c0 = float(self.calib.get("c0", np.nan))
+        c1 = float(self.calib.get("c1", np.nan))
+        c2 = float(self.calib.get("c2", np.nan))
+        y0 = float(self.calib.get("y0", np.nan))
+        y90 = float(self.calib.get("y90", np.nan))
 
-        deg_min = float(self.calib.get("deg_min", 0.0))
-        deg_max = float(self.calib.get("deg_max", 90.0))
+        deg_min = float(self._poly_inv_cfg["deg_min"])
+        deg_max = float(self._poly_inv_cfg["deg_max"])
+        extrap  = bool(self._poly_inv_cfg["extrapolate"])
+        clip_z  = bool(self._poly_inv_cfg["clip_z"])
 
-        p = np.poly1d([c2, c1, c0])
-        theta_grid = np.linspace(deg_min, deg_max, grid_size)
-        y_curve = p(theta_grid)
+        y = np.asarray(adc_vals, float)
+        out = np.full_like(y, np.nan, dtype=float)
 
-        # Normalize polynomial into z(θ) using external anchors
-        if y90 >= y0:
-            z_curve = (y_curve - y0) / max(1e-12, (y90 - y0))
-        else:
-            z_curve = (y0 - y_curve) / max(1e-12, (y0 - y90))
+        # Optional: clip ADC to anchor range before inversion
+        if clip_z and np.isfinite(y0) and np.isfinite(y90):
+            lo, hi = (y90, y0) if y90 < y0 else (y0, y90)
+            y = np.clip(y, lo, hi)
 
-        if clip_z:
-            z_curve = np.clip(z_curve, 0.0, 1.0)
+        # Desired overall slope sign between endpoints (secant)
+        secant = (y90 - y0) / max(1e-12, (deg_max - deg_min))
+        desired_sign = np.sign(secant) if np.isfinite(secant) else 0.0
 
-        # guard tiny non-monotonic wiggles
-        if not np.all(np.diff(z_curve) >= -1e-6):
-            z_curve = np.maximum.accumulate(z_curve)
+        a = c2
+        b = c1
+        for i, yi in enumerate(y):
+            if not np.isfinite(yi):
+                continue
+            c = c0 - yi
+            if abs(a) < 1e-14:  # effectively linear
+                x = (yi - c0) / b if abs(b) >= 1e-14 else np.nan
+            else:
+                disc = b*b - 4.0*a*c
+                if disc >= 0.0:
+                    s = np.sqrt(disc)
+                    r1 = (-b + s) / (2.0*a)
+                    r2 = (-b - s) / (2.0*a)
+                    candidates = np.array([r1, r2], float)
 
-        z_unique, idx = np.unique(z_curve, return_index=True)
-        theta_unique = theta_grid[idx]
-        if z_unique.size < 2 or (z_unique[-1] - z_unique[0]) < 1e-6:
-            self.calib["_theta_of_z"] = None  # degenerate → fallback to linear
-            return
+                    # Prefer roots inside [deg_min, deg_max]
+                    in_rng = (candidates >= deg_min) & (candidates <= deg_max)
+                    cand = candidates[in_rng] if in_rng.any() else candidates
 
-        from scipy.interpolate import interp1d
-        inv = interp1d(
-            z_unique, theta_unique,
-            kind="linear",
-            bounds_error=False,
-            fill_value=("extrapolate" if extrapolate else (deg_min, deg_max)),
-            assume_sorted=True
+                    if desired_sign != 0:
+                        deriv_sign = np.sign(2.0*a*cand + b)  # y'(x) = 2ax + b
+                        ok = np.where(deriv_sign == desired_sign)[0]
+                        if ok.size > 0:
+                            x = float(cand[ok[0]])
+                        else:
+                            # fallback: pick the one closest to range (or first if tie)
+                            x = float(cand[np.argmin(np.minimum(np.abs(cand - deg_min), np.abs(cand - deg_max)))])
+                    else:
+                        x = float(cand[0])
+                else:
+                    if extrap and np.isfinite(y0) and np.isfinite(y90):
+                        # Linear normalized fallback
+                        z = (yi - y0) / max(1e-12, (y90 - y0))
+                        x = deg_min + z * (deg_max - deg_min)
+                    else:
+                        x = np.nan
+
+            if clamp:
+                x = float(np.clip(x, deg_min, deg_max))
+            out[i] = x
+
+        return out
+
+    def build_poly_inverse(
+        self,
+        *,
+        clip_z: bool = True,
+        extrapolate: bool = False,
+        deg_min: float = 0.0,
+        deg_max: float = 90.0,
+    ) -> None:
+        """
+        Prepare quadratic inverse mapping ADC→angle using current calib {c0,c1,c2,y0,y90}.
+        - clip_z:      clip ADC to [min(y0,y90), max(y0,y90)] before inversion
+        - extrapolate: when quadratic has no real root, fall back to linear anchor mapping
+        - deg_min/max: expected angle range used for clamping and slope selection
+        """
+        if not self.calib or not all(k in self.calib for k in ("c0","c1","c2","y0","y90")):
+            raise RuntimeError("Calibration incomplete. Fit and set calibration first (c0,c1,c2,y0,y90).")
+        self._poly_inv_cfg = dict(
+            clip_z=bool(clip_z),
+            extrapolate=bool(extrapolate),
+            deg_min=float(deg_min),
+            deg_max=float(deg_max),
         )
-        self.calib["_theta_of_z"] = inv
-
-    def adc_to_theta_via_poly(self, adc_vals: np.ndarray, clamp: bool = True, clip_z: bool = True) -> np.ndarray:
-        if not self.calib or "y0" not in self.calib or "y90" not in self.calib:
-            raise RuntimeError("Calibration anchors missing. Set y0/y90 first.")
-        y0 = float(self.calib["y0"])
-        y90 = float(self.calib["y90"])
-        deg_min = float(self.calib.get("deg_min", 0.0))
-        deg_max = float(self.calib.get("deg_max", 90.0))
-        lo, hi = min(deg_min, deg_max), max(deg_min, deg_max)
-
-        adc_vals = np.asarray(adc_vals, float)
-        if y90 >= y0:
-            z = (adc_vals - y0) / max(1e-12, (y90 - y0))
-        else:
-            z = (y0 - adc_vals) / max(1e-12, (y0 - y90))
-        if clip_z:
-            z = np.clip(z, 0.0, 1.0)
-
-        inv = self.calib.get("_theta_of_z", None)
-        if inv is None:
-            theta = self._adc_to_theta_deg(adc_vals, clamp=False)  # linear fallback
-        else:
-            theta = inv(z)
-
-        if clamp:
-            theta = np.clip(theta, lo, hi)
-        return np.asarray(theta, float)
 
     # ---------- tall DF builder ----------
     def trials_to_tall_df(
-        self,
-        adc_trials: List[pd.DataFrame],
-        set_label: str,
-        trial_len_sec: float = 10.0,
-        adc_col: str = "adc_ch3",
-        time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
-        include_endpoint: bool = True,
-        clamp_theta: bool = False,
-        use_poly_inverse: bool = False,   # set True to use polynomial-shaped mapping
+            self,
+            adc_trials: List[pd.DataFrame],
+            set_label: str,
+            trial_len_sec: float = 10.0,
+            adc_col: str = "adc_ch3",
+            time_col_options: Tuple[str, ...] = ("timestamp", "time", "t_sec"),
+            include_endpoint: bool = True,
+            clamp_theta: bool = False,      # no clipping by default
+            use_poly_inverse: bool = False, # choose quadratic inverse
     ) -> pd.DataFrame:
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) first.")
+
+        use_poly = bool(use_poly_inverse) and getattr(self, "_poly_inv_cfg", None) is not None
 
         parts = []
         for trial_idx, df in enumerate(adc_trials, start=1):
@@ -500,8 +1117,8 @@ class BallBearingData:
 
             adc_vals = pd.to_numeric(df[adc_use], errors="coerce").to_numpy(float)
 
-            if use_poly_inverse and self.calib.get("_theta_of_z", None) is not None:
-                theta_deg = self.adc_to_theta_via_poly(adc_vals, clamp=clamp_theta)
+            if use_poly:
+                theta_deg = self._adc_to_theta_deg_poly(adc_vals, clamp=clamp_theta)
             else:
                 theta_deg = self._adc_to_theta_deg(adc_vals, clamp=clamp_theta)
 
@@ -519,7 +1136,6 @@ class BallBearingData:
 
         return pd.concat(parts, ignore_index=True)
 
-    # ---------- DLC3D / triggers / MAT loaders & aligners ----------
     def compute_dlc3d_angles_by_trial(
         self,
         dlc3d_trials: List[pd.DataFrame],
@@ -597,6 +1213,7 @@ class BallBearingData:
         )
         return augmented, tall
 
+    # --- DLC3D header coercion ---
     @staticmethod
     def _coerce_dlc3d_multiindex(df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -709,19 +1326,24 @@ class BallBearingData:
         *,
         cam_time_col: Optional[str] = None,   # e.g. 'ts_25183199'; auto-detect if None
         cam_time_prefix: str = "ts",          # auto-detect columns starting with this
-        tolerance: Union[str, float, int] = "10ms",  # '10ms' or seconds(float) or microseconds(int)
+        tolerance: Union[str, float, int] = "10ms",
         direction: str = "nearest",
-        suffix: str = "_dlc",                 # suffix for appended metric columns
+        suffix: str = "_dlc",
     ) -> List[pd.DataFrame]:
         """
         Append DLC angle columns (from compute_dlc3d_angles_by_trial) to each camera ts_* DataFrame.
+
+        Per trial:
+          • If lengths match: index-wise join (fast path).
+          • Else if both sides have a time column: merge_asof on coerced seconds.
+          • Else: nearest join on frame index.
         """
         out: List[pd.DataFrame] = []
 
         def _pick_cam_time(df: pd.DataFrame) -> Optional[str]:
             if cam_time_col and cam_time_col in df.columns:
                 return cam_time_col
-            cands = [c for c in df.columns if str(c).lower().startsWith(cam_time_prefix)]
+            cands = [c for c in df.columns if str(c).lower().startswith(cam_time_prefix)]
             return cands[0] if cands else None
 
         def _find_dlc_time_col(df: pd.DataFrame):
@@ -775,10 +1397,10 @@ class BallBearingData:
                 left = cam_df[[cam_col]].copy()
                 right = dlc_df[[dlc_tcol]].copy()
 
-                left["_t"]      = self._coerce_time_series_numeric_seconds(left[cam_col])
+                left["_t"]     = self._coerce_time_series_numeric_seconds(left[cam_col])
                 right["_t_enc"] = self._coerce_time_series_numeric_seconds(right[dlc_tcol])
 
-                left  = left.dropna(subset=["._t" if False else "_t"]).sort_values("_t").reset_index(drop=False)
+                left  = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
                 right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
 
                 right = right.join(dlc_metrics.reset_index(drop=True))
@@ -1048,6 +1670,8 @@ class BallBearingData:
 
         return pd.Series(np.nan, index=s.index, dtype=float)
 
+    
+
     def _theta_trials_from_adc(
         self,
         adc_trials: List[pd.DataFrame],
@@ -1097,9 +1721,11 @@ class BallBearingData:
         """
         Align per-trial angle-converted ADC (θ_pred from self.calib) to camera timestamps.
         """
+        # 1) Safety: need calibration first
         if not self.calib:
             raise RuntimeError("Calibration not set. Call fit_and_set_calibration(...) before aligning.")
 
+        # 2) Build θ-from-ADC tables per trial
         theta_trials = self._theta_trials_from_adc(
             adc_trials,
             trial_len_sec=trial_len_sec,
@@ -1215,14 +1841,15 @@ class BallBearingData:
             return pd.to_timedelta(tol)
 
         def _to_int64_ns(series: pd.Series) -> pd.Series:
+            # Replace deprecated Series.view("i8")
             if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
-                return series.view("i8").astype("Int64")
+                return series.astype("int64")  # ns since epoch or ns
             sn = pd.to_numeric(series, errors="coerce")
             if sn.notna().any():
                 return sn.round().astype("Int64")
             dt = pd.to_datetime(series, errors="coerce", utc=True)
             if dt.notna().any():
-                return dt.view("i8").astype("Int64")
+                return dt.astype("int64")
             return pd.Series(pd.array([pd.NA] * len(series), dtype="Int64"), index=series.index)
 
         if theta_col not in theta_all_set.columns:
@@ -1296,8 +1923,14 @@ class BallBearingData:
     def _tol_seconds(self, tol):
         """Return tolerance in float seconds (handles strings like '10ms')."""
         if isinstance(tol, str):
-            return pd.to_timedelta(tol).total_seconds()
-        return float(tol)
+            return pd.to_datetime("1970-01-01")  # dummy to use pandas parser (not used)
+        try:
+            # Try string → Timedelta → seconds
+            if isinstance(tol, str):
+                return pd.to_timedelta(tol).total_seconds()
+            return float(tol)
+        except Exception:
+            return float(pd.to_timedelta("10ms").total_seconds())
 
     def align_adc_to_cam_both_sets(
         self,
@@ -1314,6 +1947,7 @@ class BallBearingData:
         first  = self.align_adc_to_cam_for_set(adc_trials_first,  cam_trials_first,  **kwargs)
         second = self.align_adc_to_cam_for_set(adc_trials_second, cam_trials_second, **kwargs)
         return first, second
+
 
 
 
@@ -1669,6 +2303,8 @@ class DLC3DBendAngles:
         """Compute bend angle per frame for the requested angle_type."""
         v1, v2 = self.compute_vectors(angle_type)
         return self.angle_from_vectors(v1, v2)
+
+
 
     # ---------------- column resolution & typing helpers ----------------
     @staticmethod
@@ -2589,6 +3225,24 @@ class bender_class:
         self.adc_normalized = True
         self.normalize_type = '0 to max (R - R₀) / R₀'
 
+    @staticmethod
+    def _quad_fit_with_r2(x, y):
+        """Return (poly1d p, r2, (c2,c1,c0)). NaNs are ignored; needs ≥3 points."""
+        import numpy as _np
+        x = _np.asarray(x, float).ravel()
+        y = _np.asarray(y, float).ravel()
+        m = _np.isfinite(x) & _np.isfinite(y)
+        x, y = x[m], y[m]
+        if x.size < 3:
+            return None, _np.nan, (None, None, None)
+        c2, c1, c0 = _np.polyfit(x, y, 2)
+        p = _np.poly1d([c2, c1, c0])
+        yhat = p(x)
+        ss_res = float(_np.sum((y - yhat) ** 2))
+        ss_tot = float(_np.sum((y - _np.nanmean(y)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else _np.nan
+        return p, r2, (c2, c1, c0)
+
     def plot_data(self, scatter=False, title=''):
         """
         method to plot normalized ADC values vs Rotary Encoder angles (blue dots)
@@ -2826,104 +3480,187 @@ class bender_class:
 
         plt.show()
 
-    def plot_compact_pairwise_comparison(self, pairwise_min_accuracy, pairwise_abs_error,
-                                         xlabel_flat, group_size=3,
-                                         title1='Min Angle for 100% Accuracy',
-                                         title2='Mean Absolute Error', ylim=(0, 15)):
-        """
-        Compact overlayed double-bar plot showing:
-        - Blue = model trained/tested on same sample (self-trained)
-        - Red = model trained on first sample in group, tested on others (cross-trained)
-
-        Parameters:
-        - pairwise_min_accuracy (np.array): Matrix of min angle for 100% accuracy
-        - pairwise_abs_error (np.array): Matrix of mean absolute errors
-        - xlabel_flat (list): List of sample labels corresponding to DS_flat
-        - group_size (int): Number of samples per group
-        - title1 (str): Title for top subplot
-        - title2 (str): Title for bottom subplot
-        - ylim (tuple): Y-axis limits for both plots (e.g., (0, 15))
-        """
-        import matplotlib.pyplot as plt
+    def plot_compact_pairwise_comparison(
+            self,
+            pairwise_min_accuracy,
+            pairwise_abs_error,
+            xlabel_flat,
+            group_size=3,
+            title1='Min Angle for 100% Accuracy',
+            title2='Mean Absolute Error',
+            ylim=(0, 15),
+            # Optional distributions for error bars on Min Angle bars
+            self_minangle_dists=None,   # list[list[np.ndarray]]
+            cross_minangle_dists=None,  # list[list[np.ndarray]]; []/None for first in group
+            err_metric='sd',            # 'sd' or 'sem'
+            capsize=4,
+            # NEW: embed into an existing axes and align with left plot spacing
+            ax_top=None,                # if provided, draw ONLY the top bars into this axes
+            x_sample_centers=None,      # list of sample centers (same order as xlabel_flat)
+            group_centers=None,         # list of one center per group (for xticks)
+            group_labels=None,          # list of group labels (tick labels)
+            bar_w=0.24,                 # bar width for side-by-side bars
+            paired=True,                # if True, place red next to blue
+            show_sample_numbers=True,   # annotate "1,2,3,..."
+    ):
         import numpy as np
+        import matplotlib.pyplot as plt
 
         assert pairwise_min_accuracy.shape[0] == len(xlabel_flat)
         assert pairwise_min_accuracy.shape[0] % group_size == 0
-
         num_groups = pairwise_min_accuracy.shape[0] // group_size
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        bar_width = 0.6
-        inner_width = 0.4  # width for the red overlaid bar
-        x_all = []
+        def mean_sd(arr):
+            arr = np.asarray(arr, float)
+            if arr.size == 0:
+                return np.nan, np.nan
+            m = np.nanmean(arr)
+            s = np.nanstd(arr, ddof=1) if arr.size > 1 else np.nan
+            return m, s
 
-        for group_idx in range(num_groups):
-            base_idx = group_idx * group_size
-            x_group = np.arange(group_size) + group_idx * (group_size + 1.0)
-            x_all.extend(x_group)
+        def mean_sem(arr):
+            arr = np.asarray(arr, float)
+            n = np.sum(np.isfinite(arr))
+            if n == 0:
+                return np.nan, np.nan
+            m = np.nanmean(arr)
+            s = (np.nanstd(arr, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+            return m, s
 
-            min_self = []
-            min_cross = []
-            err_self = []
-            err_cross = []
+        use_err = (self_minangle_dists is not None) and (cross_minangle_dists is not None)
+        agg = mean_sem if err_metric.lower() == 'sem' else mean_sd
 
+        # Standalone mode (old behavior) OR embedded into provided ax_top
+        standalone = ax_top is None
+        if standalone:
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            ax_min = axes[0]
+            ax_err = axes[1]
+        else:
+            ax_min = ax_top
+            ax_err = None
+
+        # ----- Build flat arrays in sample order -----
+        min_self  = []
+        min_cross = []
+        self_yerr = []
+        cross_yerr = []
+
+        for g in range(num_groups):
+            base = g * group_size
             for i in range(group_size):
-                idx = base_idx + i
-                min_self.append(pairwise_min_accuracy[idx, idx])
-                err_self.append(pairwise_abs_error[idx, idx])
-
-                # Cross-trained using first sample in group
-                cross_idx = base_idx
-                if idx != cross_idx:
-                    min_cross.append(pairwise_min_accuracy[cross_idx, idx])
-                    err_cross.append(pairwise_abs_error[cross_idx, idx])
-                else:
-                    min_cross.append(np.nan)  # skip duplicate
-                    err_cross.append(np.nan)
-
-            # --- Plot Top Subplot: Min Angle ---
-            axes[0].bar(x_group, min_self, width=bar_width, color='blue',
-                        label='Self-trained' if group_idx == 0 else "")
-            axes[0].bar(x_group, min_cross, width=inner_width, color='red', alpha=0.7,
-                        label='Cross-trained (model 1)' if group_idx == 0 else "")
-
-            # --- Plot Bottom Subplot: Mean Error ---
-            axes[1].bar(x_group, err_self, width=bar_width, color='blue')
-            axes[1].bar(x_group, err_cross, width=inner_width, color='red', alpha=0.7)
-
-        # --- Format Top Subplot ---
-        axes[0].set_ylabel('Min Angle (deg)')
-        axes[0].set_ylim(ylim)
-        axes[0].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
-        axes[0].set_title(title1)
-        axes[0].legend()
-        axes[0].grid(True, linestyle='--', alpha=0.5)
-
-        # --- Format Bottom Subplot ---
-        axes[1].set_ylabel('Mean Error (deg)')
-        axes[1].set_xlabel('Sample')
-        axes[1].set_ylim(ylim)
-        axes[1].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
-        axes[1].set_title(title2)
-        axes[1].grid(True, linestyle='--', alpha=0.5)
-
-        # --- Annotated X-Axis Labels ---
-        xtick_labels = []
-        for group_idx in range(num_groups):
-            base_idx = group_idx * group_size
-            for i in range(group_size):
-                idx = base_idx + i
-                label = xlabel_flat[idx]
+                sidx = base + i
+                # bars (means) from matrices
+                min_self.append(pairwise_min_accuracy[sidx, sidx])   # diagonal
+                # cross is first in group -> others
                 if i == 0:
-                    label += " (model 1)"
-                xtick_labels.append(label)
+                    min_cross.append(np.nan)  # no red on model-1
+                else:
+                    min_cross.append(pairwise_min_accuracy[base, sidx])
 
-        axes[1].set_xticks(x_all)
-        axes[1].set_xticklabels(xtick_labels, rotation=45, ha='right')
+                if use_err:
+                    s_arr = self_minangle_dists[g][i]
+                    _, s_err = agg(s_arr)
+                    self_yerr.append(s_err)
 
-        plt.tight_layout()
-        plt.savefig("compact pairwise comp.png", dpi=300, bbox_inches='tight')
-        plt.show()
+                    c_arr = cross_minangle_dists[g][i]
+                    if (i == 0) or (c_arr is None) or (len(c_arr) == 0):
+                        cross_yerr.append(np.nan)
+                    else:
+                        _, c_err = agg(c_arr)
+                        cross_yerr.append(c_err)
+
+        min_self  = np.asarray(min_self, dtype=float)
+        min_cross = np.asarray(min_cross, dtype=float)
+        self_yerr = np.asarray(self_yerr, dtype=float) if use_err else None
+        cross_yerr = np.asarray(cross_yerr, dtype=float) if use_err else None
+
+        # ----- X positions -----
+        if not paired:
+            # overlay mode (legacy): blue full-width, red inner-width
+            x_idx = []
+            for g in range(num_groups):
+                x_idx.extend(list(np.arange(group_size) + g * (group_size + 1.0)))
+            x_idx = np.asarray(x_idx, dtype=float)
+            ax_min.bar(x_idx, min_self, width=0.60, color='blue', label='Self-trained')
+            ax_min.bar(x_idx, min_cross, width=0.40, color='red', alpha=0.7, label='Cross-trained (model 1)')
+            if use_err:
+                ax_min.errorbar(x_idx, min_self,  yerr=self_yerr,  fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+                ax_min.errorbar(x_idx, min_cross, yerr=cross_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+            # ticks per sample (legacy)
+            ax_min.set_xticks(x_idx)
+            ax_min.set_xticklabels(xlabel_flat, rotation=45, ha='right')
+        else:
+            # side-by-side mode aligned to provided sample centers
+            assert x_sample_centers is not None, "Provide x_sample_centers for paired=True"
+            x_centers = np.asarray(x_sample_centers, dtype=float)
+            x_self  = x_centers - bar_w/2
+            x_cross = x_centers + bar_w/2
+            # mask out first-in-group for cross bars
+            cross_mask = []
+            for g in range(num_groups):
+                cross_mask.extend([False] + [True]*(group_size-1))
+            cross_mask = np.asarray(cross_mask, dtype=bool)
+
+            # draw bars
+            ax_min.bar(x_self, min_self,  width=bar_w, color='blue', label='Self-trained')
+            ax_min.bar(x_cross[cross_mask], min_cross[cross_mask], width=bar_w, color='red', alpha=0.7,
+                       label='Cross-trained (model 1)')
+
+            # error bars
+            if use_err:
+                ax_min.errorbar(x_self, min_self, yerr=self_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+                ax_min.errorbar(x_cross[cross_mask], min_cross[cross_mask],
+                                yerr=cross_yerr[cross_mask], fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+
+            # group-level ticks
+            assert (group_centers is not None) and (group_labels is not None), \
+                "Provide group_centers and group_labels for paired=True"
+            ax_min.set_xticks(group_centers)
+            ax_min.set_xticklabels(group_labels)
+
+            # sample numbers above each sample center
+            if show_sample_numbers:
+                # numbers 1..group_size repeating per group
+                sample_nums = []
+                for g in range(num_groups):
+                    sample_nums.extend([str(i+1) for i in range(group_size)])
+                # y placement: max of self(+err) and cross(+err)
+                ymin, ymax = ylim
+                y_pad = 0.02 * (ymax - ymin)
+                for i, xc in enumerate(x_centers):
+                    y_self_top = min_self[i] + (self_yerr[i] if (use_err and np.isfinite(self_yerr[i])) else 0.0)
+                    if cross_mask[i]:
+                        y_cross_top = min_cross[i] + (cross_yerr[i] if (use_err and np.isfinite(cross_yerr[i])) else 0.0)
+                        y_top = max(y_self_top, y_cross_top)
+                    else:
+                        y_top = y_self_top
+                    ax_min.text(xc, y_top + y_pad, sample_nums[i], ha='center', va='bottom', fontsize=12, fontweight='bold', clip_on=False)
+
+        # style & labels
+        ax_min.set_ylabel('Min Angle (deg)')
+        ax_min.set_title(title1)
+        ax_min.set_ylim(ylim)
+        ax_min.legend(frameon=False)
+
+        # clean style per your request
+        ax_min.grid(False)
+        ax_min.spines['top'].set_visible(False)
+        ax_min.spines['right'].set_visible(False)
+
+        if standalone:
+            # Bottom subplot (legacy mode) if you ever call without ax_top
+            # (kept unchanged; you said you only need the top when embedding)
+            ax_err.set_ylabel('Mean Error (deg)')
+            ax_err.set_xlabel('Sample')
+            ax_err.set_ylim(ylim)
+            ax_err.set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
+            ax_err.set_title(title2)
+            ax_err.grid(True, linestyle='--', alpha=0.5)
+            plt.tight_layout()
+            plt.savefig("compact_pairwise_comp.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
 
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
         """
@@ -3014,27 +3751,229 @@ class bender_class:
                                            make_angles_positive=True,
                                            plot=False,
                                            ax=None,
-                                           flip_data=False):
+                                           flip_data=False,
+                                           # --- overlays ---
+                                           block_df=None,  # DataFrame or sequence; if sequence use block_index
+                                           block_index=None,
+                                           cam_df=None,  # DataFrame or sequence; if sequence use cam_index
+                                           cam_index=None,
+                                           show_quadratic=True,
+                                           # --- optional explicit column names for overlays ---
+                                           block_angle_col_hint=None,
+                                           block_adc_col_hint=None,
+                                           cam_angle_col_hint=None,
+                                           cam_adc_col_hint=None,
+                                           # --- legend labels ---
+                                           cam_label="Camera calibration",
+                                           block_label="Block calibration",
+                                           # --- styling (override if desired) ---
+                                           style_theory=dict(color="tab:orange", linewidth=2, label="Theory fit"),
+                                           style_block_points=None,
+                                           style_block_curve=None,
+                                           style_cam_points=None,
+                                           style_cam_curve=None,
+                                           # --- outputs ---
+                                           return_curve=True,
+                                           theta_grid=None,
+                                           # --- diagnostics ---
+                                           verbose=False):
         """
-        Fit the normalized theoretical model to data in self.data to estimate knuckle radius r.
-        Now supports flipping the data so that 0°→0 and 90°→1 always match the model.
+        Fit the normalized theoretical model to data in self.data to estimate knuckle radius r,
+        and (optionally) overlay camera/block calibration datasets with 0–1 normalized
+        quadratic fits. Supports selecting items by index if sequences are passed.
+
+        You can force angle/adc columns for overlays via *angle_col_hint / *adc_col_hint.
+        Set verbose=True to print which item & columns were used and how many points were fit.
+
+        Returns:
+          {
+            "r_hat", "r_se", "r_ci95", "r2", "params_cov",
+            ("theta","y_model") if return_curve,
+            "overlays": {
+                "block": {"ok", "coeffs"(c0,c1,c2), "r2", "theta", "x_pts", "y_pts_norm", "y_curve_norm},
+                "cam":   {...}
+            }
+          }
         """
         import numpy as np
         from scipy.optimize import curve_fit
         import matplotlib.pyplot as plt
+        import pandas as pd
+        import copy
 
-        if self.data is None:
+        if getattr(self, "data", None) is None:
             raise ValueError("No data loaded. Use load_merged_df(...) or load_data(...) first.")
 
-        # Pull columns
+        # ---------- resolve styles with friendly defaults ----------
+        if style_block_points is None:
+            style_block_points = dict(color="tab:green", s=16, alpha=0.7)
+        else:
+            style_block_points = copy.deepcopy(style_block_points)
+
+        if style_block_curve is None:
+            style_block_curve = dict(color="tab:green", linestyle="--", linewidth=2)
+        else:
+            style_block_curve = copy.deepcopy(style_block_curve)
+
+        if style_cam_points is None:
+            style_cam_points = dict(color="tab:blue", s=16, alpha=0.7)
+        else:
+            style_cam_points = copy.deepcopy(style_cam_points)
+
+        if style_cam_curve is None:
+            style_cam_curve = dict(color="tab:blue", linestyle="-.", linewidth=2)
+        else:
+            style_cam_curve = copy.deepcopy(style_cam_curve)
+
+        # ---------- helpers ----------
+        def _unwrap_df(dfx, index, tag):
+            """
+            Accept DataFrame, (points_df, ...), or a list/tuple of those.
+            If sequence: pick EXACT index (default 0). If item is tuple/list like
+            (points_df, means_df), use the first element (points_df).
+            """
+            if dfx is None:
+                return None, None
+            if isinstance(dfx, pd.DataFrame):
+                if verbose:
+                    print(f"[{tag}] using a SINGLE DataFrame (index ignored)")
+                return dfx.copy(), 0
+            if isinstance(dfx, (list, tuple)):
+                i = 0 if index is None else index
+                if i < 0 or i >= len(dfx):
+                    raise IndexError(f"[{tag}] index {i} out of range for sequence of length {len(dfx)}.")
+                item = dfx[i]
+                raw_type = type(item)
+                if isinstance(item, (list, tuple)) and len(item) > 0:
+                    if verbose:
+                        print(f"[{tag}] selected item {i} of type {raw_type}; using first element of tuple/list")
+                    item = item[0]
+                else:
+                    if verbose:
+                        print(f"[{tag}] selected item {i} of type {raw_type}")
+                if not isinstance(item, pd.DataFrame):
+                    raise TypeError(f"[{tag}] selected item is not a DataFrame.")
+                return item.copy(), i
+            raise TypeError(
+                f"[{tag}] Provide a DataFrame or a list/tuple of DataFrames (optionally tuples of (points_df, ...)).")
+
+        def _tidy_angle_adc(df, angle_hint=None, adc_hint=None, tag="?"):
+            """
+            Return df with columns ['angle','adc'] as floats. Tries hints then common names;
+            falls back to substring search. Clips to 0..90 if needed (broaden to -5..95 and clip if sparse).
+            """
+            if df is None:
+                return None
+
+            # Try explicit hints first
+            angle_col_cand = None
+            adc_col_cand = None
+            if angle_hint is not None and angle_hint in df.columns:
+                angle_col_cand = angle_hint
+            if adc_hint is not None and adc_hint in df.columns:
+                adc_col_cand = adc_hint
+
+            # Angle column candidates
+            if angle_col_cand is None:
+                angle_col_cand = next(
+                    (c for c in ["angle", "angle_deg", "theta", "Rotary Encoder", "angle_renc", "angle_deg_renc"]
+                     if c in df.columns),
+                    None
+                )
+            if angle_col_cand is None:
+                angle_col_cand = next(
+                    (c for c in df.columns if "angle" in str(c).lower() or "renc" in str(c).lower()),
+                    None
+                )
+
+            # ADC column candidates (add 'mean_adc' and 'adc_norm' support)
+            if adc_col_cand is None:
+                adc_col_cand = next(
+                    (c for c in ["adc_norm", "mean_adc", "adc_ch3", "adc", "ADC Value", "adc0", "adc1"]
+                     if c in df.columns),
+                    None
+                )
+            if adc_col_cand is None:
+                # Heuristic fallback: anything starting with 'adc' OR containing both 'mean' and 'adc'
+                adc_col_cand = next(
+                    (c for c in df.columns
+                     if str(c).lower().startswith("adc") or
+                     ("adc" in str(c).lower() and "mean" in str(c).lower())),
+                    None
+                )
+
+            if angle_col_cand is None or adc_col_cand is None:
+                raise KeyError(f"[{tag}] Could not identify angle/adc columns. Available: {list(df.columns)}")
+
+            out = df[[angle_col_cand, adc_col_cand]].rename(
+                columns={angle_col_cand: "angle", adc_col_cand: "adc"}
+            ).copy()
+            out["angle"] = pd.to_numeric(out["angle"], errors="coerce")
+            out["adc"] = pd.to_numeric(out["adc"], errors="coerce")
+            out = out.dropna()
+
+            # Prefer 0..90°, broaden slightly if sparse, then clip
+            mask = out["angle"].between(0.0, 90.0) & out["adc"].notna()
+            sub = out.loc[mask].copy()
+            if len(sub) < 5:
+                mask_b = out["angle"].between(-5.0, 95.0) & out["adc"].notna()
+                sub = out.loc[mask_b].copy()
+                sub["angle"] = sub["angle"].clip(0.0, 90.0)
+
+            if verbose:
+                print(f"[{tag}] columns: angle='{angle_col_cand}', adc='{adc_col_cand}', n_points_for_fit={len(sub)}")
+
+            return sub
+
+        def _quadfit_and_norm(df, theta_line, tag="?"):
+            """
+            Quadratic fit: adc = a + b*θ + c*θ^2, normalize to 0–1 over θ∈[0,90].
+            Returns dict: ok, coeffs(c0,c1,c2), r2, theta, x_pts, y_pts_norm, y_curve_norm
+            """
+            import numpy as _np
+            if df is None or len(df) < 3:
+                if verbose:
+                    print(f"[{tag}] too few points for quadratic fit (n={0 if df is None else len(df)})")
+                return {"ok": False, "reason": "too_few_points"}
+            x = df["angle"].to_numpy(float)
+            y = df["adc"].to_numpy(float)
+            c2, c1, c0 = _np.polyfit(x, y, deg=2)
+            p = _np.poly1d([c2, c1, c0])
+
+            y_hat = p(x)
+            ss_res = float(_np.sum((y - y_hat) ** 2))
+            ss_tot = float(_np.sum((y - float(_np.mean(y))) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else _np.nan
+
+            y0, y90 = float(p(0.0)), float(p(90.0))
+            y_grid = p(theta_line)
+            if y90 >= y0:
+                y_curve_norm = (y_grid - y0) / max(1e-12, (y90 - y0))
+                y_pts_norm = (y - y0) / max(1e-12, (y90 - y0))
+            else:
+                y_curve_norm = (y0 - y_grid) / max(1e-12, (y0 - y90))
+                y_pts_norm = (y0 - y) / max(1e-12, (y0 - y90))
+
+            if verbose:
+                print(f"[{tag}] quad fit R²={r2:.4f}")
+
+            return {
+                "ok": True,
+                "coeffs": (float(c0), float(c1), float(c2)),
+                "r2": float(r2),
+                "theta": theta_line,
+                "x_pts": x,
+                "y_pts_norm": y_pts_norm,
+                "y_curve_norm": y_curve_norm,
+            }
+
+        # ---------- main: prepare self.data (original flow) ----------
         x_deg = np.asarray(self.data[angle_col], dtype=float)
         y = np.asarray(self.data[value_col], dtype=float)
 
-        # Flip data if needed
         if flip_data:
             y = 1.0 - y
 
-        # Clean/guard
         m = np.isfinite(x_deg) & np.isfinite(y)
         x_deg = x_deg[m]
         y = y[m]
@@ -3050,82 +3989,139 @@ class bender_class:
         if x_deg.size < 5:
             raise ValueError("Not enough points (need ≥5) in the 0–90° range to fit.")
 
-        # Convert to radians
-        theta = np.deg2rad(x_deg)
+        theta_data = np.deg2rad(x_deg)
 
-        # Theoretical model
-        def _norm_theoretical(theta, r, L=L):
+        # Theoretical model (normalized so y=1 at 90°)
+        def _norm_theoretical(theta_r, r, L=L):
             alpha = r / L
-            num = theta * (8.0 - alpha * theta) / (2.0 - alpha * theta) ** 2
+            num = theta_r * (8.0 - alpha * theta_r) / (2.0 - alpha * theta_r) ** 2
             th_max = np.pi / 2.0
             den = th_max * (8.0 - alpha * th_max) / (2.0 - alpha * th_max) ** 2
             return num / den
 
         # Fit r
         popt, pcov = curve_fit(lambda th, r: _norm_theoretical(th, r, L),
-                               theta, y, p0=[r0], bounds=bounds, maxfev=20000)
+                               theta_data, y, p0=[r0], bounds=bounds, maxfev=20000)
         r_hat = float(popt[0])
 
-        # Predictions and R²
-        y_pred = _norm_theoretical(theta, r_hat, L)
-        ss_res = np.sum((y - y_pred) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        # Predictions + R²
+        y_pred = _norm_theoretical(theta_data, r_hat, L)
+        ss_res = float(np.sum((y - y_pred) ** 2))
+        ss_tot = float(np.sum((y - float(np.mean(y))) ** 2))
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-        # Std error & 95% CI
         r_se = float(np.sqrt(pcov[0, 0])) if pcov.size else np.nan
         ci95 = (r_hat - 1.96 * r_se, r_hat + 1.96 * r_se) if np.isfinite(r_se) else (np.nan, np.nan)
 
-        # Optional plot
+        # Theory curve on common grid (degrees for plotting)
+        if theta_grid is None:
+            theta_grid = np.linspace(0.0, 90.0, 400)
+        theta_grid_rad = np.deg2rad(theta_grid)
+        y_theory = _norm_theoretical(theta_grid_rad, r_hat, L)
+
+        # ---------- plotting (explicit legend control) ----------
+        legend_items = []  # (handle, label)
+
         if plot:
             if ax is None:
-                fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(x_deg, y, ".", markersize=3, label="Data")
-            th_fit = np.linspace(0, np.deg2rad(max(95.0, x_deg.max())), 600)
-            y_fit = _norm_theoretical(th_fit, r_hat, L)
-            ax.plot(np.rad2deg(th_fit), y_fit, "-", label=f"Fit r={r_hat:.3f} in (R²={r2:.4f})")
+                _, ax = plt.subplots(figsize=(6.8, 4.3))
+
+        overlays = {}
+
+        if plot:
+            # self.data points (hidden from legend)
+            ax.plot(x_deg, y, ".", markersize=3, label="_nolegend_")
+            # theory curve
+            th_label = f"{style_theory.get('label', 'Theory fit')} (r={r_hat:.3f}, R²={r2:.4f})"
+            th_handle = ax.plot(theta_grid, y_theory,
+                                color=style_theory.get("color", "tab:orange"),
+                                linewidth=style_theory.get("linewidth", 2),
+                                linestyle=style_theory.get("linestyle", "-"),
+                                label="_nolegend_")[0]
+            legend_items.append((th_handle, th_label))
+
             ax.set_xlabel("Angle (deg)")
             ax.set_ylabel("Normalized ADC (0–1)")
+            ax.set_xlim(0, 90)
+            ax.set_ylim(-0.05, 1.05)
             ax.set_title(f"Theoretical fit (L={L} in)")
-            ax.legend()
+
+        # ---------- block overlay (optional) ----------
+        if show_quadratic and block_df is not None:
+            try:
+                blk_raw, blk_used_idx = _unwrap_df(block_df, block_index, tag="block")
+                blk = _tidy_angle_adc(blk_raw,
+                                      angle_hint=block_angle_col_hint,
+                                      adc_hint=block_adc_col_hint,
+                                      tag=f"block[{blk_used_idx}]")
+                blk_fit = _quadfit_and_norm(blk, theta_grid, tag=f"block[{blk_used_idx}]")
+                overlays["block"] = blk_fit
+                if blk_fit.get("ok") and plot:
+                    # points
+                    bp = ax.scatter(blk_fit["x_pts"], blk_fit["y_pts_norm"],
+                                    s=style_block_points.get("s", 16),
+                                    alpha=style_block_points.get("alpha", 0.7),
+                                    color=style_block_points.get("color", "tab:green"))
+                    # curve
+                    bc, = ax.plot(blk_fit["theta"], blk_fit["y_curve_norm"],
+                                  linestyle=style_block_curve.get("linestyle", "--"),
+                                  linewidth=style_block_curve.get("linewidth", 2),
+                                  color=style_block_curve.get("color", "tab:green"))
+                    # legend (include R²)
+                    legend_items.append((bp, f"{block_label} (points)"))
+                    legend_items.append((bc, f"{block_label} (quad, R²={blk_fit['r2']:.4f})"))
+            except Exception as e:
+                print(f"[fit_knuckle_radius] Block overlay error: {e}")
+
+        # ---------- camera overlay (optional) ----------
+        if show_quadratic and cam_df is not None:
+            try:
+                cam_raw, cam_used_idx = _unwrap_df(cam_df, cam_index, tag="camera")
+                cam = _tidy_angle_adc(cam_raw,
+                                      angle_hint=cam_angle_col_hint,
+                                      adc_hint=cam_adc_col_hint,
+                                      tag=f"camera[{cam_used_idx}]")
+                cam_fit = _quadfit_and_norm(cam, theta_grid, tag=f"camera[{cam_used_idx}]")
+                overlays["cam"] = cam_fit
+                if cam_fit.get("ok") and plot:
+                    # points
+                    cp = ax.scatter(cam_fit["x_pts"], cam_fit["y_pts_norm"],
+                                    s=style_cam_points.get("s", 16),
+                                    alpha=style_cam_points.get("alpha", 0.7),
+                                    color=style_cam_points.get("color", "tab:blue"))
+                    # curve
+                    cc, = ax.plot(cam_fit["theta"], cam_fit["y_curve_norm"],
+                                  linestyle=style_cam_curve.get("linestyle", "-."),
+                                  linewidth=style_cam_curve.get("linewidth", 2),
+                                  color=style_cam_curve.get("color", "tab:blue"))
+                    # legend (include R²)
+                    legend_items.append((cp, f"{cam_label} (points)"))
+                    legend_items.append((cc, f"{cam_label} (quad, R²={cam_fit['r2']:.4f})"))
+            except Exception as e:
+                print(f"[fit_knuckle_radius] Camera overlay error: {e}")
+
+        if plot:
+            # build legend explicitly from handles + labels (guaranteed text)
+            if legend_items:
+                handles, labels = zip(*legend_items)
+                ax.legend(list(handles), list(labels), loc="best", frameon=True)
+            else:
+                ax.legend(loc="best", frameon=True)
+            ax.grid(alpha=0.2, axis="y")
             plt.tight_layout()
 
-        return {
+        out = {
             "r_hat": r_hat,
             "r_se": r_se,
             "r_ci95": ci95,
             "r2": r2,
             "params_cov": pcov,
         }
-
-    def theta_from_y(self, y, r, L=2.0, tol_deg=1e-3, max_iters=30):
-        """
-        Invert normalized theoretical curve y(θ; r, L) on [0, 90°].
-        No other class methods required. Returns radians.
-        """
-        import numpy as np
-        # clamp for safety
-        y = float(np.clip(y, 0.0, 1.0))
-
-        # inline normalized model (y = 1 at 90°)
-        def f(theta):
-            a = r / L
-            num = theta * (8.0 - a * theta)
-            den = (2.0 - a * theta) ** 2
-            th90 = np.pi / 2
-            num90 = th90 * (8.0 - a * th90) / (2.0 - a * th90) ** 2
-            return (num / den) / num90
-
-        lo, hi = 0.0, np.pi / 2
-        for _ in range(max_iters):
-            mid = 0.5 * (lo + hi)
-            if f(mid) < y:
-                lo = mid
-            else:
-                hi = mid
-            if (hi - lo) <= np.deg2rad(tol_deg):
-                break
-        return 0.5 * (lo + hi)
+        if return_curve:
+            out.update({"theta": theta_grid, "y_model": y_theory})
+        if overlays:
+            out["overlays"] = overlays
+        return out
 
     def append_theta_from_normalized(self,
                                      r_hand,
@@ -3282,6 +4278,50 @@ class bender_class:
 
         # Show the updated plot
         plt.show()
+
+    @staticmethod
+    def _coerce_to_df_sequence(obj, prefer_first_in_tuple=True):
+        """
+        Turn obj into a list of DataFrames so index selection actually changes data.
+        Handles: DataFrame, list/tuple of DFs, list/tuple of (points_df, ...),
+                 dicts of any of the above.
+        """
+        import pandas as pd
+
+        def pick_df(item):
+            # if tuple/list like (points_df, means_df) → pick the first by default
+            if isinstance(item, (list, tuple)) and item:
+                return item[0] if prefer_first_in_tuple else item[-1]
+            return item
+
+        # Single DF → [DF]
+        if isinstance(obj, pd.DataFrame):
+            return [obj]
+
+        # List/tuple → flatten one level selecting first elem if tuples
+        if isinstance(obj, (list, tuple)):
+            out = []
+            for it in obj:
+                it = pick_df(it)
+                if isinstance(it, pd.DataFrame):
+                    out.append(it)
+            return out
+
+        # Dict → look through values
+        if isinstance(obj, dict):
+            out = []
+            for v in obj.values():
+                if isinstance(v, (list, tuple)):
+                    for it in v:
+                        it = pick_df(it)
+                        if hasattr(it, "columns"):
+                            out.append(it)
+                elif hasattr(v, "columns"):
+                    out.append(v)
+            return out
+
+        # Fallback: nothing usable
+        return []
 
     def cross_validation_angular_error(self, degree=1):
         """
@@ -3675,8 +4715,14 @@ class bender_class:
         plt.ylabel(ylabel)
         plt.title(title)
 
+
         if ylim:
             plt.ylim(ylim)
+
+        ax = plt.gca()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='both', which='major', labelsize=20)
 
         plt.savefig("min_angle_bar_chart.png", dpi=300, bbox_inches='tight')
 

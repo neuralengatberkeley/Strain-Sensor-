@@ -22,6 +22,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn import preprocessing
+from sklearn.linear_model import LinearRegression
 
 # Local
 from config import path_to_repository
@@ -226,6 +227,140 @@ class BallBearingData:
             k = 1.345 * s
             w = np.where(np.abs(r) <= k, 1.0, k / (np.abs(r) + 1e-12))
         return float(beta[0]), float(beta[1]), float(beta[2])
+
+    def extract_calib_means_by_set(
+            self,
+            *,
+            adc_col_preferred: str = "adc_ch3",
+            file_patterns: tuple[str, ...] = ("data_adc*.csv", "data_adc*"),
+            angles_expected: tuple[float, ...] = (0.0, 22.5, 45.0, 67.5, 90.0),
+            exclude_name_contains: tuple[str, ...] = ("C_Block",),  # <-- new: skip folders containing any of these
+            make_plot: bool = False,
+            ax=None,
+    ):
+        """
+        Find folders ending with calib{angle} (case-insensitive; accepts 67.5/67_5/67-5/67p5),
+        compute mean ADC per angle, split into sets of len(angles_expected).
+        Skips any folder whose name contains any substring in exclude_name_contains.
+        Returns tidy DataFrame: ['set_label','angle_deg','mean_adc','n','folder','adc_col'].
+        """
+        import re
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Root directory not found: {self.root_dir}")
+
+        def angle_to_regex_suffix(a: float) -> str:
+            if float(a).is_integer():
+                return rf"calib{int(a)}"
+            whole = int(np.floor(a))
+            frac = int(round((a - whole) * 10))
+            return rf"calib{whole}(?:[._\-p])?{frac}"
+
+        suffix_patterns = [angle_to_regex_suffix(a) for a in angles_expected]
+        folder_re = re.compile(rf"(?:{'|'.join(suffix_patterns)})$", re.IGNORECASE)
+
+        # Gather candidate folders (direct children first, then recursive)
+        cands = [p for p in self.root_dir.glob("*") if p.is_dir() and folder_re.search(p.name)]
+        if not cands:
+            cands = [p for p in self.root_dir.rglob("*") if p.is_dir() and folder_re.search(p.name)]
+
+        # NEW: exclude any with blocked substrings (case-insensitive contains)
+        if exclude_name_contains:
+            bad_l = tuple(s.lower() for s in exclude_name_contains)
+            cands = [p for p in cands if all(b not in p.name.lower() for b in bad_l)]
+
+        if not cands:
+            print("[extract_calib_means_by_set] No calib folders found after exclusions.")
+            return pd.DataFrame(columns=["set_label", "angle_deg", "mean_adc", "n", "folder", "adc_col"])
+
+        cands = sorted(set(cands), key=lambda p: p.name)
+
+        def parse_angle_from_name(name: str) -> float | None:
+            name_l = name.lower()
+            for a in angles_expected:
+                if float(a).is_integer() and f"calib{int(a)}" in name_l:
+                    return float(a)
+            m = re.search(r"calib(\d+)(?:[._\-p])?(\d+)$", name_l)
+            if m:
+                whole = float(m.group(1));
+                frac = float(m.group(2))
+                scale = 10.0 if frac < 10 else (100.0 if frac < 100 else 1.0)
+                return whole + frac / scale
+            return None
+
+        rows = []
+        for folder in cands:
+            ang = parse_angle_from_name(folder.name)
+            if ang is None:
+                continue
+
+            # pick largest data_adc*.csv
+            adc_files = []
+            for pat in file_patterns:
+                adc_files.extend([p for p in folder.glob(pat) if not self._is_bad_dot_underscore(p)])
+            if not adc_files:
+                for pat in file_patterns:
+                    adc_files.extend([p for p in folder.rglob(pat) if not self._is_bad_dot_underscore(p)])
+            if not adc_files:
+                print(f"[WARN] No ADC CSVs in calib folder: {folder}")
+                continue
+
+            adc_files = sorted(set(adc_files), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            df = self._read_csv_safe(adc_files[0])
+            if df is None or df.empty:
+                print(f"[WARN] Unreadable/empty ADC CSV in calib folder: {folder}")
+                continue
+
+            adc_col = adc_col_preferred if adc_col_preferred in df.columns else None
+            if adc_col is None:
+                adc_like = [c for c in df.columns if str(c).lower().startswith("adc")]
+                if not adc_like:
+                    print(f"[WARN] No ADC-like columns in {adc_files[0].name}")
+                    continue
+                adc_col = adc_like[0]
+
+            vals = pd.to_numeric(df[adc_col], errors="coerce").to_numpy(float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                print(f"[WARN] All-NaN ADC in {adc_files[0].name}")
+                continue
+
+            rows.append(dict(angle_deg=float(ang),
+                             mean_adc=float(np.nanmean(vals)),
+                             n=int(vals.size),
+                             folder=str(folder),
+                             adc_col=str(adc_col)))
+
+        if not rows:
+            return pd.DataFrame(columns=["set_label", "angle_deg", "mean_adc", "n", "folder", "adc_col"])
+
+        df = pd.DataFrame(rows).sort_values(["folder", "angle_deg"]).reset_index(drop=True)
+
+        k = len(angles_expected)
+        set_labels = []
+        for i in range(len(df)):
+            block = i // k
+            set_labels.append("first" if block == 0 else ("second" if block == 1 else f"set{block + 1}"))
+        df["set_label"] = set_labels
+
+        df["angle_deg"] = pd.Categorical(df["angle_deg"], categories=list(angles_expected), ordered=True)
+        df = df.sort_values(["set_label", "angle_deg"]).reset_index(drop=True)
+
+        if make_plot:
+            import matplotlib.pyplot as plt
+            if ax is None:
+                _, ax = plt.subplots(figsize=(6, 4))
+            for lbl, sub in df.groupby("set_label", sort=False):
+                ax.plot(sub["angle_deg"].astype(float), sub["mean_adc"], marker="o", label=lbl)
+            ax.set_xlabel("Angle (deg)")
+            ax.set_ylabel("Mean adc")
+            ax.set_title("Calibration means (ADC vs angle)")
+            ax.grid(alpha=0.25)
+            ax.legend()
+
+        return df
+
+
 
     def fit_and_set_calibration(
             self,
@@ -2677,104 +2812,187 @@ class bender_class:
 
         plt.show()
 
-    def plot_compact_pairwise_comparison(self, pairwise_min_accuracy, pairwise_abs_error,
-                                         xlabel_flat, group_size=3,
-                                         title1='Min Angle for 100% Accuracy',
-                                         title2='Mean Absolute Error', ylim=(0, 15)):
-        """
-        Compact overlayed double-bar plot showing:
-        - Blue = model trained/tested on same sample (self-trained)
-        - Red = model trained on first sample in group, tested on others (cross-trained)
-
-        Parameters:
-        - pairwise_min_accuracy (np.array): Matrix of min angle for 100% accuracy
-        - pairwise_abs_error (np.array): Matrix of mean absolute errors
-        - xlabel_flat (list): List of sample labels corresponding to DS_flat
-        - group_size (int): Number of samples per group
-        - title1 (str): Title for top subplot
-        - title2 (str): Title for bottom subplot
-        - ylim (tuple): Y-axis limits for both plots (e.g., (0, 15))
-        """
-        import matplotlib.pyplot as plt
+    def plot_compact_pairwise_comparison(
+            self,
+            pairwise_min_accuracy,
+            pairwise_abs_error,
+            xlabel_flat,
+            group_size=3,
+            title1='Min Angle for 100% Accuracy',
+            title2='Mean Absolute Error',
+            ylim=(0, 15),
+            # Optional distributions for error bars on Min Angle bars
+            self_minangle_dists=None,   # list[list[np.ndarray]]
+            cross_minangle_dists=None,  # list[list[np.ndarray]]; []/None for first in group
+            err_metric='sd',            # 'sd' or 'sem'
+            capsize=4,
+            # NEW: embed into an existing axes and align with left plot spacing
+            ax_top=None,                # if provided, draw ONLY the top bars into this axes
+            x_sample_centers=None,      # list of sample centers (same order as xlabel_flat)
+            group_centers=None,         # list of one center per group (for xticks)
+            group_labels=None,          # list of group labels (tick labels)
+            bar_w=0.24,                 # bar width for side-by-side bars
+            paired=True,                # if True, place red next to blue
+            show_sample_numbers=True,   # annotate "1,2,3,..."
+    ):
         import numpy as np
+        import matplotlib.pyplot as plt
 
         assert pairwise_min_accuracy.shape[0] == len(xlabel_flat)
         assert pairwise_min_accuracy.shape[0] % group_size == 0
-
         num_groups = pairwise_min_accuracy.shape[0] // group_size
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        bar_width = 0.6
-        inner_width = 0.4  # width for the red overlaid bar
-        x_all = []
+        def mean_sd(arr):
+            arr = np.asarray(arr, float)
+            if arr.size == 0:
+                return np.nan, np.nan
+            m = np.nanmean(arr)
+            s = np.nanstd(arr, ddof=1) if arr.size > 1 else np.nan
+            return m, s
 
-        for group_idx in range(num_groups):
-            base_idx = group_idx * group_size
-            x_group = np.arange(group_size) + group_idx * (group_size + 1.0)
-            x_all.extend(x_group)
+        def mean_sem(arr):
+            arr = np.asarray(arr, float)
+            n = np.sum(np.isfinite(arr))
+            if n == 0:
+                return np.nan, np.nan
+            m = np.nanmean(arr)
+            s = (np.nanstd(arr, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+            return m, s
 
-            min_self = []
-            min_cross = []
-            err_self = []
-            err_cross = []
+        use_err = (self_minangle_dists is not None) and (cross_minangle_dists is not None)
+        agg = mean_sem if err_metric.lower() == 'sem' else mean_sd
 
+        # Standalone mode (old behavior) OR embedded into provided ax_top
+        standalone = ax_top is None
+        if standalone:
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            ax_min = axes[0]
+            ax_err = axes[1]
+        else:
+            ax_min = ax_top
+            ax_err = None
+
+        # ----- Build flat arrays in sample order -----
+        min_self  = []
+        min_cross = []
+        self_yerr = []
+        cross_yerr = []
+
+        for g in range(num_groups):
+            base = g * group_size
             for i in range(group_size):
-                idx = base_idx + i
-                min_self.append(pairwise_min_accuracy[idx, idx])
-                err_self.append(pairwise_abs_error[idx, idx])
-
-                # Cross-trained using first sample in group
-                cross_idx = base_idx
-                if idx != cross_idx:
-                    min_cross.append(pairwise_min_accuracy[cross_idx, idx])
-                    err_cross.append(pairwise_abs_error[cross_idx, idx])
-                else:
-                    min_cross.append(np.nan)  # skip duplicate
-                    err_cross.append(np.nan)
-
-            # --- Plot Top Subplot: Min Angle ---
-            axes[0].bar(x_group, min_self, width=bar_width, color='blue',
-                        label='Self-trained' if group_idx == 0 else "")
-            axes[0].bar(x_group, min_cross, width=inner_width, color='red', alpha=0.7,
-                        label='Cross-trained (model 1)' if group_idx == 0 else "")
-
-            # --- Plot Bottom Subplot: Mean Error ---
-            axes[1].bar(x_group, err_self, width=bar_width, color='blue')
-            axes[1].bar(x_group, err_cross, width=inner_width, color='red', alpha=0.7)
-
-        # --- Format Top Subplot ---
-        axes[0].set_ylabel('Min Angle (deg)')
-        axes[0].set_ylim(ylim)
-        axes[0].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
-        axes[0].set_title(title1)
-        axes[0].legend()
-        axes[0].grid(True, linestyle='--', alpha=0.5)
-
-        # --- Format Bottom Subplot ---
-        axes[1].set_ylabel('Mean Error (deg)')
-        axes[1].set_xlabel('Sample')
-        axes[1].set_ylim(ylim)
-        axes[1].set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
-        axes[1].set_title(title2)
-        axes[1].grid(True, linestyle='--', alpha=0.5)
-
-        # --- Annotated X-Axis Labels ---
-        xtick_labels = []
-        for group_idx in range(num_groups):
-            base_idx = group_idx * group_size
-            for i in range(group_size):
-                idx = base_idx + i
-                label = xlabel_flat[idx]
+                sidx = base + i
+                # bars (means) from matrices
+                min_self.append(pairwise_min_accuracy[sidx, sidx])   # diagonal
+                # cross is first in group -> others
                 if i == 0:
-                    label += " (model 1)"
-                xtick_labels.append(label)
+                    min_cross.append(np.nan)  # no red on model-1
+                else:
+                    min_cross.append(pairwise_min_accuracy[base, sidx])
 
-        axes[1].set_xticks(x_all)
-        axes[1].set_xticklabels(xtick_labels, rotation=45, ha='right')
+                if use_err:
+                    s_arr = self_minangle_dists[g][i]
+                    _, s_err = agg(s_arr)
+                    self_yerr.append(s_err)
 
-        plt.tight_layout()
-        plt.savefig("compact pairwise comp.png", dpi=300, bbox_inches='tight')
-        plt.show()
+                    c_arr = cross_minangle_dists[g][i]
+                    if (i == 0) or (c_arr is None) or (len(c_arr) == 0):
+                        cross_yerr.append(np.nan)
+                    else:
+                        _, c_err = agg(c_arr)
+                        cross_yerr.append(c_err)
+
+        min_self  = np.asarray(min_self, dtype=float)
+        min_cross = np.asarray(min_cross, dtype=float)
+        self_yerr = np.asarray(self_yerr, dtype=float) if use_err else None
+        cross_yerr = np.asarray(cross_yerr, dtype=float) if use_err else None
+
+        # ----- X positions -----
+        if not paired:
+            # overlay mode (legacy): blue full-width, red inner-width
+            x_idx = []
+            for g in range(num_groups):
+                x_idx.extend(list(np.arange(group_size) + g * (group_size + 1.0)))
+            x_idx = np.asarray(x_idx, dtype=float)
+            ax_min.bar(x_idx, min_self, width=0.60, color='blue', label='Self-trained')
+            ax_min.bar(x_idx, min_cross, width=0.40, color='red', alpha=0.7, label='Cross-trained (model 1)')
+            if use_err:
+                ax_min.errorbar(x_idx, min_self,  yerr=self_yerr,  fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+                ax_min.errorbar(x_idx, min_cross, yerr=cross_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+            # ticks per sample (legacy)
+            ax_min.set_xticks(x_idx)
+            ax_min.set_xticklabels(xlabel_flat, rotation=45, ha='right')
+        else:
+            # side-by-side mode aligned to provided sample centers
+            assert x_sample_centers is not None, "Provide x_sample_centers for paired=True"
+            x_centers = np.asarray(x_sample_centers, dtype=float)
+            x_self  = x_centers - bar_w/2
+            x_cross = x_centers + bar_w/2
+            # mask out first-in-group for cross bars
+            cross_mask = []
+            for g in range(num_groups):
+                cross_mask.extend([False] + [True]*(group_size-1))
+            cross_mask = np.asarray(cross_mask, dtype=bool)
+
+            # draw bars
+            ax_min.bar(x_self, min_self,  width=bar_w, color='blue', label='Self-trained')
+            ax_min.bar(x_cross[cross_mask], min_cross[cross_mask], width=bar_w, color='red', alpha=0.7,
+                       label='Cross-trained (model 1)')
+
+            # error bars
+            if use_err:
+                ax_min.errorbar(x_self, min_self, yerr=self_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+                ax_min.errorbar(x_cross[cross_mask], min_cross[cross_mask],
+                                yerr=cross_yerr[cross_mask], fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+
+            # group-level ticks
+            assert (group_centers is not None) and (group_labels is not None), \
+                "Provide group_centers and group_labels for paired=True"
+            ax_min.set_xticks(group_centers)
+            ax_min.set_xticklabels(group_labels)
+
+            # sample numbers above each sample center
+            if show_sample_numbers:
+                # numbers 1..group_size repeating per group
+                sample_nums = []
+                for g in range(num_groups):
+                    sample_nums.extend([str(i+1) for i in range(group_size)])
+                # y placement: max of self(+err) and cross(+err)
+                ymin, ymax = ylim
+                y_pad = 0.02 * (ymax - ymin)
+                for i, xc in enumerate(x_centers):
+                    y_self_top = min_self[i] + (self_yerr[i] if (use_err and np.isfinite(self_yerr[i])) else 0.0)
+                    if cross_mask[i]:
+                        y_cross_top = min_cross[i] + (cross_yerr[i] if (use_err and np.isfinite(cross_yerr[i])) else 0.0)
+                        y_top = max(y_self_top, y_cross_top)
+                    else:
+                        y_top = y_self_top
+                    ax_min.text(xc, y_top + y_pad, sample_nums[i], ha='center', va='bottom', fontsize=12, fontweight='bold', clip_on=False)
+
+        # style & labels
+        ax_min.set_ylabel('Min Angle (deg)')
+        ax_min.set_title(title1)
+        ax_min.set_ylim(ylim)
+        ax_min.legend(frameon=False)
+
+        # clean style per your request
+        ax_min.grid(False)
+        ax_min.spines['top'].set_visible(False)
+        ax_min.spines['right'].set_visible(False)
+
+        if standalone:
+            # Bottom subplot (legacy mode) if you ever call without ax_top
+            # (kept unchanged; you said you only need the top when embedding)
+            ax_err.set_ylabel('Mean Error (deg)')
+            ax_err.set_xlabel('Sample')
+            ax_err.set_ylim(ylim)
+            ax_err.set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
+            ax_err.set_title(title2)
+            ax_err.grid(True, linestyle='--', alpha=0.5)
+            plt.tight_layout()
+            plt.savefig("compact_pairwise_comp.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
 
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
         """
@@ -3526,8 +3744,14 @@ class bender_class:
         plt.ylabel(ylabel)
         plt.title(title)
 
+
         if ylim:
             plt.ylim(ylim)
+
+        ax = plt.gca()
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='both', which='major', labelsize=20)
 
         plt.savefig("min_angle_bar_chart.png", dpi=300, bbox_inches='tight')
 
