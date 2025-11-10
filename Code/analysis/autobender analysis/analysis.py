@@ -2821,22 +2821,32 @@ class bender_class:
             title1='Min Angle for 100% Accuracy',
             title2='Mean Absolute Error',
             ylim=(0, 15),
+
             # Optional distributions for error bars on Min Angle bars
-            self_minangle_dists=None,   # list[list[np.ndarray]]
+            self_minangle_dists=None,  # list[list[np.ndarray]]
             cross_minangle_dists=None,  # list[list[np.ndarray]]; []/None for first in group
-            err_metric='sd',            # 'sd' or 'sem'
+            err_metric='sd',  # 'sd' or 'sem'
             capsize=4,
-            # NEW: embed into an existing axes and align with left plot spacing
-            ax_top=None,                # if provided, draw ONLY the top bars into this axes
-            x_sample_centers=None,      # list of sample centers (same order as xlabel_flat)
-            group_centers=None,         # list of one center per group (for xticks)
-            group_labels=None,          # list of group labels (tick labels)
-            bar_w=0.24,                 # bar width for side-by-side bars
-            paired=True,                # if True, place red next to blue
-            show_sample_numbers=True,   # annotate "1,2,3,..."
+
+            # Embed into an existing axes and align with left plot spacing
+            ax_top=None,  # if provided, draw ONLY the top bars into this axes
+            x_sample_centers=None,  # list of sample centers (same order as xlabel_flat)
+            group_centers=None,  # list of one center per group (for xticks)
+            group_labels=None,  # list of group labels (tick labels)
+            bar_w=0.24,  # bar width for side-by-side bars
+            paired=True,  # if True, place red next to blue
+
+            # Appearance controls
+            show_sample_numbers=False,  # OFF by default (no numbers above bars)
+            self_color='blue',  # can be RGBA tuple to match left
+            cross_color='red',  # can be RGBA tuple to match left
+            legend_self_label='Self-trained model',
+            legend_cross_label='Model 1',
+            tick_every_1=True  # force y-ticks every 1
     ):
         import numpy as np
         import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
 
         assert pairwise_min_accuracy.shape[0] == len(xlabel_flat)
         assert pairwise_min_accuracy.shape[0] % group_size == 0
@@ -2862,7 +2872,7 @@ class bender_class:
         use_err = (self_minangle_dists is not None) and (cross_minangle_dists is not None)
         agg = mean_sem if err_metric.lower() == 'sem' else mean_sd
 
-        # Standalone mode (old behavior) OR embedded into provided ax_top
+        # Standalone or embedded
         standalone = ax_top is None
         if standalone:
             fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
@@ -2873,7 +2883,7 @@ class bender_class:
             ax_err = None
 
         # ----- Build flat arrays in sample order -----
-        min_self  = []
+        min_self = []
         min_cross = []
         self_yerr = []
         cross_yerr = []
@@ -2883,10 +2893,10 @@ class bender_class:
             for i in range(group_size):
                 sidx = base + i
                 # bars (means) from matrices
-                min_self.append(pairwise_min_accuracy[sidx, sidx])   # diagonal
+                min_self.append(pairwise_min_accuracy[sidx, sidx])  # diagonal
                 # cross is first in group -> others
                 if i == 0:
-                    min_cross.append(np.nan)  # no red on model-1
+                    min_cross.append(np.nan)  # no red on model-1 for first-in-group
                 else:
                     min_cross.append(pairwise_min_accuracy[base, sidx])
 
@@ -2902,97 +2912,110 @@ class bender_class:
                         _, c_err = agg(c_arr)
                         cross_yerr.append(c_err)
 
-        min_self  = np.asarray(min_self, dtype=float)
+        min_self = np.asarray(min_self, dtype=float)
         min_cross = np.asarray(min_cross, dtype=float)
         self_yerr = np.asarray(self_yerr, dtype=float) if use_err else None
         cross_yerr = np.asarray(cross_yerr, dtype=float) if use_err else None
 
         # ----- X positions -----
         if not paired:
-            # overlay mode (legacy): blue full-width, red inner-width
+            # overlay mode (legacy)
             x_idx = []
             for g in range(num_groups):
                 x_idx.extend(list(np.arange(group_size) + g * (group_size + 1.0)))
             x_idx = np.asarray(x_idx, dtype=float)
-            ax_min.bar(x_idx, min_self, width=0.60, color='blue', label='Self-trained')
-            ax_min.bar(x_idx, min_cross, width=0.40, color='red', alpha=0.7, label='Cross-trained (model 1)')
+
+            ax_min.bar(x_idx, min_self, width=0.60, color=self_color, label=legend_self_label)
+            ax_min.bar(x_idx, min_cross, width=0.40, color=cross_color, alpha=0.7, label=legend_cross_label)
+
             if use_err:
-                ax_min.errorbar(x_idx, min_self,  yerr=self_yerr,  fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
-                ax_min.errorbar(x_idx, min_cross, yerr=cross_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
-            # ticks per sample (legacy)
+                ax_min.errorbar(x_idx, min_self, yerr=self_yerr, fmt='none', ecolor='k', elinewidth=1.1,
+                                capsize=capsize)
+                ax_min.errorbar(x_idx, min_cross, yerr=cross_yerr, fmt='none', ecolor='k', elinewidth=1.1,
+                                capsize=capsize)
+
             ax_min.set_xticks(x_idx)
             ax_min.set_xticklabels(xlabel_flat, rotation=45, ha='right')
+
         else:
-            # side-by-side mode aligned to provided sample centers
+            # side-by-side aligned with provided sample centers
             assert x_sample_centers is not None, "Provide x_sample_centers for paired=True"
             x_centers = np.asarray(x_sample_centers, dtype=float)
-            x_self  = x_centers - bar_w/2
-            x_cross = x_centers + bar_w/2
+
+            # left/right bar positions relative to center
+            x_self = x_centers - bar_w / 2
+            x_cross = x_centers + bar_w / 2
+
             # mask out first-in-group for cross bars
             cross_mask = []
-            for g in range(num_groups):
-                cross_mask.extend([False] + [True]*(group_size-1))
+            for _g in range(num_groups):
+                cross_mask.extend([False] + [True] * (group_size - 1))
             cross_mask = np.asarray(cross_mask, dtype=bool)
 
             # draw bars
-            ax_min.bar(x_self, min_self,  width=bar_w, color='blue', label='Self-trained')
-            ax_min.bar(x_cross[cross_mask], min_cross[cross_mask], width=bar_w, color='red', alpha=0.7,
-                       label='Cross-trained (model 1)')
+            ax_min.bar(x_self, min_self, width=bar_w, color=self_color, label=legend_self_label)
+            ax_min.bar(x_cross[cross_mask], min_cross[cross_mask], width=bar_w, color=cross_color, alpha=0.7,
+                       label=legend_cross_label)
 
             # error bars
             if use_err:
-                ax_min.errorbar(x_self, min_self, yerr=self_yerr, fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
+                ax_min.errorbar(x_self, min_self, yerr=self_yerr, fmt='none', ecolor='k', elinewidth=1.1,
+                                capsize=capsize)
                 ax_min.errorbar(x_cross[cross_mask], min_cross[cross_mask],
                                 yerr=cross_yerr[cross_mask], fmt='none', ecolor='k', elinewidth=1.1, capsize=capsize)
 
-            # group-level ticks
+            # group ticks
             assert (group_centers is not None) and (group_labels is not None), \
                 "Provide group_centers and group_labels for paired=True"
             ax_min.set_xticks(group_centers)
             ax_min.set_xticklabels(group_labels)
 
-            # sample numbers above each sample center
+            # optional sample numbers above centers (OFF by default)
             if show_sample_numbers:
-                # numbers 1..group_size repeating per group
                 sample_nums = []
-                for g in range(num_groups):
-                    sample_nums.extend([str(i+1) for i in range(group_size)])
-                # y placement: max of self(+err) and cross(+err)
+                for _g in range(num_groups):
+                    sample_nums.extend([str(i + 1) for i in range(group_size)])
                 ymin, ymax = ylim
                 y_pad = 0.02 * (ymax - ymin)
                 for i, xc in enumerate(x_centers):
                     y_self_top = min_self[i] + (self_yerr[i] if (use_err and np.isfinite(self_yerr[i])) else 0.0)
                     if cross_mask[i]:
-                        y_cross_top = min_cross[i] + (cross_yerr[i] if (use_err and np.isfinite(cross_yerr[i])) else 0.0)
-                        y_top = max(y_self_top, y_cross_top)
+                        y_cross_top = min_cross[i] + (
+                            cross_yerr[i] if (use_err and np.isfinite(cross_yerr[i])) else 0.0)
+                        y_top = np.nanmax([y_self_top, y_cross_top])
                     else:
                         y_top = y_self_top
-                    ax_min.text(xc, y_top + y_pad, sample_nums[i], ha='center', va='bottom', fontsize=12, fontweight='bold', clip_on=False)
+                    ax_min.text(xc, y_top + y_pad, sample_nums[i], ha='center', va='bottom',
+                                fontsize=12, fontweight='bold', clip_on=False)
 
         # style & labels
         ax_min.set_ylabel('Min Angle (deg)')
         ax_min.set_title(title1)
         ax_min.set_ylim(ylim)
-        ax_min.legend(frameon=False)
+        if tick_every_1:
+            ax_min.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
+            ax_min.yaxis.set_major_formatter(mticker.FormatStrFormatter('%d'))
+            ax_min.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
 
-        # clean style per your request
+        ax_min.legend(frameon=False)
         ax_min.grid(False)
         ax_min.spines['top'].set_visible(False)
         ax_min.spines['right'].set_visible(False)
 
         if standalone:
             # Bottom subplot (legacy mode) if you ever call without ax_top
-            # (kept unchanged; you said you only need the top when embedding)
             ax_err.set_ylabel('Mean Error (deg)')
             ax_err.set_xlabel('Sample')
             ax_err.set_ylim(ylim)
-            ax_err.set_yticks(np.arange(ylim[0], ylim[1] + 1, 1))
+            if tick_every_1:
+                ax_err.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
+                ax_err.yaxis.set_major_formatter(mticker.FormatStrFormatter('%d'))
+                ax_err.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
             ax_err.set_title(title2)
             ax_err.grid(True, linestyle='--', alpha=0.5)
             plt.tight_layout()
             plt.savefig("compact_pairwise_comp.png", dpi=300, bbox_inches='tight')
             plt.show()
-
 
     def plot_pairwise_mean_error_heatmap(self, df_results, group_dict, group_colors, label):
         """
@@ -3704,57 +3727,121 @@ class bender_class:
 
         return min_angle_100, all_min_angle_100
 
-
-    def plot_bar_chart(self, data, labels, title, ylabel, colors, ylim=None):
+    def plot_bar_chart(
+            self,
+            data,
+            labels,
+            title,
+            ylabel,
+            colors,
+            ylim=None,
+            *,
+            # --- spacing knobs ---
+            bar_width: float = 0.24,  # width of the plotted (blue) bars
+            paired_offset: float = 0.30,  # half the distance between "self" (blue) and reserved "cross" (red)
+            intra_group_spacing: float = 0.80,  # distance between consecutive samples within a group
+            gap_between_groups: float = 1.40,  # gap between groups
+            leave_gaps_for_cross: bool = True,  # True => plot only left slot and leave right slot empty
+            fontsize_axis: int = 20,
+            figsize=(8, 6),
+            outfile: str = "min_angle_bar_chart.pdf",
+    ):
         """
-        Plots grouped bars with different colors for each group.
+        Plot grouped bars with a *reserved empty slot* per sample (as if cross-trained bars were present).
+        'data' is a list of groups; each group is a list of sample values:
+          - float -> a single value bar
+          - list/array -> mean bar with std error bar
 
-        Parameters:
-        - data: List of lists, where each sublist represents values for a group.
-        - labels: List of group names.
-        - title: Chart title.
-        - ylabel: Y-axis label.
-        - colors: List of colors for each group.
-        - ylim: Tuple (ymin, ymax) for y-axis limit.
+        Spacing:
+          centers (per sample) separated by 'intra_group_spacing'
+          within each center, we reserve two slots:
+              left  = center - paired_offset/2  (we draw the blue bar here)
+              right = center + paired_offset/2  (left empty, reserved for "red")
         """
-        num_groups = len(data)  # Number of groups (e.g., 3)
-        max_bars = max(len(group) for group in data)  # Find the maximum datasets in any group
-        bar_width = 0.2  # Controls spacing between bars in a group
+        import numpy as np
+        import matplotlib as mpl
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
 
-        x_positions = np.arange(num_groups)  # X positions for the groups
+        # Illustrator-friendly export (editable text)
+        mpl.rcParams['pdf.fonttype'] = 42
+        mpl.rcParams['ps.fonttype'] = 42
+        mpl.rcParams['font.sans-serif'] = ['Arial']
+        mpl.rcParams['font.family'] = 'sans-serif'
 
-        plt.figure(figsize=(8, 6))
+        num_groups = len(data)
+        if len(colors) != len(labels):
+            colors = ["b"] * len(labels)
 
-        for i, (group_values, color) in enumerate(zip(data, colors)):
-            num_bars = len(group_values)
-            x_offsets = np.linspace(-bar_width * (num_bars - 1) / 2, bar_width * (num_bars - 1) / 2, num_bars)
+        # ---- compute positions: sample centers, then left-slot for "self" ----
+        positions_centers = []  # sample centers (for optional sample labels if needed)
+        positions_self = []  # where we actually plot blue bars (left slot)
+        xticks_group = []  # one tick per group at its center
+        x_cursor = 1.0
 
-            # Plot bars for this group, slightly offset from center position
-            for j, (val, offset) in enumerate(zip(group_values, x_offsets)):
-                print(type(val))
-                if type(val) is float: 
-                    plt.bar(x_positions[i] + offset, val, width=bar_width, color=color,
-                        label=f"Sample {j + 1}" if i == 0 else "")
-                elif type(val) is list:
-                    plt.bar(x_positions[i] + offset, np.mean(np.array(val)), width=bar_width, color=color,
-                        label=f"Sample {j + 1}" if i == 0 else "", yerr=np.std(np.array(val)), capsize=5, error_kw={'elinewidth': 1.5})
-                    
-        # Set x-ticks to group labels
-        plt.xticks(x_positions, labels)
-        plt.ylabel(ylabel)
-        plt.title(title)
+        for gi, group in enumerate(data):
+            n = len(group)
+            centers = list(x_cursor + np.arange(n) * intra_group_spacing)
+            positions_centers.extend(centers)
+            # group tick at group center
+            xticks_group.append(np.mean(centers))
+            # reserve two slots per center; we plot only left
+            left_slots = [c - paired_offset / 2 for c in centers]
+            positions_self.extend(left_slots)
+            # advance cursor to next group start
+            x_cursor = centers[-1] + gap_between_groups + intra_group_spacing
 
+        # flatten values and colors per sample
+        flat_vals = []
+        colors_for_bars = []
+        for gi, (group, c) in enumerate(zip(data, colors)):
+            for sample in group:
+                flat_vals.append(sample)
+                colors_for_bars.append(c)
+
+        # ---- plotting ----
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # draw only the left-slot bars, leaving right slot visually empty
+        for x, sample, c in zip(positions_self, flat_vals, colors_for_bars):
+            if isinstance(sample, (float, np.floating, int, np.integer)):
+                ax.bar(x, float(sample), width=bar_width, color=c)
+            else:
+                vals = np.asarray(sample, dtype=float)
+                m = float(np.nanmean(vals)) if vals.size else np.nan
+                s = float(np.nanstd(vals)) if vals.size else np.nan
+                ax.bar(x, m, width=bar_width, color=c,
+                       yerr=s, capsize=5, error_kw={'elinewidth': 1.5})
+
+        # axes labels / ticks
+        ax.set_xticks(xticks_group)
+        ax.set_xticklabels(labels, fontsize=fontsize_axis)
+        ax.set_xlabel("Sensor Length Group (in)", fontsize=fontsize_axis)
+        ax.set_ylabel(ylabel, fontsize=fontsize_axis)
+        ax.set_title(title, fontsize=fontsize_axis)
 
         if ylim:
-            plt.ylim(ylim)
+            ax.set_ylim(ylim)
 
-        ax = plt.gca()
+        # style
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.tick_params(axis='both', which='major', labelsize=20)
+        ax.tick_params(axis='both', which='major', labelsize=fontsize_axis)
 
-        plt.savefig("min_angle_bar_chart.png", dpi=300, bbox_inches='tight')
+        # 1-unit y-ticks
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%d'))
+        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
 
+        # OPTIONAL: draw faint guides to show the empty reserved slot (where red would be)
+        if leave_gaps_for_cross:
+            # light markers to suggest reserved slot spacing (no actual bars)
+            for xc in positions_centers:
+                reserved_x = xc + paired_offset / 2
+                ax.plot([reserved_x, reserved_x], [0, 0], marker='|', color='0.7', alpha=0.6)
+
+        plt.tight_layout()
+        plt.savefig(outfile, bbox_inches='tight')
         plt.show()
 
     def plot_double_bar_chart(self, list1, list2, labels,

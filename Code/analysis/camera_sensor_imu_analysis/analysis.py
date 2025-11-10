@@ -373,16 +373,44 @@ class BallBearingData:
     def extract_dlc3d_dfs_by_trial(
             self,
             trial_folders: list[str] | list[Path],
-            file_patterns: tuple[str, ...] = (
-                    "*DLC*.csv", "*DLC3D*.csv", "*dlc3d*.csv", "*3d*.csv", "*3D*.csv"
-            ),
+            file_patterns: tuple[str, ...] = ("*DLC*.csv", "*DLC3D*.csv", "*dlc3d*.csv", "*3d*.csv", "*3D*.csv"),
+            *,
+            # NEW labeling controls
+            add_labels: bool = True,
+            trial_labels: Optional[List[int]] = None,
+            trial_base: int = 1,
+            set_label: Optional[str] = None,
+            set_labels: Optional[List[str]] = None,
+            include_path: bool = False,
     ) -> list[pd.DataFrame]:
         """
         Find DLC 3D csv per trial folder. Picks the largest matching csv in each folder (or nested).
-        Returns a list of DataFrames (already coerced to MultiIndex if possible).
+        Returns a list of DataFrames (MultiIndex if possible). If add_labels=True, stamps 'trial' and 'set_label'.
         """
+        import pandas as pd
+        from pathlib import Path
+
         out: list[pd.DataFrame] = []
-        for folder in trial_folders:
+
+        n = len(trial_folders)
+        if trial_labels is None:
+            labels_trial = [trial_base + i for i in range(n)]
+        else:
+            if len(trial_labels) != n:
+                raise ValueError("trial_labels length must match trial_folders length.")
+            labels_trial = trial_labels
+
+        if set_labels is not None and len(set_labels) != n:
+            raise ValueError("set_labels length must match trial_folders length.")
+
+        def _label_for(i: int) -> tuple[Optional[int], Optional[str]]:
+            tlabel = labels_trial[i] if add_labels else None
+            slabel = None
+            if add_labels:
+                slabel = set_labels[i] if set_labels is not None else set_label
+            return tlabel, slabel
+
+        for i, folder in enumerate(trial_folders):
             fp = Path(folder)
 
             # find candidates
@@ -394,14 +422,26 @@ class BallBearingData:
                     cands.extend([p for p in fp.rglob(pat) if not self._is_bad_dot_underscore(p)])
 
             if not cands:
-                out.append(pd.DataFrame());
+                df = pd.DataFrame()
+                tlabel, slabel = _label_for(i)
+                if add_labels:
+                    if tlabel is not None: df["trial"] = [tlabel]
+                    if slabel is not None: df["set_label"] = [slabel]
+                if include_path: df["source_path"] = [str(fp)]
+                out.append(df)
                 continue
 
             # prefer largest file (full export)
             cands = sorted(set(cands), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
             df0 = self._read_csv_safe(cands[0])
             if df0 is None or df0.empty:
-                out.append(pd.DataFrame());
+                df = pd.DataFrame()
+                tlabel, slabel = _label_for(i)
+                if add_labels:
+                    if tlabel is not None: df["trial"] = [tlabel]
+                    if slabel is not None: df["set_label"] = [slabel]
+                if include_path: df["source_path"] = [str(cands[0])]
+                out.append(df)
                 continue
 
             # normalize to MultiIndex if it looks like a flat DLC export
@@ -410,8 +450,433 @@ class BallBearingData:
             except Exception:
                 df_coerced = df0
 
+            # stamp labels (don’t overwrite if already present)
+            if add_labels and not df_coerced.empty:
+                tlabel, slabel = _label_for(i)
+                if ("trial" not in df_coerced.columns) and (tlabel is not None):
+                    df_coerced = df_coerced.copy();
+                    df_coerced["trial"] = tlabel
+                if ("set_label" not in df_coerced.columns) and (slabel is not None):
+                    df_coerced = df_coerced.copy();
+                    df_coerced["set_label"] = slabel
+
+            if include_path:
+                df_coerced = df_coerced.copy();
+                df_coerced["source_path"] = str(cands[0])
+
             out.append(df_coerced)
         return out
+
+    def calibrate_four_from_overlays_and_stream(
+            self,
+            overlays: dict,
+            *,
+            adc_trials_first: list | None = None,
+            adc_trials_second: list | None = None,
+            anchors_mode: str = "stream_per_set",  # "stream_per_set" | "stream_per_cal" | "endpoints_per_cal"
+            q_hi: float = 0.999,
+            q_lo: float = 0.001,
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
+            clip_z: bool = True,
+            extrapolate: bool = False,
+            clamp_theta: bool = True,
+            trial_len_sec: float = 10.0,
+            plot: bool = True,
+            # styling
+            linewidth: float = 1.8,
+            alpha_curves: float = 0.95,
+            figsize=(10.5, 4.2),
+            label_cam1="Camera 1", label_blk1="Block 1",
+            label_cam2="Camera 2", label_blk2="Block 2",
+            verbose: bool = True,
+    ):
+        import numpy as _np
+        import pandas as _pd
+        import copy
+        import matplotlib.pyplot as _plt
+
+        # ---------- helpers ----------
+        def _coeffs(tag):
+            ov = overlays.get(tag, {})
+            if not ov or not ov.get("ok"):
+                return None
+            c0, c1, c2 = ov.get("coeffs", (None, None, None))
+            if c0 is None or c1 is None or c2 is None:
+                return None
+            return float(c0), float(c1), float(c2)
+
+        def _poly_y(th_deg, c0, c1, c2):
+            th = float(th_deg)
+            return c0 + c1 * th + c2 * th * th
+
+        def _stack_adc(trials):
+            parts = []
+            for df in (trials or []):
+                if df is None or df.empty:
+                    continue
+                col = "adc_ch3" if "adc_ch3" in df.columns else next(
+                    (c for c in df.columns if str(c).lower().startswith("adc")), None
+                )
+                if col is None:
+                    continue
+                parts.append(_pd.to_numeric(df[col], errors="coerce"))
+            return _pd.concat(parts, ignore_index=True) if parts else _pd.Series(dtype=float)
+
+        def _anchors_from_stream(trials, q_hi, q_lo):
+            s = _stack_adc(trials)
+            if s.empty:
+                return _np.nan, _np.nan, True
+            y_raw = _np.asarray(s, float)
+            return float(_np.nanquantile(y_raw, q_hi)), float(_np.nanquantile(y_raw, q_lo)), False
+
+        def _anchors_from_endpoints(c0, c1, c2):
+            return float(_poly_y(0.0, c0, c1, c2)), float(_poly_y(90.0, c0, c1, c2))
+
+        def _clone_and_install_inverse(base_bb, c0, c1, c2, y0, y90, source_tag):
+            b = copy.deepcopy(base_bb)
+            if not hasattr(b, "calib") or not isinstance(getattr(b, "calib", None), dict):
+                b.calib = {}
+            b.calib.update(c0=float(c0), c1=float(c1), c2=float(c2), y0=float(y0), y90=float(y90),
+                           source=source_tag)
+            b.build_poly_inverse(clip_z=clip_z, extrapolate=extrapolate,
+                                 deg_min=deg_min, deg_max=deg_max)
+            return b
+
+        def _tall(bb_obj, trials, set_label):
+            if (not trials) or (bb_obj is None):
+                return _pd.DataFrame(columns=["set_label", "trial", "time_s", "timestamp",
+                                              "theta_pred_deg", "adc_ch3"])
+            return bb_obj.trials_to_tall_df(
+                trials, set_label=set_label, trial_len_sec=trial_len_sec,
+                use_poly_inverse=True, clamp_theta=clamp_theta
+            )
+
+        def _attach_oob(df, y0, y90):
+            if df.empty:
+                return df
+            lo, hi = (y90, y0) if y90 < y0 else (y0, y90)
+            col = "adc_ch3" if "adc_ch3" in df.columns else next(
+                (c for c in df.columns if str(c).lower().startswith("adc")), None
+            )
+            if col is None:
+                return df
+            v = _pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+            over = v > hi
+            under = v < lo
+            oob = _pd.DataFrame({
+                "adc_raw": v, "oob_over_hi": over, "oob_under_lo": under,
+                "oob_margin": _np.where(over, v - hi, _np.where(under, lo - v, 0.0)),
+            })
+            return _pd.concat([df.reset_index(drop=True), oob], axis=1)
+
+        def _trial_ids_union(df_a, df_b):
+            ids = set()
+            if (df_a is not None) and (not df_a.empty) and ("trial" in df_a.columns):
+                ids |= set(_pd.to_numeric(df_a["trial"], errors="coerce").dropna().astype(int).unique())
+            if (df_b is not None) and (not df_b.empty) and ("trial" in df_b.columns):
+                ids |= set(_pd.to_numeric(df_b["trial"], errors="coerce").dropna().astype(int).unique())
+            return sorted(list(ids))
+
+        # NEW: attach original timestamps from raw trials by (set_label, trial, row-order)
+        def _attach_timestamp_from_trials(tall_df, trials, set_label):
+            """
+            Append original integer 'timestamp' from `trials` into `tall_df`,
+            aligning by (set_label, trial, row-order). No dtype conversion.
+            If tall_df already has 'timestamp', this is a no-op.
+            """
+            if tall_df is None or tall_df.empty:
+                return tall_df
+            if "timestamp" in tall_df.columns:
+                return tall_df  # already present
+
+            df = tall_df.copy()
+            df["_row_idx"] = df.groupby(["set_label", "trial"]).cumcount()
+
+            parts = []
+            for t_id, raw in enumerate(trials or [], start=1):  # 1-based to match your trials
+                if raw is None or len(raw) == 0 or "timestamp" not in raw.columns:
+                    continue
+                ts = _pd.to_numeric(raw["timestamp"], errors="coerce")
+                idx = _pd.DataFrame({
+                    "set_label": set_label,
+                    "trial": t_id,
+                    "_row_idx": _np.arange(len(ts), dtype=int),
+                    "timestamp": ts.to_numpy()
+                })
+                parts.append(idx)
+
+            if not parts:
+                return df.drop(columns=["_row_idx"], errors="ignore")
+
+            attach = _pd.concat(parts, ignore_index=True)
+            df = _pd.merge(df, attach, on=["set_label", "trial", "_row_idx"], how="left")
+            return df.drop(columns=["_row_idx"], errors="ignore")
+
+        # ---------- grab coeffs ----------
+        c_blk1 = _coeffs("block1")
+        c_blk2 = _coeffs("block2")
+        c_cam1 = _coeffs("cam1")
+        c_cam2 = _coeffs("cam2")
+
+        if verbose:
+            print("[four] coeffs found:",
+                  f"blk1={c_blk1 is not None}, blk2={c_blk2 is not None}, cam1={c_cam1 is not None}, cam2={c_cam2 is not None}")
+
+        # ---------- compute anchors per mode ----------
+        anchors_per_cal = {}  # y0,y90 per calibration key
+        mode = anchors_mode.lower()
+
+        if mode not in {"stream_per_set", "stream_per_cal", "endpoints_per_cal"}:
+            raise ValueError("anchors_mode must be one of {'stream_per_set','stream_per_cal','endpoints_per_cal'}")
+
+        if mode == "stream_per_set":
+            # first set (shared by blk1 + cam1)
+            y0_f, y90_f, empty_f = _anchors_from_stream(adc_trials_first, q_hi, q_lo)
+            if empty_f and (c_blk1 or c_cam1):
+                pool = [c for c in (c_blk1, c_cam1) if c]
+                y0_f = float(_np.mean([_poly_y(0, *c) for c in pool]))
+                y90_f = float(_np.mean([_poly_y(90, *c) for c in pool]))
+            # second set (shared by blk2 + cam2)
+            y0_s, y90_s, empty_s = _anchors_from_stream(adc_trials_second, q_hi, q_lo)
+            if empty_s and (c_blk2 or c_cam2):
+                pool = [c for c in (c_blk2, c_cam2) if c]
+                y0_s = float(_np.mean([_poly_y(0, *c) for c in pool]))
+                y90_s = float(_np.mean([_poly_y(90, *c) for c in pool]))
+
+            anchors_per_cal["blk1"] = {"y0": y0_f, "y90": y90_f, "mode": mode}
+            anchors_per_cal["cam1"] = {"y0": y0_f, "y90": y90_f, "mode": mode}
+            anchors_per_cal["blk2"] = {"y0": y0_s, "y90": y90_s, "mode": mode}
+            anchors_per_cal["cam2"] = {"y0": y0_s, "y90": y90_s, "mode": mode}
+
+        elif mode == "stream_per_cal":
+            for key, coeffs, trials in [
+                ("blk1", c_blk1, adc_trials_first),
+                ("cam1", c_cam1, adc_trials_first),
+                ("blk2", c_blk2, adc_trials_second),
+                ("cam2", c_cam2, adc_trials_second),
+            ]:
+                if coeffs is None:
+                    anchors_per_cal[key] = {"y0": _np.nan, "y90": _np.nan, "mode": mode}
+                    continue
+                y0, y90, empty = _anchors_from_stream(trials, q_hi, q_lo)
+                if empty:
+                    y0, y90 = _anchors_from_endpoints(*coeffs)
+                anchors_per_cal[key] = {"y0": y0, "y90": y90, "mode": mode}
+
+        else:  # endpoints_per_cal
+            for key, coeffs in [("blk1", c_blk1), ("cam1", c_cam1), ("blk2", c_blk2), ("cam2", c_cam2)]:
+                if coeffs is None:
+                    anchors_per_cal[key] = {"y0": _np.nan, "y90": _np.nan, "mode": mode}
+                else:
+                    y0, y90 = _anchors_from_endpoints(*coeffs)
+                    anchors_per_cal[key] = {"y0": y0, "y90": y90, "mode": mode}
+
+        if verbose:
+            for k, v in anchors_per_cal.items():
+                print(f"[four] anchors {k}: y0={v['y0']:.6g}, y90={v['y90']:.6g}, mode={v['mode']}")
+
+        # ---------- build 4 calibrated clones ----------
+        bb_blk1 = _clone_and_install_inverse(self, *(c_blk1 or (0, 1, 0)),
+                                             anchors_per_cal.get("blk1", {}).get("y0", _np.nan),
+                                             anchors_per_cal.get("blk1", {}).get("y90", _np.nan),
+                                             "four_from_overlays") if c_blk1 else None
+        bb_cam1 = _clone_and_install_inverse(self, *(c_cam1 or (0, 1, 0)),
+                                             anchors_per_cal.get("cam1", {}).get("y0", _np.nan),
+                                             anchors_per_cal.get("cam1", {}).get("y90", _np.nan),
+                                             "four_from_overlays") if c_cam1 else None
+        bb_blk2 = _clone_and_install_inverse(self, *(c_blk2 or (0, 1, 0)),
+                                             anchors_per_cal.get("blk2", {}).get("y0", _np.nan),
+                                             anchors_per_cal.get("blk2", {}).get("y90", _np.nan),
+                                             "four_from_overlays") if c_blk2 else None
+        bb_cam2 = _clone_and_install_inverse(self, *(c_cam2 or (0, 1, 0)),
+                                             anchors_per_cal.get("cam2", {}).get("y0", _np.nan),
+                                             anchors_per_cal.get("cam2", {}).get("y90", _np.nan),
+                                             "four_from_overlays") if c_cam2 else None
+
+        # ---------- tall tables ----------
+        theta_blk1_first = _tall(bb_blk1, adc_trials_first, set_label="first_block") if bb_blk1 else _pd.DataFrame()
+        theta_cam1_first = _tall(bb_cam1, adc_trials_first, set_label="first_cam") if bb_cam1 else _pd.DataFrame()
+        theta_blk2_second = _tall(bb_blk2, adc_trials_second, set_label="second_block") if bb_blk2 else _pd.DataFrame()
+        theta_cam2_second = _tall(bb_cam2, adc_trials_second, set_label="second_cam") if bb_cam2 else _pd.DataFrame()
+
+        # --- append raw timestamps from input trials (preserve integer ticks) ---
+        theta_blk1_first = _attach_timestamp_from_trials(theta_blk1_first, adc_trials_first, "first_block")
+        theta_cam1_first = _attach_timestamp_from_trials(theta_cam1_first, adc_trials_first, "first_cam")
+        theta_blk2_second = _attach_timestamp_from_trials(theta_blk2_second, adc_trials_second, "second_block")
+        theta_cam2_second = _attach_timestamp_from_trials(theta_cam2_second, adc_trials_second, "second_cam")
+
+        # ---------- OOB ----------
+        theta_blk1_first = _attach_oob(theta_blk1_first,
+                                       anchors_per_cal.get("blk1", {}).get("y0", _np.nan),
+                                       anchors_per_cal.get("blk1", {}).get("y90", _np.nan))
+        theta_cam1_first = _attach_oob(theta_cam1_first,
+                                       anchors_per_cal.get("cam1", {}).get("y0", _np.nan),
+                                       anchors_per_cal.get("cam1", {}).get("y90", _np.nan))
+        theta_blk2_second = _attach_oob(theta_blk2_second,
+                                        anchors_per_cal.get("blk2", {}).get("y0", _np.nan),
+                                        anchors_per_cal.get("blk2", {}).get("y90", _np.nan))
+        theta_cam2_second = _attach_oob(theta_cam2_second,
+                                        anchors_per_cal.get("cam2", {}).get("y0", _np.nan),
+                                        anchors_per_cal.get("cam2", {}).get("y90", _np.nan))
+
+        def _oob_count(df):
+            if df.empty:
+                return {"over_hi": 0, "under_lo": 0}
+            return {
+                "over_hi": int(
+                    _pd.to_numeric(df.get("oob_over_hi"), errors="coerce").sum()) if "oob_over_hi" in df else 0,
+                "under_lo": int(
+                    _pd.to_numeric(df.get("oob_under_lo"), errors="coerce").sum()) if "oob_under_lo" in df else 0
+            }
+
+        oob_counts = {
+            "first": _oob_count(_pd.concat([theta_cam1_first, theta_blk1_first], axis=0)),
+            "second": _oob_count(_pd.concat([theta_cam2_second, theta_blk2_second], axis=0)),
+        }
+
+        # ---------- combine outputs ----------
+        tall_all = _pd.concat(
+            [theta_cam1_first, theta_blk1_first, theta_cam2_second, theta_blk2_second],
+            ignore_index=True
+        )
+
+        # prefer timestamp in pairwise wide merges
+        def _wide_pair(df_a, df_b, name_a, name_b):
+            if (df_a is None or df_a.empty) and (df_b is None or df_b.empty):
+                return _pd.DataFrame()
+
+            join_priority = [
+                ["set_label", "trial", "timestamp"],
+                ["set_label", "trial", "time_s"],
+                ["timestamp"],
+                ["time_s"],
+            ]
+
+            def _keys_in_both(keys, A, B):
+                return all(k in A.columns for k in keys) and all(k in B.columns for k in keys)
+
+            keys = next((k for k in join_priority if _keys_in_both(k, df_a, df_b)), [])
+
+            dfA = df_a.rename(columns={"theta_pred_deg": f"theta_{name_a}"})
+            dfB = df_b.rename(columns={"theta_pred_deg": f"theta_{name_b}"})
+
+            if keys:
+                out = _pd.merge(
+                    dfA[keys + [f"theta_{name_a}"]],
+                    dfB[keys + [f"theta_{name_b}"]],
+                    on=keys, how="outer"
+                )
+                return out.sort_values(keys)
+            else:
+                return _pd.concat([dfA[[f"theta_{name_a}"]], dfB[[f"theta_{name_b}"]]], axis=1)
+
+        wide_first = _wide_pair(theta_cam1_first, theta_blk1_first, "cam1", "blk1")
+        wide_second = _wide_pair(theta_cam2_second, theta_blk2_second, "cam2", "blk2")
+
+        # merge wide tables on common keys (prefer timestamp)
+        priority_orders = [
+            ["set_label", "trial", "timestamp"],
+            ["set_label", "trial", "time_s"],
+            ["timestamp"],
+            ["time_s"],
+        ]
+
+        def _common_keys(a, b, prefs):
+            for keys in prefs:
+                if all(k in a.columns for k in keys) and all(k in b.columns for k in keys):
+                    return keys
+            return []
+
+        common_keys = _common_keys(wide_first, wide_second, priority_orders)
+        if common_keys:
+            theta_all_wide = _pd.merge(wide_first, wide_second, how="outer", on=common_keys).sort_values(common_keys)
+        else:
+            theta_all_wide = _pd.concat([wide_first, wide_second], axis=1)
+
+        # ---------- plotting ----------
+        fig = axes = None
+        if plot:
+            fig, axes = _plt.subplots(1, 2, figsize=figsize, sharey=True)
+
+            def _plot_panel(ax, df_blk, df_cam, label_blk, label_cam, panel_title):
+                trial_ids = _trial_ids_union(df_blk, df_cam)
+                colors = _plt.rcParams["axes.prop_cycle"].by_key().get(
+                    "color",
+                    ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+                )
+                for i, t in enumerate(trial_ids):
+                    col = colors[i % len(colors)]
+                    if (df_blk is not None) and (not df_blk.empty):
+                        sub = df_blk[df_blk["trial"] == t]
+                        if not sub.empty:
+                            ax.plot(sub["time_s"], sub["theta_pred_deg"],
+                                    color=col, linewidth=linewidth, alpha=alpha_curves,
+                                    linestyle="-", label=f"{label_blk} • trial {t}")
+                    if (df_cam is not None) and (not df_cam.empty):
+                        sub = df_cam[df_cam["trial"] == t]
+                        if not sub.empty:
+                            ax.plot(sub["time_s"], sub["theta_pred_deg"],
+                                    color=col, linewidth=linewidth, alpha=alpha_curves,
+                                    linestyle="--", label=f"{label_cam} • trial {t}")
+                handles, labels = ax.get_legend_handles_labels()
+                seen = set()
+                dedup = [(h, l) for h, l in zip(handles, labels) if not (l in seen or seen.add(l))]
+                if dedup:
+                    ax.legend(*zip(*dedup), frameon=False, ncol=1)
+                ax.set_title(panel_title)
+                ax.set_xlabel("Time (s)")
+                ax.set_ylim(deg_min - 2, deg_max + 2)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                ax.grid(alpha=0.25, axis="y")
+
+            ax = axes[0]
+            _plot_panel(ax,
+                        theta_blk1_first, theta_cam1_first,
+                        f"{label_blk1}", f"{label_cam1}",
+                        "First application: Block 1 & Cam 1 → adc_trials_first")
+            ax.set_ylabel("Angle (deg)")
+
+            ax = axes[1]
+            _plot_panel(ax,
+                        theta_blk2_second, theta_cam2_second,
+                        f"{label_blk2}", f"{label_cam2}",
+                        "Second application: Block 2 & Cam 2 → adc_trials_second")
+
+            fig.tight_layout()
+
+        if verbose:
+            print(f"[four] OOB first: over={oob_counts['first']['over_hi']}, under={oob_counts['first']['under_lo']}")
+            print(
+                f"[four] OOB second: over={oob_counts['second']['over_hi']}, under={oob_counts['second']['under_lo']}")
+
+        # optional: stable time sort before return
+        def _maybe_sort_time(df):
+            if df is None or df.empty: return df
+            if "timestamp" in df.columns: return df.sort_values(["set_label", "trial", "timestamp"])
+            if "time_s" in df.columns:    return df.sort_values(["set_label", "trial", "time_s"])
+            return df
+
+        theta_cam1_first = _maybe_sort_time(theta_cam1_first)
+        theta_blk1_first = _maybe_sort_time(theta_blk1_first)
+        theta_cam2_second = _maybe_sort_time(theta_cam2_second)
+        theta_blk2_second = _maybe_sort_time(theta_blk2_second)
+        tall_all = _maybe_sort_time(tall_all)
+        theta_all_wide = _maybe_sort_time(theta_all_wide)
+
+        return {
+            "anchors_mode": anchors_mode,
+            "anchors_per_cal": anchors_per_cal,
+            "theta_cam1_first": theta_cam1_first,
+            "theta_blk1_first": theta_blk1_first,
+            "theta_cam2_second": theta_cam2_second,
+            "theta_blk2_second": theta_blk2_second,
+            "theta_all_tall": tall_all,
+            "theta_all_wide": theta_all_wide,
+            "oob_counts": oob_counts,
+            "fig": fig, "axes": axes,
+        }
 
     def calibrate_from_pairs_and_stream(
             self,
@@ -622,6 +1087,823 @@ class BallBearingData:
             "theta_all": theta_all,
             "oob_counts": oob_counts,
         }
+
+    from typing import Optional, Union, List
+    import pandas as pd
+    import numpy as np
+
+    from typing import Optional, Union, List
+    import pandas as pd
+    import numpy as np
+    from pandas.api.types import is_timedelta64_dtype
+
+    # --- Paste this method into BallBearingData in analysis.py ---
+
+    def align_theta_all_to_cam_for_set(
+            self,
+            theta_all_set: pd.DataFrame,
+            cam_trials: list[pd.DataFrame],
+            *,
+            enc_time_col: str = "timestamp",
+            cam_time_col: str | None = None,
+            cam_time_prefix: str = "ts",
+            tolerance: int | float | str = 50000,  # you call with 50 ms in microseconds; keep numeric
+            direction: str = "nearest",
+            theta_col: str = "theta_pred_deg",
+            keep_time_delta: bool = True,
+            drop_unmatched: bool = True,
+            return_concatenated: bool = False,
+            trial_labels: list[int] | None = None,
+            require_set_label_match: bool = True,
+    ) -> list[pd.DataFrame] | pd.DataFrame:
+        """
+        Align per-trial camera rows to encoder (theta_all_set) by nearest time.
+        - Converts various time formats to int64 nanoseconds for robust asof-merge
+        - Optional strict matching on set_label
+        - Returns list of aligned dfs (or concatenated if return_concatenated=True)
+        """
+        import numpy as np
+        import pandas as pd
+        from pandas.api.types import is_timedelta64_dtype  # <-- ensure available in this scope
+
+        # ---------- helpers ----------
+        def _coerce_tolerance_to_ns(tol) -> int | None:
+            """Return tolerance in nanoseconds if tol is str/Timedelta; None if numeric (we'll post-filter)."""
+            if isinstance(tol, (int, float)):
+                # numeric → treat as microseconds to preserve your current call-pattern (50000 = 50 ms)
+                return int(float(tol) * 1_000)  # us → ns
+            # string like "50ms", "10ms", etc.
+            td = pd.to_timedelta(tol)
+            return int(td / pd.to_timedelta(1, "ns"))
+
+        def _rel_seconds_from_ns(ns: pd.Series) -> pd.Series:
+            n = pd.to_numeric(ns, errors="coerce").astype("float64")
+            if n.notna().sum() == 0:
+                return pd.Series(np.nan, index=ns.index, dtype="float64")
+            n0 = np.nanmin(n)
+            return (n - n0) / 1e9
+
+        def _to_ns_generic(s: pd.Series) -> pd.Series:
+            """Best-effort conversion of many time representations to int64 nanoseconds."""
+
+            # 1) Try HHMMSSffffff (even if numeric floats)
+            def _try_hhmmssffffff(ss: pd.Series) -> pd.Series:
+                try:
+                    ints = pd.to_numeric(ss, errors="coerce").dropna().apply(
+                        lambda v: int(np.floor(float(v) + 0.5))
+                    )
+                except Exception:
+                    return pd.Series(pd.NaT, index=ss.index)
+                z = ints.astype("string").str.zfill(12)
+                ok = z.str.fullmatch(r"\d{12}")
+                if ok.mean() < 0.7:
+                    return pd.Series(pd.NaT, index=ss.index)
+                hh = z.str.slice(0, 2).astype(int)
+                mm = z.str.slice(2, 4).astype(int)
+                ss_ = z.str.slice(4, 6).astype(int)
+                use = z.str.slice(6, 12).astype(int)
+                td = (pd.to_timedelta(hh, unit="h") + pd.to_timedelta(mm, unit="m")
+                      + pd.to_timedelta(ss_, unit="s") + pd.to_timedelta(use, unit="us"))
+                out = pd.Series(td, index=ints.index).reindex(ss.index)
+                return out
+
+            td_hms = _try_hhmmssffffff(s)
+            if is_timedelta64_dtype(td_hms) and td_hms.notna().any():
+                return td_hms.astype("timedelta64[ns]").astype("int64")
+
+            # 2) Timedelta-like strings via DLC helper if present
+            try:
+                td = DLC3DBendAngles._series_time_of_day_to_timedelta(s)  # if your class is available
+            except Exception:
+                td = pd.Series(pd.NaT, index=s.index)
+            if is_timedelta64_dtype(td) and td.notna().any():
+                return td.astype("timedelta64[ns]").astype("int64")
+
+            # 3) Datetime strings/values
+            dt = pd.to_datetime(s, errors="coerce", utc=True)
+            if dt.notna().any():
+                return dt.astype("int64")
+
+            # 4) Numeric epochs or counters
+            sn = pd.to_numeric(s, errors="coerce")
+            if sn.notna().any():
+                snn = sn.dropna()
+                # Try epochs with guessed units
+                for unit in ("ns", "us", "ms", "s"):
+                    dte = pd.to_datetime(snn, unit=unit, errors="coerce", utc=True)
+                    if dte.notna().mean() > 0.8 and dte.dt.year.between(2005, 2100).mean() > 0.8:
+                        dt_all = pd.to_datetime(sn, unit=unit, errors="coerce", utc=True)
+                        return dt_all.astype("int64")
+                # Fallback: relative counter -> heuristic scale to ns
+                rng = float(snn.max() - snn.min())
+                if not np.isfinite(rng) or rng <= 0:
+                    return sn.round().astype("int64")
+                if rng < 1e6:
+                    sc = 1e9  # seconds-range
+                elif rng < 1e9:
+                    sc = 1e6  # milliseconds-range
+                elif rng < 1e12:
+                    sc = 1e3  # microseconds-range
+                else:
+                    sc = 1.0  # already ns-range
+                return (sn * sc).round().astype("int64")
+
+            # nothing worked
+            return pd.Series(np.nan, index=s.index, dtype="float64")
+
+        # ---------- checks & setup ----------
+        if theta_col not in theta_all_set.columns:
+            raise KeyError(f"'{theta_col}' not found in theta_all_set.")
+        if enc_time_col not in theta_all_set.columns:
+            raise KeyError(f"'{enc_time_col}' not found in theta_all_set.")
+
+        # map cam_trials -> labels
+        if trial_labels is None:
+            labels = list(range(1, len(cam_trials) + 1))
+        else:
+            if len(trial_labels) != len(cam_trials):
+                raise ValueError("trial_labels length must match cam_trials length.")
+            labels = trial_labels
+
+        tol_ns = _coerce_tolerance_to_ns(tolerance)
+        numeric_postfilter = isinstance(tolerance, (int, float))
+
+        merged_trials: list[pd.DataFrame] = []
+
+        # ---------- main loop ----------
+        for cam_df, trial_id in zip(cam_trials, labels):
+            # subset encoder rows for this trial (and possibly set_label)
+            th_df = theta_all_set.loc[
+                pd.to_numeric(theta_all_set.get("trial"), errors="coerce") == trial_id
+                ].copy()
+
+            # If enforcing set_label and camera has one, filter encoder side to match
+            if require_set_label_match and isinstance(cam_df, pd.DataFrame) and ("set_label" in cam_df.columns):
+                cam_sets = pd.Series(cam_df["set_label"]).dropna().astype(str).unique().tolist()
+                if cam_sets and ("set_label" in th_df.columns):
+                    th_df = th_df.loc[th_df["set_label"].astype(str).isin(cam_sets)].copy()
+
+            if cam_df is None or cam_df.empty or th_df.empty:
+                merged_trials.append(pd.DataFrame())
+                continue
+
+            # choose camera time column (explicit or by prefix)
+            if cam_time_col is None:
+                cam_cands = [c for c in cam_df.columns if str(c).lower().startswith(cam_time_prefix)]
+                cam_col = cam_cands[0] if cam_cands else None
+            else:
+                cam_col = cam_time_col
+
+            if cam_col is None or cam_col not in cam_df.columns:
+                print(f"[alignθ] Trial {trial_id}: camera time column not found (prefix='{cam_time_prefix}').")
+                merged_trials.append(pd.DataFrame())
+                continue
+
+            # LEFT = camera
+            left = cam_df.copy()
+            left["_t_ns"] = _to_ns_generic(left[cam_col])
+            left = left.dropna(subset=["_t_ns"]).sort_values("_t_ns").reset_index(drop=False)
+            left["_t_ns"] = left["_t_ns"].astype("int64")  # ensure int64 for merge_asof
+            left["cam_time_s"] = _rel_seconds_from_ns(left["_t_ns"])
+
+            # RIGHT = encoder subset
+            extra_cols = ["time_s", "adc_ch3", "calib", "set_label"]
+            right_cols = [enc_time_col, theta_col] + [c for c in extra_cols if c in th_df.columns]
+            right = th_df[right_cols].copy()
+            right["_t_ns_right"] = _to_ns_generic(right[enc_time_col])
+            right = right.dropna(subset=["_t_ns_right"]).sort_values("_t_ns_right").reset_index(drop=True)
+            right["_t_ns_right"] = right["_t_ns_right"].astype("int64")
+            right["enc_time_s"] = _rel_seconds_from_ns(right["_t_ns_right"])
+
+            if left.empty or right.empty:
+                merged_trials.append(pd.DataFrame())
+                continue
+
+            # merge_asof (tolerance only if non-numeric; for numeric we post-filter by abs delta)
+            merged = pd.merge_asof(
+                left,
+                right,
+                left_on="_t_ns",
+                right_on="_t_ns_right",
+                direction=direction,
+                allow_exact_matches=True,
+                tolerance=None if numeric_postfilter else pd.to_timedelta(tol_ns, unit="ns")
+            )
+
+            # apply numeric tolerance post-filter
+            merged["_delta_ns"] = (merged["_t_ns_right"] - merged["_t_ns"]).astype("float64")
+            if numeric_postfilter and tol_ns is not None:
+                merged = merged[merged["_delta_ns"].abs() <= tol_ns].copy()
+
+            if drop_unmatched:
+                merged = merged[pd.notna(merged["_t_ns_right"])].copy()
+
+            if keep_time_delta:
+                merged["_delta_ms"] = merged["_delta_ns"] / 1e6
+                merged["_delta_sec"] = merged["_delta_ns"] / 1e9
+
+            # stamp trial; keep/propagate set_label if present
+            merged["trial"] = trial_id
+            if "set_label" not in merged.columns:
+                if "set_label" in right.columns:
+                    merged["set_label"] = right["set_label"]
+                elif "set_label" in cam_df.columns:
+                    merged["set_label"] = cam_df["set_label"]
+
+            # restore original camera row order
+            merged = merged.set_index("index").sort_index().reset_index(drop=True)
+            merged_trials.append(merged)
+
+        if return_concatenated:
+            non_empty = [df for df in merged_trials if not df.empty]
+            return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
+
+        return merged_trials
+
+    def plot_adc_and_dlc_twopanel(
+            self,
+            out: dict,
+            *,
+            cam_plus_dlc_first: list,
+            cam_plus_dlc_second: list,
+            dlc_angle_col: str = "metric_mcp_bend_deg_deg_dlc",
+            cam_time_col: str = "ts_25185174",
+            aligned_first: list | None = None,  # from align_theta_all_to_cam_for_set(...)
+            aligned_second: list | None = None,  # from align_theta_all_to_cam_for_set(...)
+            use_aligned: bool = True,
+            # trial IDs (1-based ids used in the tall ADC tables)
+            trial_first: int | None = None,
+            trial_second: int | None = None,
+            title_left: str = "Set1: Block1 + Cam1 (ADC) vs DLC(1) — aligned",
+            title_right: str = "Set2: Block2 + Cam2 (ADC) vs DLC(2) — aligned",
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
+            figsize=(12.5, 5.2),
+            linewidth: float = 1.8,
+            alpha_curves: float = 0.95,
+            # --- drawing order & emphasis ---
+            dlc_on_top: bool = True,
+            dlc_zorder: int = 10,
+            adc_zorder: int = 2,
+            dlc_linewidth: float = 2.2,
+            dlc_alpha: float = 1.0,
+            # --- DLC y preprocessing (optional) ---
+            auto_convert_rad: bool = True,  # auto-convert DLC radians→degrees if detected
+            dlc_abs: bool = False,  # plot |DLC| if True
+            verbose: bool = True,
+    ):
+        """
+        Plot ADC theta (blk+cam) against DLC angles for one trial in each set.
+        Key fixes:
+          - DLC(aligned) retrieved by trial id -> index = trial_id - 1
+          - DLC(raw cam) retrieved by matching stamped 'trial' in each df (not by list position)
+        """
+
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        # ---- fetch tall tables from 'out' ----
+        need = ["theta_blk1_first", "theta_cam1_first", "theta_blk2_second", "theta_cam2_second"]
+        for k in need:
+            if k not in out or out[k] is None:
+                raise KeyError(f"Missing '{k}' in out.")
+        blk1_first = out["theta_blk1_first"].copy()
+        cam1_first = out["theta_cam1_first"].copy()
+        blk2_second = out["theta_blk2_second"].copy()
+        cam2_second = out["theta_cam2_second"].copy()
+
+        def _first_trial_or_none(df):
+            if df is None or df.empty:
+                return None
+            t = pd.to_numeric(df.get("trial"), errors="coerce").dropna().astype(int)
+            return int(np.min(t)) if not t.empty else None
+
+        # Auto-pick a trial id for each set if not provided (use min trial id present)
+        if trial_first is None:
+            trial_first = _first_trial_or_none(blk1_first if not blk1_first.empty else cam1_first)
+        if trial_second is None:
+            trial_second = _first_trial_or_none(blk2_second if not blk2_second.empty else cam2_second)
+
+        if verbose:
+            print(f"[twopanel] trial ids → set1: {trial_first}, set2: {trial_second}")
+
+        # --- helpers: consistent selection by TRIAL ID ---
+        def _subset_trial_adc(df, trial_id):
+            """Rows with df['trial'] == trial_id (for ADC tall tables)."""
+            if df is None or df.empty or trial_id is None:
+                return pd.DataFrame(columns=df.columns if df is not None else ["time_s", "theta_pred_deg"])
+            tt = pd.to_numeric(df.get("trial"), errors="coerce").astype("Int64")
+            return df.loc[tt == int(trial_id)].copy()
+
+        def _find_cam_df_for_trial_id(cam_list, trial_id):
+            """
+            Return the df from cam_list whose stamped 'trial' equals trial_id (by mode),
+            ignoring position. Returns None if not found.
+            """
+            if cam_list is None or trial_id is None:
+                return None
+            for df in cam_list:
+                if df is None or df.empty or "trial" not in df.columns:
+                    continue
+                s = pd.to_numeric(df["trial"], errors="coerce").dropna().astype(int)
+                if not s.empty and int(s.mode().iat[0]) == int(trial_id):
+                    return df
+            return None
+
+        def _get_aligned_df_for_trial_id(aligned_list, trial_id):
+            """
+            Aligned lists produced by remap_aligned_by_trial are 0-based by (trial_id - 1).
+            """
+            if not use_aligned or aligned_list is None or trial_id is None:
+                return None
+            idx = int(trial_id) - 1
+            if 0 <= idx < len(aligned_list):
+                df = aligned_list[idx]
+                return None if (df is None or df.empty) else df
+            return None
+
+        def _rel_seconds(ts_series):
+            """Convert any ts-like series to relative seconds starting at 0."""
+            ts = pd.to_numeric(ts_series, errors="coerce").to_numpy()
+            if ts.size == 0 or not np.isfinite(np.nanmin(ts)):
+                return ts
+            x = ts - np.nanmin(ts)
+            mx = float(np.nanmax(x)) if np.isfinite(np.nanmax(x)) else 0.0
+            if mx > 1e9:
+                x = x / 1e9
+            elif mx > 1e6:
+                x = x / 1e6
+            elif mx > 1e3:
+                x = x / 1e3
+            return x
+
+        # ---------- DLC helpers: robust x, unit handling, warnings ----------
+        def _prepare_dlc_series(y_raw, *, auto_convert_rad=True, dlc_abs=False):
+            y = pd.to_numeric(y_raw, errors="coerce").to_numpy(dtype=float)
+            if y.size == 0:
+                return y
+            # heuristic: if 95th percentile < ~6 rad, assume radians → degrees
+            if auto_convert_rad:
+                finite = y[np.isfinite(y)]
+                if finite.size:
+                    y95 = np.nanpercentile(np.abs(finite), 95)
+                    if y95 < 6.0:
+                        y = np.degrees(y)
+            if dlc_abs:
+                y = np.abs(y)
+            return y
+
+        def _pick_x_seconds_from_aligned(df, fallback_ts_prefixes=("ts_",)):
+            """
+            Priority for DLC x-axis:
+              1) cam_time_s
+              2) enc_time_s
+              3) time_s or t_sec
+              4) first ts_* column → relative seconds
+            Returns (x, used_col_name, is_constant)
+            """
+            for name in ("cam_time_s", "enc_time_s", "time_s", "t_sec"):
+                if name in df.columns:
+                    x = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+                    if x.size:
+                        is_const = (np.nanmax(x) - np.nanmin(x)) < 1e-9
+                        return x, name, is_const
+            ts_cols = [c for c in df.columns if any(str(c).startswith(p) for p in fallback_ts_prefixes)]
+            if ts_cols:
+                s = _rel_seconds(df[ts_cols[0]])
+                if s.size:
+                    is_const = (np.nanmax(s) - np.nanmin(s)) < 1e-9
+                    return s, ts_cols[0], is_const
+            return np.array([]), None, False
+
+        # ---------- plotting helpers ----------
+        def _plot_adc(ax, df, color, linestyle, label):
+            if df is None or df.empty:
+                return False
+            x = pd.to_numeric(df.get("time_s"), errors="coerce")
+            y = pd.to_numeric(df.get("theta_pred_deg"), errors="coerce")
+            if x.notna().any() and y.notna().any():
+                ax.plot(
+                    x, y,
+                    color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=alpha_curves,
+                    label=label, zorder=adc_zorder
+                )
+                return True
+            return False
+
+        def _plot_dlc_aligned(ax, aligned_list, trial_id, color, label):
+            """Use aligned seconds for DLC if available (prefers cam_time_s)."""
+            if not use_aligned or aligned_list is None or trial_id is None:
+                return False
+            # aligned_list is 0-based by trial_id-1
+            slot = int(trial_id) - 1
+            if not (0 <= slot < len(aligned_list)):
+                return False
+            df = aligned_list[slot]
+            if df is None or df.empty or (dlc_angle_col not in df.columns):
+                return False
+
+            x, xname, is_const = _pick_x_seconds_from_aligned(df)
+            y = _prepare_dlc_series(df[dlc_angle_col], auto_convert_rad=auto_convert_rad, dlc_abs=dlc_abs)
+            if x.size and y.size:
+                if is_const and verbose:
+                    print(f"[twopanel] WARNING: DLC x-axis '{xname}' is constant for trial {trial_id}.")
+                order = np.argsort(x, kind="stable")
+                ax.plot(
+                    x[order], y[order],
+                    color=color, linestyle=":",
+                    linewidth=dlc_linewidth, alpha=dlc_alpha,
+                    label=label,
+                    zorder=(dlc_zorder if dlc_on_top else adc_zorder + 1)
+                )
+                return True
+            return False
+
+        def _plot_dlc_raw(ax, cam_list, trial_id, color, label):
+            """When passing a *raw* per-trial camera list (0-based by position), also translate trial_id→index."""
+            if cam_list is None or trial_id is None:
+                return False
+            slot = int(trial_id) - 1
+            if not (0 <= slot < len(cam_list)):
+                return False
+            df = cam_list[slot]
+            if df is None or df.empty or (cam_time_col not in df.columns) or (dlc_angle_col not in df.columns):
+                return False
+            s = _rel_seconds(df[cam_time_col])
+            if s.size == 0:
+                return False
+            is_const = (np.nanmax(s) - np.nanmin(s)) < 1e-9
+            if is_const and verbose:
+                print(f"[twopanel] WARNING: raw cam x-axis '{cam_time_col}' is constant for trial {trial_id}.")
+            y = _prepare_dlc_series(df[dlc_angle_col], auto_convert_rad=auto_convert_rad, dlc_abs=dlc_abs)
+            order = np.argsort(s, kind="stable")
+            ax.plot(
+                s[order], y[order],
+                color=color, linestyle=":",
+                linewidth=dlc_linewidth, alpha=dlc_alpha,
+                label=label,
+                zorder=(dlc_zorder if dlc_on_top else adc_zorder + 1)
+            )
+            return True
+
+        # fixed colors
+        colors = {
+            "blk1": "tab:blue",
+            "cam1": "tab:orange",
+            "blk2": "tab:green",
+            "cam2": "tab:red",
+            "dlc1": "tab:purple",
+            "dlc2": "tab:brown",
+        }
+
+        # subset per panel from ADC tall tables by trial ID
+        df_b1_L = _subset_trial_adc(blk1_first, trial_first)
+        df_c1_L = _subset_trial_adc(cam1_first, trial_first)
+        df_b2_R = _subset_trial_adc(blk2_second, trial_second)
+        df_c2_R = _subset_trial_adc(cam2_second, trial_second)
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+
+        # ================= LEFT: set1 ADC(blk1, cam1) + DLC(1) =================
+        ax = axes[0]
+        _plot_adc(ax, df_b1_L, colors["blk1"], "-", f"Blk1→set1 (trial {trial_first})")
+        _plot_adc(ax, df_c1_L, colors["cam1"], "--", f"Cam1→set1 (trial {trial_first})")
+        # DLC first: aligned → raw fallback
+        if not _plot_dlc_aligned(ax, aligned_first, trial_first, colors["dlc1"], f"DLC(1) trial {trial_first}"):
+            _plot_dlc_raw(ax, cam_plus_dlc_first, trial_first, colors["dlc1"], f"DLC(1) trial {trial_first}")
+
+        ax.set_title(title_left)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (deg)")
+        ax.set_ylim(deg_min - 2, deg_max + 2)
+        ax.grid(alpha=0.25, axis="y")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, ncol=1, loc="best")
+
+        # ================= RIGHT: set2 ADC(blk2, cam2) + DLC(2) =================
+        ax = axes[1]
+        _plot_adc(ax, df_b2_R, colors["blk2"], "-", f"Blk2→set2 (trial {trial_second})")
+        _plot_adc(ax, df_c2_R, colors["cam2"], "--", f"Cam2→set2 (trial {trial_second})")
+        if not _plot_dlc_aligned(ax, aligned_second, trial_second, colors["dlc2"], f"DLC(2) trial {trial_second}"):
+            _plot_dlc_raw(ax, cam_plus_dlc_second, trial_second, colors["dlc2"], f"DLC(2) trial {trial_second}")
+
+        ax.set_title(title_right)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(deg_min - 2, deg_max + 2)
+        ax.grid(alpha=0.25, axis="y")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, ncol=1, loc="best")
+
+        fig.tight_layout()
+        if verbose:
+            print("[twopanel] done.")
+        return {"fig": fig, "axes": axes, "trial_first": trial_first, "trial_second": trial_second}
+
+    def remap_aligned_by_trial(
+            self,
+            aligned_list: list[pd.DataFrame],
+            *,
+            start_from_zero: bool = True,  # True → return index = trial_id - 1
+            fallback_use_index: bool = True,  # If missing trial, fall back to i+1
+            prefer_last: bool = True,  # If duplicates, last wins
+            verbose: bool = True,
+    ) -> list[pd.DataFrame]:
+        """
+        Build a dense list keyed by trial id.
+          - If start_from_zero=True, output index k holds trial_id=(k+1)
+          - If start_from_zero=False, output index t holds trial_id=t (index 0 unused/None)
+        Robust to frames with no/NaN trial: optionally fall back to list index (i+1).
+        """
+        if not aligned_list:
+            return []
+
+        # 1) collect (trial_id, df) pairs
+        pairs: list[tuple[int, pd.DataFrame]] = []
+        bad_idxs: list[int] = []
+        for i, df in enumerate(aligned_list):
+            if df is None or df.empty:
+                continue
+            if "trial" in df.columns:
+                tser = pd.to_numeric(df["trial"], errors="coerce").dropna().astype(int)
+                if not tser.empty:
+                    t = int(tser.mode().iloc[0])
+                    pairs.append((t, df))
+                    continue
+            # no valid trial in df
+            if fallback_use_index:
+                t = i + 1
+                pairs.append((t, df))
+            else:
+                bad_idxs.append(i)
+
+        if not pairs:
+            if verbose:
+                print("[remap] No frames had usable trial IDs; returning empty mapping.")
+            return []
+
+        # 2) resolve duplicates: first or last wins
+        by_trial: dict[int, pd.DataFrame] = {}
+        for t, df in (pairs if not prefer_last else pairs):
+            by_trial[t] = df  # overwrites prior if prefer_last=True (default)
+
+        # 3) build dense list
+        max_t = max(by_trial.keys())
+        if start_from_zero:
+            out = [None] * max_t  # index k → trial (k+1)
+            for t, df in by_trial.items():
+                idx = t - 1
+                if 0 <= idx < len(out):
+                    out[idx] = df
+        else:
+            out = [None] * (max_t + 1)  # index t → trial t, 0 unused
+            for t, df in by_trial.items():
+                out[t] = df
+
+        # 4) optional logging
+        if verbose:
+            present = [i + 1 for i, df in enumerate(out) if df is not None] if start_from_zero else [i for i, df in
+                                                                                                     enumerate(out) if
+                                                                                                     i > 0 and df is not None]
+            missing = [i + 1 for i, df in enumerate(out) if df is None] if start_from_zero else [i for i, df in
+                                                                                                 enumerate(out) if
+                                                                                                 i > 0 and df is None]
+            print(f"[remap] Trials present: {present} | missing: {missing}")
+            if bad_idxs:
+                print(f"[remap] Frames without trial & not remapped (fallback_use_index=False): {bad_idxs}")
+
+        return out
+
+    def plot_dlc_abs_error_boxplots_from_aligned(
+            self,
+            *,
+            aligned_first: list,
+            aligned_second: list,
+            dlc_angle_col: str = "metric_mcp_bend_deg_deg_dlc",
+            adc_theta_col: str = "theta_pred_deg",
+            calib_col: str = "calib",
+            max_abs_dt_ms: float | None = 100.0,
+            trial_first: int | None = None,
+            trial_second: int | None = None,
+            figsize=(10.5, 4.6),
+            whisker: float = 1.5,
+            verbose: bool = True,
+    ):
+        """
+        Boxplots of |ADC - DLC| using pre-aligned lists (no re-alignment).
+        Left:  |Blk1−DLC(1)|, |Cam1−DLC(1)|
+        Right: |Blk2−DLC(2)|, |Cam2−DLC(2)|
+        All boxes blue, black median, no outliers shown.
+
+        Robust to:
+          - delta-time column being named `_delta_ms` or `time_delta_ms`
+          - deriving delta-time from enc_time_s/cam_time_s or `time_delta`
+          - DLC column name differences (auto-detects a likely DLC column if missing)
+          - trial index confusion (accepts 0-based or 1-based)
+        """
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        def _trial_indices(label, n):
+            """Return the list of indices to use into aligned list."""
+            if n <= 0:
+                return []
+            if label is None:
+                return list(range(n))
+            # accept 1-based or 0-based
+            i1 = int(label) - 1
+            if 0 <= i1 < n:
+                return [i1]
+            i0 = int(label)
+            if 0 <= i0 < n:
+                return [i0]
+            return []
+
+        def _ensure_time_delta_ms(df: pd.DataFrame) -> pd.Series:
+            """Get/derive a time delta in milliseconds as a Series aligned to df.index."""
+            if df is None or df.empty:
+                return pd.Series(dtype=float)
+            # 1) preferred column names
+            if "time_delta_ms" in df.columns:
+                return pd.to_numeric(df["time_delta_ms"], errors="coerce")
+            if "_delta_ms" in df.columns:
+                return pd.to_numeric(df["_delta_ms"], errors="coerce")
+            # 2) derive from enc_time_s - cam_time_s
+            if {"enc_time_s", "cam_time_s"}.issubset(df.columns):
+                enc = pd.to_numeric(df["enc_time_s"], errors="coerce")
+                cam = pd.to_numeric(df["cam_time_s"], errors="coerce")
+                return (enc - cam) * 1000.0
+            # 3) derive heuristically from generic 'time_delta' (unknown units)
+            if "time_delta" in df.columns:
+                td = pd.to_numeric(df["time_delta"], errors="coerce").astype(float)
+                if td.notna().any():
+                    p95 = float(np.nanpercentile(np.abs(td.dropna()), 95))
+                    # crude unit guess
+                    if p95 > 1e7:  # ns → ms
+                        return td / 1e6
+                    elif p95 > 1e4:  # us → ms
+                        return td / 1e3
+                    elif p95 > 10:  # ms already
+                        return td
+                    else:  # seconds → ms
+                        return td * 1e3
+            # fallback: all NaN
+            return pd.Series(np.nan, index=df.index, dtype=float)
+
+        def _pick_dlc_col(df: pd.DataFrame, wanted: str) -> str | None:
+            """Return an existing DLC angle column name, preferring 'wanted'."""
+            if wanted in df.columns:
+                return wanted
+            # try to find a likely candidate
+            cand = next((c for c in df.columns
+                         if ("dlc" in str(c).lower()) and ("mcp" in str(c).lower())
+                         and ("deg" in str(c).lower() or "angle" in str(c).lower())),
+                        None)
+            return cand
+
+        def _collect_abs_err(al_list, idxs, want_calibs, panel_tag="set"):
+            vals = {c: [] for c in want_calibs}
+            dbg_counts = {c: dict(rows=0, kept=0) for c in want_calibs}
+
+            for i in idxs:
+                if i is None or i >= len(al_list):
+                    continue
+                df = al_list[i]
+                if df is None or df.empty:
+                    if verbose:
+                        print(f"[{panel_tag}] trial idx {i}: empty")
+                    continue
+
+                # ensure calib present
+                if calib_col not in df.columns:
+                    raise KeyError(
+                        f"[{panel_tag}] trial idx {i} missing '{calib_col}'. "
+                        "Keep it during alignment by including 'calib' among the right-hand columns."
+                    )
+
+                # time-delta filter
+                dt_ms = _ensure_time_delta_ms(df)
+                mask_dt = pd.Series(True, index=df.index)
+                if max_abs_dt_ms is not None:
+                    mask_dt = dt_ms.abs() <= float(max_abs_dt_ms)
+
+                # dlc/adc series
+                dlc_col = _pick_dlc_col(df, dlc_angle_col)
+                if dlc_col is None:
+                    if verbose:
+                        print(f"[{panel_tag}] trial idx {i}: no DLC column found (looked for '{dlc_angle_col}')")
+                    continue
+
+                s_dlc = pd.to_numeric(df[dlc_col], errors="coerce")
+                s_adc = pd.to_numeric(df.get(adc_theta_col), errors="coerce")
+                s_cal = df[calib_col].astype(str)
+
+                ok = mask_dt & s_dlc.notna() & s_adc.notna() & s_cal.notna()
+                if verbose:
+                    total_rows = int(len(df))
+                    kept_rows = int(ok.sum())
+                    print(f"[{panel_tag}] trial idx {i}: rows total={total_rows}, kept_by_dt={kept_rows}, "
+                          f"dt_ms 5/95% ~ {np.nanpercentile(dt_ms, 5) if dt_ms.notna().any() else np.nan:.1f} / "
+                          f"{np.nanpercentile(dt_ms, 95) if dt_ms.notna().any() else np.nan:.1f}")
+
+                if not ok.any():
+                    continue
+
+                sub = pd.DataFrame({"dlc": s_dlc[ok], "adc": s_adc[ok], "cal": s_cal[ok]})
+                sub["abs_err"] = (sub["adc"] - sub["dlc"]).abs()
+
+                for c in want_calibs:
+                    arr = sub.loc[sub["cal"] == c, "abs_err"].to_numpy()
+                    dbg_counts[c]["rows"] += int((s_cal == c).sum())
+                    dbg_counts[c]["kept"] += int((ok & (s_cal == c)).sum())
+                    if arr.size:
+                        vals[c].append(arr)
+
+            for c in list(vals.keys()):
+                vals[c] = np.concatenate(vals[c]) if vals[c] else np.array([], dtype=float)
+
+            if verbose:
+                for c in want_calibs:
+                    print(f"[{panel_tag}] calib='{c}': kept {dbg_counts[c]['kept']} / rows {dbg_counts[c]['rows']}")
+
+            return vals
+
+        def _summ(arr: np.ndarray):
+            if arr.size == 0:
+                return dict(n=0, mean=np.nan, median=np.nan, p90=np.nan, iqr=np.nan, mad=np.nan)
+            q25, med, q75, p90 = np.percentile(arr, [25, 50, 75, 90])
+            iqr = float(q75 - q25)
+            mad = float(np.median(np.abs(arr - med)))
+            return dict(n=int(arr.size), mean=float(np.mean(arr)), median=float(med),
+                        p90=float(p90), iqr=iqr, mad=mad)
+
+        want1, want2 = ("blk1", "cam1"), ("blk2", "cam2")
+        idxs1 = _trial_indices(trial_first, len(aligned_first) if aligned_first is not None else 0)
+        idxs2 = _trial_indices(trial_second, len(aligned_second) if aligned_second is not None else 0)
+
+        vals1 = _collect_abs_err(aligned_first, idxs1, want1, panel_tag="set1")
+        vals2 = _collect_abs_err(aligned_second, idxs2, want2, panel_tag="set2")
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True, constrained_layout=True)
+
+        data_L = [vals1["blk1"], vals1["cam1"]]
+        data_R = [vals2["blk2"], vals2["cam2"]]
+
+        # blue boxes, black median, hide outliers
+        boxprops = dict(linewidth=1.2)
+        medianprops = dict(color="black", linewidth=1.8)
+        whiskerprops = dict(color="0.4", linewidth=1.2)
+        capprops = dict(color="0.4", linewidth=1.2)
+
+        bpl = axes[0].boxplot(
+            data_L, labels=["|Blk1 − DLC(1)|", "|Cam1 − DLC(1)|"],
+            whis=whisker, showfliers=False, patch_artist=True,
+            boxprops=boxprops, medianprops=medianprops,
+            whiskerprops=whiskerprops, capprops=capprops
+        )
+        bpr = axes[1].boxplot(
+            data_R, labels=["|Blk2 − DLC(2)|", "|Cam2 − DLC(2)|"],
+            whis=whisker, showfliers=False, patch_artist=True,
+            boxprops=boxprops, medianprops=medianprops,
+            whiskerprops=whiskerprops, capprops=capprops
+        )
+
+        def _blueify(bx):
+            for patch in bx["boxes"]:
+                patch.set_facecolor("tab:blue")
+                patch.set_alpha(0.35)
+
+        _blueify(bpl);
+        _blueify(bpr)
+
+        for ax in axes:
+            ax.axhline(0, color="k", linewidth=0.8, alpha=0.5)
+            ax.grid(axis="y", alpha=0.25)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        axes[0].set_title("Set 1: |error| vs DLC")
+        axes[0].set_ylabel("|θ_ADC − θ_DLC| (deg)")
+        axes[1].set_title("Set 2: |error| vs DLC")
+
+        stats = {
+            "set1": {"blk1_abs": _summ(data_L[0]), "cam1_abs": _summ(data_L[1])},
+            "set2": {"blk2_abs": _summ(data_R[0]), "cam2_abs": _summ(data_R[1])},
+            "params": {
+                "dlc_angle_col": dlc_angle_col,
+                "adc_theta_col": adc_theta_col,
+                "calib_col": calib_col,
+                "max_abs_dt_ms": max_abs_dt_ms,
+                "trial_first": trial_first, "trial_second": trial_second,
+            },
+        }
+        if verbose:
+            print("[abs-err boxplots] done.")
+        return {"fig": fig, "axes": axes, "stats": stats}
 
     def extract_calib_means_by_set(
             self,
@@ -1137,42 +2419,51 @@ class BallBearingData:
         return pd.concat(parts, ignore_index=True)
 
     def compute_dlc3d_angles_by_trial(
-        self,
-        dlc3d_trials: List[pd.DataFrame],
-        *,
-        set_label: str,
-        signed_in_plane: bool = True,
-        add_plane_ok: bool = True,
+            self,
+            dlc3d_trials: List[pd.DataFrame],
+            *,
+            set_label: str,
+            signed_in_plane: bool = True,
+            add_plane_ok: bool = True,
     ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
         """
         From per-trial DLC3D DataFrames (3-row MultiIndex columns), compute:
           • wrist_bend_deg  = angle(forearm→hand, hand→MCP)
           • mcp_bend_deg    = angle(hand→MCP, MCP→PIP)
           • mcp_bend_in_wrist_plane_deg = MCP bend projected into wrist plane
+
         Returns (augmented_trials, tall_df).
+
+        CHANGE: Each per-trial 'augmented' df now also carries scalar columns:
+          - 'set_label' (string)
+          - 'trial'     (int, 1-based)
         """
+        import numpy as np
+        import pandas as pd
+
         augmented: List[pd.DataFrame] = []
         parts: List[pd.DataFrame] = []
 
         for trial_idx, dlc_df in enumerate(dlc3d_trials, start=1):
             if dlc_df is None or dlc_df.empty:
-                augmented.append(pd.DataFrame()); continue
+                augmented.append(pd.DataFrame());
+                continue
 
             cam = DLC3DBendAngles(dlc_df)
 
             # MCP bend
             hand_pts = cam.get_points("hand")
-            mcp_pts  = cam.get_points("MCP")
-            pip_pts  = cam.get_points("PIP")
+            mcp_pts = cam.get_points("MCP")
+            pip_pts = cam.get_points("PIP")
             v1_mcp = cam.vector(hand_pts, mcp_pts)  # hand→MCP
             v2_mcp = cam.vector(mcp_pts, pip_pts)  # MCP→PIP
 
             # Wrist bend (+ plane)
             forearm_pts = cam.get_points("forearm")
             v1_wrist = cam.vector(forearm_pts, hand_pts)  # forearm→hand
-            v2_wrist = cam.vector(hand_pts, mcp_pts)      # hand→MCP
+            v2_wrist = cam.vector(hand_pts, mcp_pts)  # hand→MCP
 
-            angles_mcp   = cam.angle_from_vectors(v1_mcp, v2_mcp)
+            angles_mcp = cam.angle_from_vectors(v1_mcp, v2_mcp)
             angles_wrist = cam.angle_from_vectors(v1_wrist, v2_wrist)
 
             angles_mcp_plane, _, _, plane_ok = cam.angle_from_vectors_in_plane(
@@ -1180,11 +2471,16 @@ class BallBearingData:
             )
 
             df_out = cam.df.copy()
-            df_out[("metric", "mcp_bend_deg", "deg")]                 = angles_mcp
-            df_out[("metric", "wrist_bend_deg", "deg")]               = angles_wrist
-            df_out[("metric", "mcp_bend_in_wrist_plane_deg", "deg")]  = angles_mcp_plane
+            df_out[("metric", "mcp_bend_deg", "deg")] = angles_mcp
+            df_out[("metric", "wrist_bend_deg", "deg")] = angles_wrist
+            df_out[("metric", "mcp_bend_in_wrist_plane_deg", "deg")] = angles_mcp_plane
             if add_plane_ok:
                 df_out[("metric", "wrist_plane_ok", "")] = plane_ok
+
+            # === NEW: stamp labels on each per-trial augmented df ===
+            # Use flat (single-level) columns for easy downstream access
+            df_out["set_label"] = set_label
+            df_out["trial"] = int(trial_idx)
 
             augmented.append(df_out)
 
@@ -1192,7 +2488,8 @@ class BallBearingData:
             time_col = None
             for c in df_out.columns:
                 if "time" in str(c).lower() or "timestamp" in str(c).lower():
-                    time_col = c; break
+                    time_col = c;
+                    break
             time_vals = df_out[time_col] if time_col is not None else pd.Series([np.nan] * len(df_out))
 
             parts.append(pd.DataFrame({
@@ -1208,8 +2505,8 @@ class BallBearingData:
             }))
 
         tall = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
-            columns=["set_label","trial","frame","time_or_timestamp",
-                     "mcp_bend_deg","wrist_bend_deg","mcp_bend_in_wrist_plane_deg","wrist_plane_ok"]
+            columns=["set_label", "trial", "frame", "time_or_timestamp",
+                     "mcp_bend_deg", "wrist_bend_deg", "mcp_bend_in_wrist_plane_deg", "wrist_plane_ok"]
         )
         return augmented, tall
 
@@ -1279,17 +2576,49 @@ class BallBearingData:
         return dfs
 
     def extract_mat_dfs_by_trial(
-        self,
-        trial_folders: List[str],
-        mat_name: str = "flir.mat",
-        prefix: str = "ts",
+            self,
+            trial_folders: List[str],
+            mat_name: str = "flir.mat",
+            prefix: str = "ts",
+            *,
+            # NEW labeling controls
+            add_labels: bool = True,
+            trial_labels: Optional[List[int]] = None,  # else trial_base..N-1
+            trial_base: int = 1,  # set 0 for zero-based
+            set_label: Optional[str] = None,  # single label for all
+            set_labels: Optional[List[str]] = None,  # per-trial labels
+            include_path: bool = False,  # optionally store source path in each df
     ) -> List[pd.DataFrame]:
         """
-        For each trial folder, find a FLIR .mat file and load variables whose names start with `prefix`
-        (e.g., 'ts*') into a single DataFrame per trial.
+        For each trial folder, find a FLIR .mat file and load variables whose names
+        start with `prefix` (e.g., 'ts*') into a single DataFrame per trial.
+        If add_labels=True, stamps 'trial' and 'set_label' columns on each df.
         """
+        import pandas as pd
+        from pathlib import Path
+
         out: List[pd.DataFrame] = []
-        for folder in trial_folders:
+
+        # build labels
+        n = len(trial_folders)
+        if trial_labels is None:
+            labels_trial = [trial_base + i for i in range(n)]
+        else:
+            if len(trial_labels) != n:
+                raise ValueError("trial_labels length must match trial_folders length.")
+            labels_trial = trial_labels
+
+        if set_labels is not None and len(set_labels) != n:
+            raise ValueError("set_labels length must match trial_folders length.")
+
+        def _label_for(i: int) -> tuple[Optional[int], Optional[str]]:
+            tlabel = labels_trial[i] if add_labels else None
+            slabel = None
+            if add_labels:
+                slabel = set_labels[i] if set_labels is not None else set_label
+            return tlabel, slabel
+
+        for i, folder in enumerate(trial_folders):
             fp = Path(folder)
 
             cands: List[Path] = []
@@ -1305,7 +2634,15 @@ class BallBearingData:
                 cands = [p for p in nested if not self._is_bad_dot_underscore(p)]
 
             if not cands:
-                out.append(pd.DataFrame()); continue
+                # return an empty df but still stamp labels if requested
+                df = pd.DataFrame()
+                tlabel, slabel = _label_for(i)
+                if add_labels:
+                    if tlabel is not None: df["trial"] = [tlabel]
+                    if slabel is not None: df["set_label"] = [slabel]
+                if include_path: df["source_path"] = [str(fp)]
+                out.append(df)
+                continue
 
             cands_sorted = sorted(cands, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
             mat_path = cands_sorted[0]
@@ -1316,30 +2653,56 @@ class BallBearingData:
                 print(f"[WARN] Skipping unreadable MAT: {mat_path} ({e})")
                 df = pd.DataFrame()
 
+            # stamp labels (don’t overwrite if already present)
+            if add_labels and not df.empty:
+                tlabel, slabel = _label_for(i)
+                if ("trial" not in df.columns) and (tlabel is not None):
+                    df = df.copy();
+                    df["trial"] = tlabel
+                if ("set_label" not in df.columns) and (slabel is not None):
+                    df = df.copy();
+                    df["set_label"] = slabel
+            elif add_labels and df.empty:
+                # ensure at least a one-row df with labels, if you prefer; or keep empty
+                pass
+
+            if include_path:
+                df = df.copy();
+                df["source_path"] = str(mat_path)
+
             out.append(df)
         return out
 
     def attach_dlc_angles_to_cam_by_trial(
-        self,
-        cam_trials: List[pd.DataFrame],
-        dlc_aug_trials: List[pd.DataFrame],
-        *,
-        cam_time_col: Optional[str] = None,   # e.g. 'ts_25183199'; auto-detect if None
-        cam_time_prefix: str = "ts",          # auto-detect columns starting with this
-        tolerance: Union[str, float, int] = "10ms",
-        direction: str = "nearest",
-        suffix: str = "_dlc",
+            self,
+            cam_trials: List[pd.DataFrame],
+            dlc_aug_trials: List[pd.DataFrame],
+            *,
+            cam_time_col: Optional[str] = None,  # e.g. 'ts_25183199'; auto-detect if None
+            cam_time_prefix: str = "ts",  # auto-detect columns starting with this
+            tolerance: Union[str, float, int] = "10ms",
+            direction: str = "nearest",
+            suffix: str = "_dlc",
+            # --- NEW labeling controls ---
+            add_labels: bool = True,  # add both 'trial' and 'set_label'
+            trial_labels: Optional[List[int]] = None,  # per-trial ids; else trial_base..N-1
+            trial_base: int = 1,  # default 1..N; set to 0 for 0..N-1
+            set_label: Optional[str] = None,  # single label for all trials (e.g., "first")
+            set_labels: Optional[List[str]] = None,  # per-trial labels (same length as cam_trials)
     ) -> List[pd.DataFrame]:
         """
         Append DLC angle columns (from compute_dlc3d_angles_by_trial) to each camera ts_* DataFrame.
-
-        Per trial:
-          • If lengths match: index-wise join (fast path).
-          • Else if both sides have a time column: merge_asof on coerced seconds.
-          • Else: nearest join on frame index.
+        Returns a list of per-trial DataFrames. If add_labels=True, each df gets:
+          - 'trial'     : from trial_labels or a default sequence
+          - 'set_label' : from set_label (single) or set_labels (per-trial)
+        Preserves these labels if they already exist.
         """
+        import numpy as np
+        import pandas as pd
+
         out: List[pd.DataFrame] = []
 
+        # ---------- helpers ----------
         def _pick_cam_time(df: pd.DataFrame) -> Optional[str]:
             if cam_time_col and cam_time_col in df.columns:
                 return cam_time_col
@@ -1348,8 +2711,10 @@ class BallBearingData:
 
         def _find_dlc_time_col(df: pd.DataFrame):
             for c in df.columns:
-                s = str(c)
-                if "ts" in s.lower() or "timestamp" in s.lower():
+                s = str(c).lower()
+                if "cam_time_s_from_ts" in s:  # preferred prepared-seconds column if present
+                    return c
+                if "ts" in s or "timestamp" in s or s.endswith("_time_s") or s in ("time_s", "t_sec"):
                     return c
             return None
 
@@ -1364,21 +2729,46 @@ class BallBearingData:
             if not present:
                 return pd.DataFrame(index=df.index)
             sub = df[present].copy()
-            new_names = []
-            for c in sub.columns:
-                base = "_".join([x for x in c if str(x) != ""]) if isinstance(c, tuple) else str(c)
-                new_names.append(base + suffix)
-            sub.columns = new_names
+            sub.columns = [
+                ("_".join([x for x in c if str(x) != ""]) if isinstance(c, tuple) else str(c)) + suffix
+                for c in sub.columns
+            ]
             return sub
 
         def _tol_seconds_local(tol) -> float:
-            if isinstance(tol, str):
-                return pd.to_timedelta(tol).total_seconds()
-            return float(tol)
+            return pd.to_timedelta(tol).total_seconds() if isinstance(tol, str) else float(tol)
 
-        for cam_df, dlc_df in zip(cam_trials, dlc_aug_trials):
+        # ---------- build labels ----------
+        n = len(cam_trials)
+        if trial_labels is None:
+            labels_trial = [trial_base + i for i in range(n)]
+        else:
+            if len(trial_labels) != n:
+                raise ValueError("trial_labels length must match cam_trials length.")
+            labels_trial = trial_labels
+
+        if set_labels is not None and len(set_labels) != n:
+            raise ValueError("set_labels length must match cam_trials length.")
+
+        def _label_for(i: int) -> tuple[Optional[int], Optional[str]]:
+            tlabel = labels_trial[i] if add_labels else None
+            slabel = None
+            if add_labels:
+                slabel = set_labels[i] if set_labels is not None else set_label
+            return tlabel, slabel
+
+        # ---------- main loop ----------
+        for i, (cam_df, dlc_df) in enumerate(zip(cam_trials, dlc_aug_trials)):
+            tlabel, slabel = _label_for(i)
+
             if cam_df is None or cam_df.empty or dlc_df is None or dlc_df.empty:
-                out.append(cam_df if isinstance(cam_df, pd.DataFrame) else pd.DataFrame())
+                df_out = cam_df.copy() if isinstance(cam_df, pd.DataFrame) else pd.DataFrame()
+                if add_labels and not df_out.empty:
+                    if tlabel is not None and "trial" not in df_out.columns:
+                        df_out["trial"] = tlabel
+                    if slabel is not None and "set_label" not in df_out.columns:
+                        df_out["set_label"] = slabel
+                out.append(df_out)
                 continue
 
             dlc_metrics = _flatten_metrics(dlc_df)
@@ -1386,23 +2776,35 @@ class BallBearingData:
             # Case A: identical lengths → fast index join
             if len(cam_df) == len(dlc_metrics) and len(dlc_metrics) > 0:
                 joined = cam_df.reset_index(drop=True).join(dlc_metrics.reset_index(drop=True))
+                if add_labels:
+                    if tlabel is not None and "trial" not in joined.columns:
+                        joined["trial"] = tlabel
+                    if slabel is not None and "set_label" not in joined.columns:
+                        joined["set_label"] = slabel
                 out.append(joined)
                 continue
 
-            cam_col  = _pick_cam_time(cam_df)
+            # Case B: time-based merge_asof if possible
+            cam_col = _pick_cam_time(cam_df)
             dlc_tcol = _find_dlc_time_col(dlc_df)
 
-            # Case B: time-based merge_asof if possible
             if cam_col is not None and dlc_tcol is not None and len(dlc_metrics) > 0:
                 left = cam_df[[cam_col]].copy()
                 right = dlc_df[[dlc_tcol]].copy()
 
-                left["_t"]     = self._coerce_time_series_numeric_seconds(left[cam_col])
-                right["_t_enc"] = self._coerce_time_series_numeric_seconds(right[dlc_tcol])
+                # prefer precomputed seconds if available
+                if "cam_time_s_from_ts" in cam_df.columns:
+                    left["_t"] = pd.to_numeric(cam_df["cam_time_s_from_ts"], errors="coerce")
+                else:
+                    left["_t"] = self._coerce_time_series_numeric_seconds(left[cam_col])
 
-                left  = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
+                if dlc_tcol in ("cam_time_s_from_ts", "time_s", "t_sec") or str(dlc_tcol).endswith("_time_s"):
+                    right["_t_enc"] = pd.to_numeric(right[dlc_tcol], errors="coerce")
+                else:
+                    right["_t_enc"] = self._coerce_time_series_numeric_seconds(right[dlc_tcol])
+
+                left = left.dropna(subset=["_t"]).sort_values("_t").reset_index(drop=False)
                 right = right.dropna(subset=["_t_enc"]).sort_values("_t_enc").reset_index(drop=False)
-
                 right = right.join(dlc_metrics.reset_index(drop=True))
 
                 m = pd.merge_asof(
@@ -1416,14 +2818,17 @@ class BallBearingData:
                 m = m.set_index("index").reindex(cam_df.index)
                 keep_cols = [c for c in m.columns if c.endswith(suffix)]
                 joined = pd.concat([cam_df, m[keep_cols]], axis=1)
+
+                if add_labels:
+                    if tlabel is not None and "trial" not in joined.columns:
+                        joined["trial"] = tlabel
+                    if slabel is not None and "set_label" not in joined.columns:
+                        joined["set_label"] = slabel
+
                 out.append(joined)
                 continue
 
             # Case C: fallback to frame-index nearest
-            if len(dlc_metrics) == 0:
-                out.append(cam_df.copy())
-                continue
-
             cam_tmp = cam_df.copy()
             dlc_tmp = dlc_metrics.copy()
             cam_tmp["_frame"] = np.arange(len(cam_tmp), dtype=float)
@@ -1442,6 +2847,12 @@ class BallBearingData:
 
             keep_cols = [c for c in m.columns if c.endswith(suffix)]
             joined = pd.concat([cam_df, m[keep_cols]], axis=1)
+            if add_labels:
+                if tlabel is not None and "trial" not in joined.columns:
+                    joined["trial"] = tlabel
+                if slabel is not None and "set_label" not in joined.columns:
+                    joined["set_label"] = slabel
+
             out.append(joined)
 
         return out
@@ -1814,123 +3225,312 @@ class BallBearingData:
 
         return merged
 
-    def align_theta_all_to_cam_for_set(
-        self,
-        theta_all_set: pd.DataFrame,
-        cam_trials: List[pd.DataFrame],
-        *,
-        enc_time_col: str = "timestamp",
-        cam_time_col: Optional[str] = None,
-        cam_time_prefix: str = "ts",
-        tolerance: Union[str, int, float] = "10ms",
-        direction: str = "nearest",
-        theta_col: str = "theta_pred_deg",
-        keep_time_delta: bool = True,
-        drop_unmatched: bool = True,
-        return_concatenated: bool = False,
-    ) -> List[pd.DataFrame] | pd.DataFrame:
+
+    def plot_imu_dlc_abs_error_boxplots(
+            self,
+            *,
+            aligned_first_imu: list,
+            aligned_second_imu: list,
+            dlc_angle_col: str = "metric_wrist_bend_deg_deg_dlc",
+            imu_angle_col: str = "imu_joint_deg_rx_py",
+            trials_first: list | tuple | None = None,  # e.g., [1,3] (accepts 1- or 0-based). None => auto-pick 2
+            trials_second: list | tuple | None = None,
+            max_abs_dt_ms: float | None = 100.0,  # None -> no Δt filter
+            figsize=(10.5, 4.6),
+            whisker: float = 1.5,
+            show_counts: bool = True,
+            verbose: bool = True,
+    ):
         """
-        Align a tall per-set θ table to per-trial camera ts_* DataFrames.
-        Keeps ALL camera columns; appends theta/ADC/time_s, plus deltas in ns/ms/s.
+        Make boxplots of |IMU - DLC| for two trials in Set 1 and two trials in Set 2,
+        using pre-aligned lists (aligned_first_imu, aligned_second_imu).
+
+        Left subplot: 2 boxes for Set 1 (one per chosen trial).
+        Right subplot: 2 boxes for Set 2 (one per chosen trial).
+
+        Returns: {"fig","axes","stats","chosen_trials":{"set1":[...],"set2":[...]}}
         """
-        def _coerce_tolerance_to_timedelta(tol) -> pd.Timedelta:
-            if isinstance(tol, (np.integer, int)):
-                return pd.to_timedelta(int(tol), unit="us")
-            if isinstance(tol, (np.floating, float)):
-                return pd.to_timedelta(float(tol), unit="s")
-            return pd.to_timedelta(tol)
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
 
-        def _to_int64_ns(series: pd.Series) -> pd.Series:
-            # Replace deprecated Series.view("i8")
-            if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
-                return series.astype("int64")  # ns since epoch or ns
-            sn = pd.to_numeric(series, errors="coerce")
-            if sn.notna().any():
-                return sn.round().astype("Int64")
-            dt = pd.to_datetime(series, errors="coerce", utc=True)
-            if dt.notna().any():
-                return dt.astype("int64")
-            return pd.Series(pd.array([pd.NA] * len(series), dtype="Int64"), index=series.index)
+        def _nonempty_indices(al):
+            return [i for i, df in enumerate(al or []) if df is not None and not df.empty]
 
-        if theta_col not in theta_all_set.columns:
-            raise KeyError(f"'{theta_col}' not found in theta_all_set.")
-        if enc_time_col not in theta_all_set.columns:
-            raise KeyError(f"'{enc_time_col}' not found in theta_all_set.")
+        def _resolve_trials(al, trials):
+            """Accept 1- or 0-based labels; return valid 0-based indices (max 2)."""
+            ne = _nonempty_indices(al)
+            if not ne:
+                return []
+            if trials is None:
+                return ne[:2]
+            idxs = []
+            for t in trials:
+                t = int(t)
+                i1 = t - 1
+                if 0 <= i1 < len(al) and al[i1] is not None and not al[i1].empty:
+                    idxs.append(i1);
+                    continue
+                if 0 <= t < len(al) and al[t] is not None and not al[t].empty:
+                    idxs.append(t)
+            # keep first two unique
+            seen, out = set(), []
+            for i in idxs:
+                if i not in seen:
+                    out.append(i);
+                    seen.add(i)
+                if len(out) == 2:
+                    break
+            if not out:
+                out = ne[:2]
+            return out
 
-        tol_td = _coerce_tolerance_to_timedelta(tolerance)
-        tol_ns = int(tol_td / pd.to_timedelta(1, unit="ns"))
-        merged_trials: List[pd.DataFrame] = []
+        def _abs_err_for_trial(df):
+            if df is None or df.empty:
+                return np.array([], dtype=float)
+            if (dlc_angle_col not in df.columns) or (imu_angle_col not in df.columns):
+                return np.array([], dtype=float)
+            s_dlc = pd.to_numeric(df[dlc_angle_col], errors="coerce")
+            s_imu = pd.to_numeric(df[imu_angle_col], errors="coerce")
+            ok = s_dlc.notna() & s_imu.notna()
+            if max_abs_dt_ms is not None and "_delta_ms" in df.columns:
+                dt_ok = pd.to_numeric(df["_delta_ms"], errors="coerce").abs() <= float(max_abs_dt_ms)
+                ok = ok & dt_ok
+            v = (s_imu[ok] - s_dlc[ok]).abs().to_numpy()
+            return v if v.size else np.array([], dtype=float)
 
-        for trial_idx, cam_df in enumerate(cam_trials, start=1):
-            th_df = theta_all_set.loc[theta_all_set["trial"] == trial_idx].copy()
-            if cam_df is None or cam_df.empty or th_df.empty:
-                merged_trials.append(pd.DataFrame()); continue
+        # choose trials
+        idxs1 = _resolve_trials(aligned_first_imu, trials_first)
+        idxs2 = _resolve_trials(aligned_second_imu, trials_second)
+        if verbose:
+            print(f"[imu-dlc boxplots] set1 trials (0-based): {idxs1}, set2 trials (0-based): {idxs2}")
 
-            if cam_time_col is None:
-                cam_cands = [c for c in cam_df.columns if str(c).lower().startswith(cam_time_prefix)]
-                cam_col = cam_cands[0] if cam_cands else None
-            else:
-                cam_col = cam_time_col
+        # compute arrays
+        vals1 = [_abs_err_for_trial(aligned_first_imu[i]) for i in idxs1]
+        vals2 = [_abs_err_for_trial(aligned_second_imu[i]) for i in idxs2]
 
-            if cam_col is None or cam_col not in cam_df.columns:
-                print(f"[alignθ] Trial {trial_idx}: camera time column not found (prefix='{cam_time_prefix}').")
-                merged_trials.append(pd.DataFrame()); continue
+        # pad with empties if fewer than 2
+        while len(vals1) < 2: vals1.append(np.array([], dtype=float))
+        while len(vals2) < 2: vals2.append(np.array([], dtype=float))
 
-            left = cam_df.copy()
-            left["_t_ns"] = _to_int64_ns(left[cam_col])
-            left = left.dropna(subset=["_t_ns"]).sort_values("_t_ns")
+        # labels (show as 1-based to user)
+        labels1 = [f"Set1 T{(i + 1)}" if i is not None else "Set1 ?" for i in idxs1] + [""] * (2 - len(idxs1))
+        labels2 = [f"Set2 T{(i + 1)}" if i is not None else "Set2 ?" for i in idxs2] + [""] * (2 - len(idxs2))
 
-            extra_cols = ["time_s", "adc_ch3"]
-            right_cols = [enc_time_col, theta_col] + [c for c in extra_cols if c in th_df.columns]
-            right = th_df[right_cols].copy()
-            right["_t_ns"] = _to_int64_ns(right[enc_time_col])
-            right = right.dropna(subset=["_t_ns"]).sort_values("_t_ns")
-            right["_t_enc_ns"] = right["_t_ns"].copy()
+        # plot
+        fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True, constrained_layout=True)
 
-            if left.empty or right.empty:
-                merged_trials.append(pd.DataFrame()); continue
+        boxprops = dict(linewidth=1.2)
+        medianprops = dict(color="black", linewidth=1.8)
+        whiskerprops = dict(color="0.4", linewidth=1.2)
+        capprops = dict(color="0.4", linewidth=1.2)
 
-            m = pd.merge_asof(
-                left, right,
-                left_on="_t_ns", right_on="_t_ns",
-                direction=direction,
-                tolerance=tol_ns,
-                allow_exact_matches=True,
+        bpl = axes[0].boxplot(
+            vals1, labels=labels1, whis=whisker, showfliers=False, patch_artist=True,
+            boxprops=boxprops, medianprops=medianprops,
+            whiskerprops=whiskerprops, capprops=capprops
+        )
+        bpr = axes[1].boxplot(
+            vals2, labels=labels2, whis=whisker, showfliers=False, patch_artist=True,
+            boxprops=boxprops, medianprops=medianprops,
+            whiskerprops=whiskerprops, capprops=capprops
+        )
+
+        # make all boxes blue with slight alpha
+        for bx in (bpl, bpr):
+            for patch in bx["boxes"]:
+                patch.set_facecolor("tab:blue");
+                patch.set_alpha(0.35)
+            for med in bx["medians"]:
+                med.set_color("black");
+                med.set_linewidth(1.8)
+
+        axes[0].set_title("|IMU − DLC| (Set 1)")
+        axes[0].set_ylabel("|angle error| (deg)")
+        axes[1].set_title("|IMU − DLC| (Set 2)")
+
+        for ax in axes:
+            ax.axhline(0, color="k", linewidth=0.8, alpha=0.5)
+            ax.grid(axis="y", alpha=0.25)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        # counts
+        if show_counts:
+            def _annot(ax, arrs):
+                top = ax.get_ylim()[1] if np.isfinite(ax.get_ylim()[1]) else 1.0
+                for i, arr in enumerate(arrs, start=1):
+                    n = int(arr.size) if arr is not None else 0
+                    ax.text(i, top * 0.95, f"n={n}", ha="center", va="top", fontsize=9)
+
+            _annot(axes[0], vals1);
+            _annot(axes[1], vals2)
+
+        def _summ(a):
+            if a.size == 0:
+                return dict(n=0, mean=np.nan, median=np.nan, p90=np.nan, iqr=np.nan, mad=np.nan)
+            q25, med, q75, p90 = np.percentile(a, [25, 50, 75, 90])
+            return dict(
+                n=int(a.size),
+                mean=float(np.mean(a)),
+                median=float(med),
+                p90=float(p90),
+                iqr=float(q75 - q25),
+                mad=float(np.median(np.abs(a - med))),
             )
 
-            if keep_time_delta and "_t_enc_ns" in m.columns:
-                m["_delta_ns"]  = (m["_t_enc_ns"] - m["_t_ns"]).astype("Int64")
-                m["_delta_ms"]  = m["_delta_ns"].astype("float64") / 1e6
-                m["_delta_sec"] = m["_delta_ns"].astype("float64") / 1e9
+        stats = {
+            "set1": {labels1[0]: _summ(vals1[0]), labels1[1]: _summ(vals1[1])},
+            "set2": {labels2[0]: _summ(vals2[0]), labels2[1]: _summ(vals2[1])},
+            "chosen_trials": {"set1": [i for i in idxs1], "set2": [i for i in idxs2]},
+            "params": {
+                "dlc_angle_col": dlc_angle_col,
+                "imu_angle_col": imu_angle_col,
+                "max_abs_dt_ms": max_abs_dt_ms,
+                "whisker": whisker,
+            },
+        }
+        if verbose: print("[imu-dlc boxplots] done.")
+        return {"fig": fig, "axes": axes, "stats": stats}
 
-            if drop_unmatched and theta_col in m.columns:
-                m = m.loc[m[theta_col].notna()].copy()
+    def plot_imu_vs_dlc_twopanel(
+            self,
+            *,
+            aligned_first_imu: list,
+            aligned_second_imu: list,
+            dlc_angle_col: str = "metric_wrist_bend_deg_deg_dlc",
+            imu_angle_col: str = "imu_joint_deg_rx_py",
+            trials_first: list | tuple | None = None,  # e.g., [1,3] or [0,2]; None => auto first two
+            trials_second: list | tuple | None = None,
+            max_abs_dt_ms: float | None = 100.0,
+            figsize=(12.0, 4.8),
+            linewidth: float = 1.6,
+            alpha_dlc: float = 0.9,
+            alpha_imu: float = 0.9,
+            verbose: bool = True,
+    ):
+        """
+        Plot IMU vs DLC angle as time series, overlaying up to TWO trials per set.
+          LEFT:  Set 1 (two chosen trials)
+          RIGHT: Set 2 (two chosen trials)
+        Uses pre-aligned lists (aligned_first_imu / aligned_second_imu).
+        """
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
 
-            m["trial"] = trial_idx
-            if "set_label" in theta_all_set.columns:
-                vals = th_df["set_label"].dropna()
-                if not vals.empty:
-                    m["set_label"] = vals.mode().iat[0]
+        def _nonempty_indices(al):
+            return [i for i, df in enumerate(al or []) if df is not None and not df.empty]
 
-            merged_trials.append(m.reset_index(drop=True))
+        def _resolve_two(al, trials_like):
+            """Return up to two 0-based indices, accepting 1- or 0-based."""
+            ne = _nonempty_indices(al)
+            if not ne:
+                return []
+            if trials_like is None:
+                return ne[:2]
+            idxs = []
+            for t in trials_like:
+                t = int(t)
+                i1 = t - 1
+                if 0 <= i1 < len(al) and al[i1] is not None and not al[i1].empty:
+                    idxs.append(i1);
+                    continue
+                if 0 <= t < len(al) and al[t] is not None and not al[t].empty:
+                    idxs.append(t)
+            # dedupe and cap at 2
+            out, seen = [], set()
+            for i in idxs:
+                if i not in seen:
+                    out.append(i);
+                    seen.add(i)
+                if len(out) == 2:
+                    break
+            return out if out else ne[:2]
 
-        if return_concatenated:
-            non_empty = [df for df in merged_trials if not df.empty]
-            return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
+        def _rel_seconds(series):
+            s = pd.to_numeric(series, errors="coerce").to_numpy()
+            if s.size == 0 or not np.isfinite(s).any():
+                return s
+            s = s - np.nanmin(s)
+            mx = np.nanmax(s)
+            if not np.isfinite(mx) or mx == 0:
+                return s
+            if mx > 1e9: return s / 1e9
+            if mx > 1e6: return s / 1e6
+            if mx > 1e3: return s / 1e3
+            return s
 
-        return merged_trials
+        def _pick_x(df):
+            for xname in ("enc_time_s", "time_s", "t_sec"):
+                if xname in df.columns:
+                    return pd.to_numeric(df[xname], errors="coerce").to_numpy()
+            ts_cols = [c for c in df.columns if str(c).startswith("ts_")]
+            if ts_cols:
+                return _rel_seconds(df[ts_cols[0]])
+            return np.arange(len(df), dtype=float)
 
-    def _tol_seconds(self, tol):
-        """Return tolerance in float seconds (handles strings like '10ms')."""
-        if isinstance(tol, str):
-            return pd.to_datetime("1970-01-01")  # dummy to use pandas parser (not used)
-        try:
-            # Try string → Timedelta → seconds
-            if isinstance(tol, str):
-                return pd.to_timedelta(tol).total_seconds()
-            return float(tol)
-        except Exception:
-            return float(pd.to_timedelta("10ms").total_seconds())
+        def _plot_trial(ax, df, label_prefix, color):
+            if df is None or df.empty: return False
+            if (dlc_angle_col not in df.columns) or (imu_angle_col not in df.columns): return False
+
+            x = _pick_x(df)
+            ok = pd.Series(True, index=df.index)
+            if (max_abs_dt_ms is not None) and ("_delta_ms" in df.columns):
+                ok = pd.to_numeric(df["_delta_ms"], errors="coerce").abs() <= float(max_abs_dt_ms)
+                ok = ok.fillna(False)
+
+            y_dlc = pd.to_numeric(df[dlc_angle_col], errors="coerce")
+            y_imu = pd.to_numeric(df[imu_angle_col], errors="coerce")
+            good = ok & y_dlc.notna() & y_imu.notna()
+            if not good.any(): return False
+
+            xx = np.asarray(x)[good.to_numpy()]
+            ax.plot(xx, y_dlc[good].to_numpy(), linestyle=":", linewidth=linewidth,
+                    alpha=alpha_dlc, color=color, label=f"{label_prefix} DLC")
+            ax.plot(xx, y_imu[good].to_numpy(), linestyle="-", linewidth=linewidth,
+                    alpha=alpha_imu, color=color, label=f"{label_prefix} IMU")
+            return True
+
+        # choose up to two trials per set
+        idxs1 = _resolve_two(aligned_first_imu, trials_first)
+        idxs2 = _resolve_two(aligned_second_imu, trials_second)
+        if verbose:
+            print(f"[imu-vs-dlc 2x] set1 trials (0-based): {idxs1} | set2 trials (0-based): {idxs2}")
+
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True, constrained_layout=True)
+
+        # colors per trial overlay (two distinct colors per panel)
+        colors_L = ["tab:blue", "tab:orange"]
+        colors_R = ["tab:green", "tab:red"]
+
+        # LEFT panel (Set 1)
+        any_L = False
+        for k, i in enumerate(idxs1[:2]):
+            lbl = f"T{i + 1}"
+            any_L |= _plot_trial(axes[0], aligned_first_imu[i], lbl, colors_L[k % len(colors_L)])
+        axes[0].set_title("Set 1 — IMU vs DLC (two trials)" + ("" if any_L else " — no data"))
+        axes[0].set_xlabel("time (s)")
+        axes[0].set_ylabel("angle (deg)")
+        axes[0].grid(alpha=0.25)
+        axes[0].spines["top"].set_visible(False);
+        axes[0].spines["right"].set_visible(False)
+        if any_L: axes[0].legend(frameon=False, ncol=2, fontsize=9)
+
+        # RIGHT panel (Set 2)
+        any_R = False
+        for k, i in enumerate(idxs2[:2]):
+            lbl = f"T{i + 1}"
+            any_R |= _plot_trial(axes[1], aligned_second_imu[i], lbl, colors_R[k % len(colors_R)])
+        axes[1].set_title("Set 2 — IMU vs DLC (two trials)" + ("" if any_R else " — no data"))
+        axes[1].set_xlabel("time (s)")
+        axes[1].grid(alpha=0.25)
+        axes[1].spines["top"].set_visible(False);
+        axes[1].spines["right"].set_visible(False)
+        if any_R: axes[1].legend(frameon=False, ncol=2, fontsize=9)
+
+        return {"fig": fig, "axes": axes, "trials_used": {"set1": idxs1[:2], "set2": idxs2[:2]}}
 
     def align_adc_to_cam_both_sets(
         self,
@@ -3741,257 +5341,293 @@ class bender_class:
         den = th_max * (8.0 - alpha * th_max) / (2.0 - alpha * th_max) ** 2
         return num / den
 
-    def fit_knuckle_radius_from_normalized(self,
-                                           L=2.0,
-                                           angle_col="Rotary Encoder",
-                                           value_col="ADC Value",
-                                           r0=0.7,
-                                           bounds=(1e-4, 2.45),
-                                           restrict_to_0_90=True,
-                                           make_angles_positive=True,
-                                           plot=False,
-                                           ax=None,
-                                           flip_data=False,
-                                           # --- overlays ---
-                                           block_df=None,  # DataFrame or sequence; if sequence use block_index
-                                           block_index=None,
-                                           cam_df=None,  # DataFrame or sequence; if sequence use cam_index
-                                           cam_index=None,
-                                           show_quadratic=True,
-                                           # --- optional explicit column names for overlays ---
-                                           block_angle_col_hint=None,
-                                           block_adc_col_hint=None,
-                                           cam_angle_col_hint=None,
-                                           cam_adc_col_hint=None,
-                                           # --- legend labels ---
-                                           cam_label="Camera calibration",
-                                           block_label="Block calibration",
-                                           # --- styling (override if desired) ---
-                                           style_theory=dict(color="tab:orange", linewidth=2, label="Theory fit"),
-                                           style_block_points=None,
-                                           style_block_curve=None,
-                                           style_cam_points=None,
-                                           style_cam_curve=None,
-                                           # --- outputs ---
-                                           return_curve=True,
-                                           theta_grid=None,
-                                           # --- diagnostics ---
-                                           verbose=False):
-        """
-        Fit the normalized theoretical model to data in self.data to estimate knuckle radius r,
-        and (optionally) overlay camera/block calibration datasets with 0–1 normalized
-        quadratic fits. Supports selecting items by index if sequences are passed.
+    def fit_knuckle_radius_from_normalized(
+            self,
+            # --- theory fit target (now Block 1 normalized points) ---
+            L=2.0,
+            r0=0.7,
+            bounds=(1e-4, 2.45),
 
-        You can force angle/adc columns for overlays via *angle_col_hint / *adc_col_hint.
-        Set verbose=True to print which item & columns were used and how many points were fit.
+            # --- BLOCK sources: ranges + angles (this method will build angle→adc tables) ---
+            h_cal_path_first=None,  # str | pd.Series | np.ndarray (ADC stream for Block 1)
+            ranges_first=None,  # list[(start,end)] aligned with 'angles'
+            h_cal_path_second=None,  # str | pd.Series | np.ndarray (ADC stream for Block 2)
+            ranges_second=None,  # list[(start,end)] aligned with 'angles'
+            angles=(0.0, 22.5, 45.0, 67.5, 90.0),
+            max_points_per_range=None,  # e.g., 200 (keeps flattest window), or None for all
+
+            # --- CAMERA sources (means or points) ---
+            cam_df=None,  # DataFrame (both sets with set_idx) OR list/tuple of DFs
+            cam_index_first=None,  # which item is Camera 1 if cam_df is a sequence
+            cam_index_second=None,  # which item is Camera 2 if cam_df is a sequence
+            cam_angle_col_hint="angle_deg",
+            cam_adc_col_hint="mean_adc",
+
+            # --- general behaviors ---
+            restrict_to_0_90=True,
+            make_angles_positive=True,
+            flip_data=False,  # flips normalized y → (1-y) everywhere (incl. theory fit)
+            show_quadratic=True,
+            plot=False,
+            ax=None,
+
+            # --- labels ---
+            block1_label="Block 1",
+            block2_label="Block 2",
+            cam1_label="Camera 1",
+            cam2_label="Camera 2",
+            theory_label="Theory fit",
+
+            # --- styles ---
+            style_theory=dict(color="tab:orange", linewidth=2),
+            style_block1_points=dict(color="tab:green", s=22, alpha=0.75),
+            style_block1_curve=dict(color="tab:green", linestyle="--", linewidth=2),
+            style_block2_points=dict(color="tab:red", s=22, alpha=0.75),
+            style_block2_curve=dict(color="tab:red", linestyle="--", linewidth=2),
+            style_cam1_points=dict(color="tab:blue", s=28, alpha=0.80, marker="o"),
+            style_cam1_curve=dict(color="tab:blue", linestyle="-.", linewidth=2),
+            style_cam2_points=dict(color="tab:purple", s=28, alpha=0.80, marker="o"),
+            style_cam2_curve=dict(color="tab:purple", linestyle="-.", linewidth=2),
+
+            # --- outputs ---
+            return_curve=True,
+            theta_grid=None,
+
+            # --- diagnostics ---
+            verbose=False,
+    ):
+        """
+        Build Block 1/2 angle→ADC from (ranges, angles) and CSV/Series, do per-set quadratic fits
+        normalized to [0,1] via each fit's y(0°), y(90°). Do the same for Camera 1/2.
+        Fit the theoretical model (normalized) to Block 1 normalized *points* and report r̂, R².
+        Optionally plot overlays and return all fit artifacts.
 
         Returns:
           {
             "r_hat", "r_se", "r_ci95", "r2", "params_cov",
-            ("theta","y_model") if return_curve,
+            "theta", "y_model",                       # theory curve if return_curve
             "overlays": {
-                "block": {"ok", "coeffs"(c0,c1,c2), "r2", "theta", "x_pts", "y_pts_norm", "y_curve_norm},
-                "cam":   {...}
+               "block1": {"ok","coeffs","r2","x_pts","y_pts_norm","theta","y_curve_norm"},
+               "block2": {...},
+               "cam1":   {...},
+               "cam2":   {...}
             }
           }
         """
         import numpy as np
-        from scipy.optimize import curve_fit
-        import matplotlib.pyplot as plt
         import pandas as pd
+        import matplotlib.pyplot as plt
+        from scipy.optimize import curve_fit
         import copy
+        from pathlib import Path
 
-        if getattr(self, "data", None) is None:
-            raise ValueError("No data loaded. Use load_merged_df(...) or load_data(...) first.")
+        # ---------------- helpers ----------------
+        def _load_adc_series(src):
+            # Accept path, Series, ndarray, list-like
+            if src is None:
+                return None
+            if isinstance(src, (pd.Series, list, tuple, np.ndarray)):
+                v = np.asarray(src).astype(float)
+                return v[np.isfinite(v)]
+            # path-like → CSV → column pick
+            p = Path(str(src))
+            if not p.exists() or p.suffix.lower() != ".csv":
+                raise FileNotFoundError(f"ADC source not found or not a CSV: {src}")
+            df = pd.read_csv(p)
+            cand = "adc_ch3" if "adc_ch3" in df.columns else next(
+                (c for c in df.columns if str(c).lower().startswith("adc")), None
+            )
+            if cand is None:
+                raise KeyError(f"No ADC-like column in {p.name}")
+            y = pd.to_numeric(df[cand], errors="coerce").to_numpy(float)
+            y = y[np.isfinite(y)]
+            return y
 
-        # ---------- resolve styles with friendly defaults ----------
-        if style_block_points is None:
-            style_block_points = dict(color="tab:green", s=16, alpha=0.7)
-        else:
-            style_block_points = copy.deepcopy(style_block_points)
+        def _flattest_window(vals, k):
+            # pick consecutive window length k with minimal variance
+            if k is None or len(vals) <= 0 or k >= len(vals):
+                return vals
+            import numpy as _np
+            c1 = _np.concatenate(([0.0], _np.cumsum(vals)))
+            c2 = _np.concatenate(([0.0], _np.cumsum(vals * vals)))
+            sum_y = c1[k:] - c1[:-k]
+            sum_y2 = c2[k:] - c2[:-k]
+            mean_y = sum_y / k
+            var_y = _np.maximum(sum_y2 / k - mean_y ** 2, 0.0)
+            i0 = int(_np.argmin(var_y))
+            return vals[i0:i0 + k]
 
-        if style_block_curve is None:
-            style_block_curve = dict(color="tab:green", linestyle="--", linewidth=2)
-        else:
-            style_block_curve = copy.deepcopy(style_block_curve)
-
-        if style_cam_points is None:
-            style_cam_points = dict(color="tab:blue", s=16, alpha=0.7)
-        else:
-            style_cam_points = copy.deepcopy(style_cam_points)
-
-        if style_cam_curve is None:
-            style_cam_curve = dict(color="tab:blue", linestyle="-.", linewidth=2)
-        else:
-            style_cam_curve = copy.deepcopy(style_cam_curve)
-
-        # ---------- helpers ----------
-        def _unwrap_df(dfx, index, tag):
-            """
-            Accept DataFrame, (points_df, ...), or a list/tuple of those.
-            If sequence: pick EXACT index (default 0). If item is tuple/list like
-            (points_df, means_df), use the first element (points_df).
-            """
-            if dfx is None:
-                return None, None
-            if isinstance(dfx, pd.DataFrame):
-                if verbose:
-                    print(f"[{tag}] using a SINGLE DataFrame (index ignored)")
-                return dfx.copy(), 0
-            if isinstance(dfx, (list, tuple)):
-                i = 0 if index is None else index
-                if i < 0 or i >= len(dfx):
-                    raise IndexError(f"[{tag}] index {i} out of range for sequence of length {len(dfx)}.")
-                item = dfx[i]
-                raw_type = type(item)
-                if isinstance(item, (list, tuple)) and len(item) > 0:
-                    if verbose:
-                        print(f"[{tag}] selected item {i} of type {raw_type}; using first element of tuple/list")
-                    item = item[0]
-                else:
-                    if verbose:
-                        print(f"[{tag}] selected item {i} of type {raw_type}")
-                if not isinstance(item, pd.DataFrame):
-                    raise TypeError(f"[{tag}] selected item is not a DataFrame.")
-                return item.copy(), i
-            raise TypeError(
-                f"[{tag}] Provide a DataFrame or a list/tuple of DataFrames (optionally tuples of (points_df, ...)).")
+        def _build_block_angle_df(adc_stream, ranges, angles_list):
+            if adc_stream is None or ranges is None or angles_list is None:
+                return None
+            parts = []
+            n = len(adc_stream)
+            for (start, end), ang in zip(ranges, angles_list):
+                i0 = int(max(0, start))
+                i1 = int(min(n, end))
+                if i1 <= i0:
+                    continue
+                vals = adc_stream[i0:i1]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                if max_points_per_range is not None and vals.size > max_points_per_range:
+                    vals = _flattest_window(vals, int(max_points_per_range))
+                parts.append(pd.DataFrame({"angle": float(ang), "adc": vals}))
+            return (pd.concat(parts, ignore_index=True)
+                    if parts else pd.DataFrame(columns=["angle", "adc"]))
 
         def _tidy_angle_adc(df, angle_hint=None, adc_hint=None, tag="?"):
-            """
-            Return df with columns ['angle','adc'] as floats. Tries hints then common names;
-            falls back to substring search. Clips to 0..90 if needed (broaden to -5..95 and clip if sparse).
-            """
-            if df is None:
+            if df is None or df.empty:
                 return None
-
-            # Try explicit hints first
-            angle_col_cand = None
-            adc_col_cand = None
-            if angle_hint is not None and angle_hint in df.columns:
-                angle_col_cand = angle_hint
-            if adc_hint is not None and adc_hint in df.columns:
-                adc_col_cand = adc_hint
-
-            # Angle column candidates
-            if angle_col_cand is None:
-                angle_col_cand = next(
-                    (c for c in ["angle", "angle_deg", "theta", "Rotary Encoder", "angle_renc", "angle_deg_renc"]
-                     if c in df.columns),
-                    None
-                )
-            if angle_col_cand is None:
-                angle_col_cand = next(
-                    (c for c in df.columns if "angle" in str(c).lower() or "renc" in str(c).lower()),
-                    None
-                )
-
-            # ADC column candidates (add 'mean_adc' and 'adc_norm' support)
-            if adc_col_cand is None:
-                adc_col_cand = next(
-                    (c for c in ["adc_norm", "mean_adc", "adc_ch3", "adc", "ADC Value", "adc0", "adc1"]
-                     if c in df.columns),
-                    None
-                )
-            if adc_col_cand is None:
-                # Heuristic fallback: anything starting with 'adc' OR containing both 'mean' and 'adc'
-                adc_col_cand = next(
-                    (c for c in df.columns
-                     if str(c).lower().startswith("adc") or
-                     ("adc" in str(c).lower() and "mean" in str(c).lower())),
-                    None
-                )
-
-            if angle_col_cand is None or adc_col_cand is None:
-                raise KeyError(f"[{tag}] Could not identify angle/adc columns. Available: {list(df.columns)}")
-
-            out = df[[angle_col_cand, adc_col_cand]].rename(
-                columns={angle_col_cand: "angle", adc_col_cand: "adc"}
-            ).copy()
+            a = angle_hint if (angle_hint and angle_hint in df.columns) else None
+            d = adc_hint if (adc_hint and adc_hint in df.columns) else None
+            if a is None:
+                a = next((c for c in ["angle", "angle_deg", "theta", "Rotary Encoder"] if c in df.columns), None)
+                if a is None:
+                    a = next((c for c in df.columns if "angle" in str(c).lower()), None)
+            if d is None:
+                d = next((c for c in ["adc_norm", "mean_adc", "adc", "adc_ch3", "ADC Value"] if c in df.columns), None)
+                if d is None:
+                    d = next((c for c in df.columns if str(c).lower().startswith("adc")), None)
+            if a is None or d is None:
+                raise KeyError(f"[{tag}] cannot find angle/adc columns in {list(df.columns)}")
+            out = df[[a, d]].rename(columns={a: "angle", d: "adc"}).copy()
             out["angle"] = pd.to_numeric(out["angle"], errors="coerce")
             out["adc"] = pd.to_numeric(out["adc"], errors="coerce")
             out = out.dropna()
-
-            # Prefer 0..90°, broaden slightly if sparse, then clip
-            mask = out["angle"].between(0.0, 90.0) & out["adc"].notna()
-            sub = out.loc[mask].copy()
-            if len(sub) < 5:
-                mask_b = out["angle"].between(-5.0, 95.0) & out["adc"].notna()
-                sub = out.loc[mask_b].copy()
+            m = out["angle"].between(0.0, 90.0)
+            sub = out.loc[m].copy()
+            if sub.shape[0] < 5:
+                m2 = out["angle"].between(-5.0, 95.0)
+                sub = out.loc[m2].copy()
                 sub["angle"] = sub["angle"].clip(0.0, 90.0)
-
-            if verbose:
-                print(f"[{tag}] columns: angle='{angle_col_cand}', adc='{adc_col_cand}', n_points_for_fit={len(sub)}")
-
             return sub
 
-        def _quadfit_and_norm(df, theta_line, tag="?"):
-            """
-            Quadratic fit: adc = a + b*θ + c*θ^2, normalize to 0–1 over θ∈[0,90].
-            Returns dict: ok, coeffs(c0,c1,c2), r2, theta, x_pts, y_pts_norm, y_curve_norm
-            """
+        def _quadfit_norm(df, theta_line, tag="?"):
+            # fit: adc = c0 + c1*θ + c2*θ² ; normalize by fit's y(0), y(90)
             import numpy as _np
-            if df is None or len(df) < 3:
-                if verbose:
-                    print(f"[{tag}] too few points for quadratic fit (n={0 if df is None else len(df)})")
+            if df is None or df.shape[0] < 3:
                 return {"ok": False, "reason": "too_few_points"}
             x = df["angle"].to_numpy(float)
             y = df["adc"].to_numpy(float)
             c2, c1, c0 = _np.polyfit(x, y, deg=2)
             p = _np.poly1d([c2, c1, c0])
-
-            y_hat = p(x)
-            ss_res = float(_np.sum((y - y_hat) ** 2))
+            yhat = p(x)
+            ss_res = float(_np.sum((y - yhat) ** 2))
             ss_tot = float(_np.sum((y - float(_np.mean(y))) ** 2))
             r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else _np.nan
-
             y0, y90 = float(p(0.0)), float(p(90.0))
             y_grid = p(theta_line)
             if y90 >= y0:
-                y_curve_norm = (y_grid - y0) / max(1e-12, (y90 - y0))
-                y_pts_norm = (y - y0) / max(1e-12, (y90 - y0))
+                y_curve_n = (y_grid - y0) / max(1e-12, (y90 - y0))
+                y_pts_n = (y - y0) / max(1e-12, (y90 - y0))
             else:
-                y_curve_norm = (y0 - y_grid) / max(1e-12, (y0 - y90))
-                y_pts_norm = (y0 - y) / max(1e-12, (y0 - y90))
-
-            if verbose:
-                print(f"[{tag}] quad fit R²={r2:.4f}")
-
+                y_curve_n = (y0 - y_grid) / max(1e-12, (y0 - y90))
+                y_pts_n = (y0 - y) / max(1e-12, (y0 - y90))
             return {
                 "ok": True,
                 "coeffs": (float(c0), float(c1), float(c2)),
                 "r2": float(r2),
                 "theta": theta_line,
                 "x_pts": x,
-                "y_pts_norm": y_pts_norm,
-                "y_curve_norm": y_curve_norm,
+                "y_pts_norm": y_pts_n,
+                "y_curve_norm": y_curve_n,
             }
 
-        # ---------- main: prepare self.data (original flow) ----------
-        x_deg = np.asarray(self.data[angle_col], dtype=float)
-        y = np.asarray(self.data[value_col], dtype=float)
+        def _split_cam_sets(cam_in):
+            """Return (cam1_df, cam2_df) as tidy angle/adc tables."""
+            if cam_in is None:
+                return None, None
+            # sequence → pick by indices
+            if isinstance(cam_in, (list, tuple)):
+                c1 = _tidy_angle_adc(cam_in[cam_index_first or 0],
+                                     angle_hint=cam_angle_col_hint,
+                                     adc_hint=cam_adc_col_hint,
+                                     tag="cam1")
+                c2 = None
+                if cam_index_second is not None and cam_index_second < len(cam_in):
+                    c2 = _tidy_angle_adc(cam_in[cam_index_second],
+                                         angle_hint=cam_angle_col_hint,
+                                         adc_hint=cam_adc_col_hint,
+                                         tag="cam2")
+                return c1, c2
+            # single DF → try set_idx or set_label to split
+            df = cam_in.copy()
+            key = "set_idx" if "set_idx" in df.columns else ("set_label" if "set_label" in df.columns else None)
+            if key is None:
+                # assume it's already one set → cam1 only
+                c1 = _tidy_angle_adc(df, angle_hint=cam_angle_col_hint, adc_hint=cam_adc_col_hint, tag="cam1")
+                return c1, None
+            c1_raw = df[df[key].astype(str).str.lower().isin(["1", "first", "1st"])].copy()
+            c2_raw = df[df[key].astype(str).str.lower().isin(["2", "second", "2nd"])].copy()
+            c1 = _tidy_angle_adc(c1_raw, angle_hint=cam_angle_col_hint, adc_hint=cam_adc_col_hint,
+                                 tag="cam1") if not c1_raw.empty else None
+            c2 = _tidy_angle_adc(c2_raw, angle_hint=cam_angle_col_hint, adc_hint=cam_adc_col_hint,
+                                 tag="cam2") if not c2_raw.empty else None
+            return c1, c2
 
-        if flip_data:
-            y = 1.0 - y
+        # ---------------- build Block 1/2 angle→adc from ranges ----------------
+        theta_grid = np.linspace(0.0, 90.0, 400) if theta_grid is None else np.asarray(theta_grid, float)
+        blk1_df = None
+        blk2_df = None
+        if h_cal_path_first is not None and ranges_first is not None:
+            adc1 = _load_adc_series(h_cal_path_first)
+            blk1_df = _build_block_angle_df(adc1, ranges_first, angles)
+        if h_cal_path_second is not None and ranges_second is not None:
+            adc2 = _load_adc_series(h_cal_path_second)
+            blk2_df = _build_block_angle_df(adc2, ranges_second, angles)
 
-        m = np.isfinite(x_deg) & np.isfinite(y)
-        x_deg = x_deg[m]
-        y = y[m]
+        # tidy camera sets
+        cam1_df, cam2_df = _split_cam_sets(cam_df)
+
+        # ---------------- quadratic fits (normalized) for each overlay ----------------
+        overlays = {}
+        if show_quadratic and blk1_df is not None and not blk1_df.empty:
+            overlays["block1"] = _quadfit_norm(blk1_df, theta_grid, tag="block1")
+        if show_quadratic and blk2_df is not None and not blk2_df.empty:
+            overlays["block2"] = _quadfit_norm(blk2_df, theta_grid, tag="block2")
+        if show_quadratic and cam1_df is not None and not cam1_df.empty:
+            overlays["cam1"] = _quadfit_norm(cam1_df, theta_grid, tag="cam1")
+        if show_quadratic and cam2_df is not None and not cam2_df.empty:
+            overlays["cam2"] = _quadfit_norm(cam2_df, theta_grid, tag="cam2")
+
+        # ---------------- theory fit (normalized) using Block 1 normalized points ----------------
+        # pick Block 1 normalized points (fall back to any available set)
+        fit_source = None
+        fit_label = None
+        if "block1" in overlays and overlays["block1"].get("ok"):
+            fit_source, fit_label = overlays["block1"], block1_label
+        elif "cam1" in overlays and overlays["cam1"].get("ok"):
+            fit_source, fit_label = overlays["cam1"], cam1_label
+        elif "block2" in overlays and overlays["block2"].get("ok"):
+            fit_source, fit_label = overlays["block2"], block2_label
+        elif "cam2" in overlays and overlays["cam2"].get("ok"):
+            fit_source, fit_label = overlays["cam2"], cam2_label
+        else:
+            raise ValueError("No valid overlay found to fit the theoretical model against.")
+
+        x_deg_fit = np.asarray(fit_source["x_pts"], float)
+        y_fit = np.asarray(fit_source["y_pts_norm"], float)
 
         if make_angles_positive:
-            x_deg = np.abs(x_deg)
-
+            x_deg_fit = np.abs(x_deg_fit)
         if restrict_to_0_90:
-            mm = (x_deg >= 0.0) & (x_deg <= 95.0)
-            x_deg = x_deg[mm]
-            y = y[mm]
+            mfit = (x_deg_fit >= 0.0) & (x_deg_fit <= 90.0) & np.isfinite(y_fit)
+            x_deg_fit = x_deg_fit[mfit];
+            y_fit = y_fit[mfit]
+        if flip_data:
+            y_fit = 1.0 - y_fit
+            for key in overlays:
+                if overlays[key].get("ok"):
+                    overlays[key]["y_pts_norm"] = 1.0 - np.asarray(overlays[key]["y_pts_norm"], float)
+                    overlays[key]["y_curve_norm"] = 1.0 - np.asarray(overlays[key]["y_curve_norm"], float)
 
-        if x_deg.size < 5:
-            raise ValueError("Not enough points (need ≥5) in the 0–90° range to fit.")
+        if x_deg_fit.size < 5:
+            raise ValueError("Not enough points (need ≥5) in 0–90° from the selected fit source to fit theory.")
 
-        theta_data = np.deg2rad(x_deg)
+        theta_data = np.deg2rad(x_deg_fit)
 
-        # Theoretical model (normalized so y=1 at 90°)
         def _norm_theoretical(theta_r, r, L=L):
             alpha = r / L
             num = theta_r * (8.0 - alpha * theta_r) / (2.0 - alpha * theta_r) ** 2
@@ -3999,128 +5635,75 @@ class bender_class:
             den = th_max * (8.0 - alpha * th_max) / (2.0 - alpha * th_max) ** 2
             return num / den
 
-        # Fit r
         popt, pcov = curve_fit(lambda th, r: _norm_theoretical(th, r, L),
-                               theta_data, y, p0=[r0], bounds=bounds, maxfev=20000)
+                               theta_data, y_fit, p0=[r0], bounds=bounds, maxfev=20000)
         r_hat = float(popt[0])
-
-        # Predictions + R²
         y_pred = _norm_theoretical(theta_data, r_hat, L)
-        ss_res = float(np.sum((y - y_pred) ** 2))
-        ss_tot = float(np.sum((y - float(np.mean(y))) ** 2))
+        ss_res = float(np.sum((y_fit - y_pred) ** 2))
+        ss_tot = float(np.sum((y_fit - float(np.mean(y_fit))) ** 2))
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-
         r_se = float(np.sqrt(pcov[0, 0])) if pcov.size else np.nan
         ci95 = (r_hat - 1.96 * r_se, r_hat + 1.96 * r_se) if np.isfinite(r_se) else (np.nan, np.nan)
 
-        # Theory curve on common grid (degrees for plotting)
-        if theta_grid is None:
-            theta_grid = np.linspace(0.0, 90.0, 400)
+        # theory curve grid
+        theta_grid = np.asarray(theta_grid, float)
         theta_grid_rad = np.deg2rad(theta_grid)
         y_theory = _norm_theoretical(theta_grid_rad, r_hat, L)
+        if flip_data:
+            y_theory = 1.0 - y_theory
 
-        # ---------- plotting (explicit legend control) ----------
-        legend_items = []  # (handle, label)
-
+        # ---------------- plotting ----------------
         if plot:
             if ax is None:
-                _, ax = plt.subplots(figsize=(6.8, 4.3))
-
-        overlays = {}
-
-        if plot:
-            # self.data points (hidden from legend)
-            ax.plot(x_deg, y, ".", markersize=3, label="_nolegend_")
-            # theory curve
-            th_label = f"{style_theory.get('label', 'Theory fit')} (r={r_hat:.3f}, R²={r2:.4f})"
-            th_handle = ax.plot(theta_grid, y_theory,
-                                color=style_theory.get("color", "tab:orange"),
-                                linewidth=style_theory.get("linewidth", 2),
-                                linestyle=style_theory.get("linestyle", "-"),
-                                label="_nolegend_")[0]
-            legend_items.append((th_handle, th_label))
-
-            ax.set_xlabel("Angle (deg)")
-            ax.set_ylabel("Normalized ADC (0–1)")
+                _, ax = plt.subplots(figsize=(6.9, 4.4))
             ax.set_xlim(0, 90)
             ax.set_ylim(-0.05, 1.05)
-            ax.set_title(f"Theoretical fit (L={L} in)")
+            ax.set_xlabel("Angle (deg)")
+            ax.set_ylabel("Normalized ADC (0–1)")
+            ax.set_title(f"{theory_label} on {fit_label} (L={L} in)")
 
-        # ---------- block overlay (optional) ----------
-        if show_quadratic and block_df is not None:
-            try:
-                blk_raw, blk_used_idx = _unwrap_df(block_df, block_index, tag="block")
-                blk = _tidy_angle_adc(blk_raw,
-                                      angle_hint=block_angle_col_hint,
-                                      adc_hint=block_adc_col_hint,
-                                      tag=f"block[{blk_used_idx}]")
-                blk_fit = _quadfit_and_norm(blk, theta_grid, tag=f"block[{blk_used_idx}]")
-                overlays["block"] = blk_fit
-                if blk_fit.get("ok") and plot:
-                    # points
-                    bp = ax.scatter(blk_fit["x_pts"], blk_fit["y_pts_norm"],
-                                    s=style_block_points.get("s", 16),
-                                    alpha=style_block_points.get("alpha", 0.7),
-                                    color=style_block_points.get("color", "tab:green"))
-                    # curve
-                    bc, = ax.plot(blk_fit["theta"], blk_fit["y_curve_norm"],
-                                  linestyle=style_block_curve.get("linestyle", "--"),
-                                  linewidth=style_block_curve.get("linewidth", 2),
-                                  color=style_block_curve.get("color", "tab:green"))
-                    # legend (include R²)
-                    legend_items.append((bp, f"{block_label} (points)"))
-                    legend_items.append((bc, f"{block_label} (quad, R²={blk_fit['r2']:.4f})"))
-            except Exception as e:
-                print(f"[fit_knuckle_radius] Block overlay error: {e}")
+            legend_items = []
 
-        # ---------- camera overlay (optional) ----------
-        if show_quadratic and cam_df is not None:
-            try:
-                cam_raw, cam_used_idx = _unwrap_df(cam_df, cam_index, tag="camera")
-                cam = _tidy_angle_adc(cam_raw,
-                                      angle_hint=cam_angle_col_hint,
-                                      adc_hint=cam_adc_col_hint,
-                                      tag=f"camera[{cam_used_idx}]")
-                cam_fit = _quadfit_and_norm(cam, theta_grid, tag=f"camera[{cam_used_idx}]")
-                overlays["cam"] = cam_fit
-                if cam_fit.get("ok") and plot:
-                    # points
-                    cp = ax.scatter(cam_fit["x_pts"], cam_fit["y_pts_norm"],
-                                    s=style_cam_points.get("s", 16),
-                                    alpha=style_cam_points.get("alpha", 0.7),
-                                    color=style_cam_points.get("color", "tab:blue"))
-                    # curve
-                    cc, = ax.plot(cam_fit["theta"], cam_fit["y_curve_norm"],
-                                  linestyle=style_cam_curve.get("linestyle", "-."),
-                                  linewidth=style_cam_curve.get("linewidth", 2),
-                                  color=style_cam_curve.get("color", "tab:blue"))
-                    # legend (include R²)
-                    legend_items.append((cp, f"{cam_label} (points)"))
-                    legend_items.append((cc, f"{cam_label} (quad, R²={cam_fit['r2']:.4f})"))
-            except Exception as e:
-                print(f"[fit_knuckle_radius] Camera overlay error: {e}")
+            # theory
+            th = ax.plot(theta_grid, y_theory,
+                         color=style_theory.get("color", "tab:orange"),
+                         linewidth=style_theory.get("linewidth", 2),
+                         linestyle=style_theory.get("linestyle", "-"),
+                         label="_nolegend_")[0]
+            legend_items.append((th, f"{theory_label} (r={r_hat:.3f}, R²={r2:.4f})"))
 
-        if plot:
-            # build legend explicitly from handles + labels (guaranteed text)
+            # overlays
+            def _plot_one(tag, pts_style, curve_style, label_pts, label_curve):
+                ov = overlays.get(tag, {})
+                if not ov or not ov.get("ok"):
+                    return
+                sc = ax.scatter(ov["x_pts"], ov["y_pts_norm"], **pts_style)
+                ln, = ax.plot(ov["theta"], ov["y_curve_norm"], **curve_style)
+                legend_items.append((sc, f"{label_pts} (points)"))
+                legend_items.append((ln, f"{label_curve} (quad, R²={ov['r2']:.4f})"))
+
+            _plot_one("block1", style_block1_points, style_block1_curve, block1_label, block1_label)
+            _plot_one("block2", style_block2_points, style_block2_curve, block2_label, block2_label)
+            _plot_one("cam1", style_cam1_points, style_cam1_curve, cam1_label, cam1_label)
+            _plot_one("cam2", style_cam2_points, style_cam2_curve, cam2_label, cam2_label)
+
             if legend_items:
                 handles, labels = zip(*legend_items)
                 ax.legend(list(handles), list(labels), loc="best", frameon=True)
-            else:
-                ax.legend(loc="best", frameon=True)
-            ax.grid(alpha=0.2, axis="y")
+            ax.grid(alpha=0.25, axis="y")
             plt.tight_layout()
 
+        # ---------------- return ----------------
         out = {
             "r_hat": r_hat,
             "r_se": r_se,
             "r_ci95": ci95,
             "r2": r2,
             "params_cov": pcov,
+            "overlays": overlays,
         }
         if return_curve:
             out.update({"theta": theta_grid, "y_model": y_theory})
-        if overlays:
-            out["overlays"] = overlays
         return out
 
     def append_theta_from_normalized(self,
@@ -4675,46 +6258,43 @@ class bender_class:
 
         return min_angle_100, all_min_angle_100
 
-
     def plot_bar_chart(self, data, labels, title, ylabel, colors, ylim=None):
         """
         Plots grouped bars with different colors for each group.
-
-        Parameters:
-        - data: List of lists, where each sublist represents values for a group.
-        - labels: List of group names.
-        - title: Chart title.
-        - ylabel: Y-axis label.
-        - colors: List of colors for each group.
-        - ylim: Tuple (ymin, ymax) for y-axis limit.
         """
-        num_groups = len(data)  # Number of groups (e.g., 3)
-        max_bars = max(len(group) for group in data)  # Find the maximum datasets in any group
-        bar_width = 0.2  # Controls spacing between bars in a group
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
 
-        x_positions = np.arange(num_groups)  # X positions for the groups
+        num_groups = len(data)
+        max_bars = max(len(group) for group in data)
+        bar_width = 0.2
+
+        x_positions = np.arange(num_groups)
 
         plt.figure(figsize=(8, 6))
 
         for i, (group_values, color) in enumerate(zip(data, colors)):
             num_bars = len(group_values)
-            x_offsets = np.linspace(-bar_width * (num_bars - 1) / 2, bar_width * (num_bars - 1) / 2, num_bars)
+            x_offsets = np.linspace(-bar_width * (num_bars - 1) / 2,
+                                    bar_width * (num_bars - 1) / 2, num_bars)
 
-            # Plot bars for this group, slightly offset from center position
             for j, (val, offset) in enumerate(zip(group_values, x_offsets)):
-                print(type(val))
-                if type(val) is float: 
-                    plt.bar(x_positions[i] + offset, val, width=bar_width, color=color,
-                        label=f"Sample {j + 1}" if i == 0 else "")
-                elif type(val) is list:
-                    plt.bar(x_positions[i] + offset, np.mean(np.array(val)), width=bar_width, color=color,
-                        label=f"Sample {j + 1}" if i == 0 else "", yerr=np.std(np.array(val)), capsize=5, error_kw={'elinewidth': 1.5})
-                    
-        # Set x-ticks to group labels
+                if isinstance(val, float):
+                    plt.bar(x_positions[i] + offset, val, width=bar_width,
+                            color=color, label=f"Sample {j + 1}" if i == 0 else "")
+                elif isinstance(val, list):
+                    vals = np.array(val)
+                    plt.bar(x_positions[i] + offset, np.mean(vals),
+                            width=bar_width, color=color,
+                            label=f"Sample {j + 1}" if i == 0 else "",
+                            yerr=np.std(vals), capsize=5,
+                            error_kw={'elinewidth': 1.5})
+
+        # X labels/titles
         plt.xticks(x_positions, labels)
         plt.ylabel(ylabel)
         plt.title(title)
-
 
         if ylim:
             plt.ylim(ylim)
@@ -4724,8 +6304,14 @@ class bender_class:
         ax.spines['right'].set_visible(False)
         ax.tick_params(axis='both', which='major', labelsize=20)
 
-        plt.savefig("min_angle_bar_chart.png", dpi=300, bbox_inches='tight')
+        # ---- Force y-ticks every 1 unit (robust) ----
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(1.0))
+        # Optional: nicer integer formatting (no decimals)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%d'))
+        # Optional: minor ticks between majors
+        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
 
+        plt.savefig("min_angle_bar_chart.svg", dpi=300, bbox_inches='tight')
         plt.show()
 
     def plot_double_bar_chart(self, list1, list2, labels,
