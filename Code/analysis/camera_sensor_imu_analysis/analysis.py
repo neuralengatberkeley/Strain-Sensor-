@@ -1905,6 +1905,176 @@ class BallBearingData:
             print("[abs-err boxplots] done.")
         return {"fig": fig, "axes": axes, "stats": stats}
 
+    def remap_aligned_by_trial_concat(self, aligned_list: list[pd.DataFrame]) -> list[pd.DataFrame]:
+        """
+        Return a 0-based dense list where index (t-1) holds a CONCATENATION
+        of *all* aligned dfs whose stamped 'trial' == t.
+        Preserves both calib streams (e.g., blk1 and cam1) for the same trial.
+        """
+        import pandas as pd
+        from collections import defaultdict
+
+        if aligned_list is None or len(aligned_list) == 0:
+            return []
+
+        buckets = defaultdict(list)
+        max_t = 0
+
+        for df in aligned_list:
+            if df is None or df.empty or "trial" not in df.columns:
+                continue
+            tt = pd.to_numeric(df["trial"], errors="coerce").dropna().astype(int)
+            if tt.empty:
+                continue
+            t = int(tt.mode().iat[0])
+            max_t = max(max_t, t)
+            buckets[t].append(df)
+
+        if max_t == 0:
+            return []
+
+        out = [pd.DataFrame()] * max_t  # slots 0..(max_t-1)
+        for t in range(1, max_t + 1):
+            parts = buckets.get(t, [])
+            if parts:
+                cat = pd.concat(parts, ignore_index=True, sort=False)
+                # nice-to-haves: sort by any available relative-time columns
+                sort_cols = [c for c in ("cam_time_s", "enc_time_s", "time_s", "t_sec") if c in cat.columns]
+                if sort_cols:
+                    cat = cat.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+                out[t - 1] = cat
+            else:
+                out[t - 1] = pd.DataFrame()
+
+        print(
+            f"[remap+concat] trials present: {sorted(buckets.keys())} | missing: {[t for t in range(1, max_t + 1) if t not in buckets]}")
+        return out
+
+    import pandas as pd
+    import numpy as np
+
+    @staticmethod
+    def _collect_aligned_rows(
+            aligned_list: list,
+            *,
+            set_tag: str,
+            dlc_angle_col: str = "metric_mcp_bend_deg_deg_dlc",
+            adc_theta_col: str = "theta_pred_deg",
+            calib_col: str = "calib",
+            max_abs_dt_ms: float | None = None,
+    ):
+        """Flatten one aligned list into a single DataFrame with abs_err + filters applied."""
+        rows = []
+        for i, df in enumerate(aligned_list or []):
+            if df is None or len(getattr(df, "columns", [])) == 0:
+                continue
+
+            if calib_col not in df.columns:
+                raise KeyError(f"Missing '{calib_col}' in aligned df[{i}]")
+
+            # Filter by |Δt| if provided and present
+            mask_dt = pd.Series(True, index=df.index)
+            if (max_abs_dt_ms is not None) and ("_delta_ms" in df.columns):
+                mask_dt = pd.to_numeric(df["_delta_ms"], errors="coerce").abs() <= float(max_abs_dt_ms)
+
+            s_dlc = pd.to_numeric(df.get(dlc_angle_col), errors="coerce")
+            s_adc = pd.to_numeric(df.get(adc_theta_col), errors="coerce")
+            s_cal = df[calib_col].astype(str)
+            s_trial = pd.to_numeric(df.get("trial"), errors="coerce").astype("Int64")
+
+            ok = mask_dt & s_dlc.notna() & s_adc.notna() & s_cal.notna() & s_trial.notna()
+            if not ok.any():
+                continue
+
+            sub = pd.DataFrame({
+                "set": set_tag,
+                "trial": s_trial[ok].astype(int).to_numpy(),
+                "trial_index": i,  # index within the list (0-based)
+                "calib": s_cal[ok].to_numpy(),
+                "theta_adc_deg": s_adc[ok].to_numpy(),
+                "theta_dlc_deg": s_dlc[ok].to_numpy(),
+            })
+            sub["abs_err_deg"] = (sub["theta_adc_deg"] - sub["theta_dlc_deg"]).astype(float).abs()
+
+            # (Optional) carry a reasonable x-axis if present (helps you revisit the spot)
+            for col in ("cam_time_s", "enc_time_s", "time_s", "t_sec"):
+                if col in df.columns:
+                    sub[col] = pd.to_numeric(df.loc[ok, col], errors="coerce").to_numpy()
+                    break
+
+            rows.append(sub)
+
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(
+            columns=["set", "trial", "trial_index", "calib", "theta_adc_deg", "theta_dlc_deg", "abs_err_deg"]
+        )
+
+    @staticmethod
+    def find_max_abs_errors_across_sets(
+            *,
+            aligned_first: list,
+            aligned_second: list,
+            dlc_angle_col: str = "metric_mcp_bend_deg_deg_dlc",
+            adc_theta_col: str = "theta_pred_deg",
+            calib_col: str = "calib",
+            max_abs_dt_ms: float | None = None,
+            top_k: int = 10,
+    ):
+        """
+        Returns:
+          {
+            "per_trial_calib_max": DataFrame  # one worst row per (set, trial, calib)
+            "top_overall": DataFrame          # top-K worst rows overall across both sets
+          }
+        """
+        import pandas as pd
+
+        df1 = BallBearingData._collect_aligned_rows(
+            aligned_first, set_tag="set1",
+            dlc_angle_col=dlc_angle_col, adc_theta_col=adc_theta_col,
+            calib_col=calib_col, max_abs_dt_ms=max_abs_dt_ms
+        )
+        df2 = BallBearingData._collect_aligned_rows(
+            aligned_second, set_tag="set2",
+            dlc_angle_col=dlc_angle_col, adc_theta_col=adc_theta_col,
+            calib_col=calib_col, max_abs_dt_ms=max_abs_dt_ms
+        )
+
+        if df1.empty and df2.empty:
+            empty = BallBearingData._collect_aligned_rows([], set_tag="set1")
+            return {"per_trial_calib_max": empty, "top_overall": empty}
+
+        all_rows = pd.concat([df1, df2], ignore_index=True)
+
+        # ---- robust 1-D idxmax over groups ----
+        # (avoid multidimensional key errors in different pandas versions)
+        idx = (
+            all_rows
+            .groupby(["set", "trial", "calib"], sort=False)["abs_err_deg"]
+            .idxmax()
+        )
+
+        # ensure we pass a 1-D indexer to .loc
+        idx = getattr(idx, "to_numpy", lambda: idx)()
+
+        per_trial_calib_max = (
+            all_rows
+            .loc[idx]
+            .sort_values(["set", "trial", "calib"])
+            .reset_index(drop=True)
+        )
+
+        top_overall = (
+            all_rows
+            .sort_values("abs_err_deg", ascending=False)
+            .head(int(top_k))
+            .reset_index(drop=True)
+        )
+
+        return {
+            "per_trial_calib_max": per_trial_calib_max,
+            "top_overall": top_overall
+        }
+
     def extract_calib_means_by_set(
             self,
             *,
