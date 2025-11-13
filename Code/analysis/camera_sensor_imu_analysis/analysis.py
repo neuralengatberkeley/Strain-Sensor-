@@ -2089,6 +2089,8 @@ class BallBearingData:
             point_size: float = 10,
             jitter: float = 0.25,
             ax=None,
+            # NEW: snap near-miss folder angles (e.g., calib86/87) to nearest expected angle
+            snap_tol_deg: float = 4.0,
     ) -> pd.DataFrame:
         """
         Find folders whose names contain 'calib' immediately followed by an angle number.
@@ -2139,15 +2141,27 @@ class BallBearingData:
             return whole, frac
 
         def _angle_from_tokens(whole: int, frac: int | None) -> float | None:
+            # CHANGED: compute raw value first
             if frac is not None:
                 scale = 10.0 if frac < 10 else (100.0 if frac < 100 else 1.0)
                 val = float(whole) + (float(frac) / scale)
-                return val if val in angles_set else None
+            else:
+                if float(whole) in angles_set:
+                    val = float(whole)
+                elif (float(whole) + 0.5) in angles_set and (float(whole) not in angles_set):
+                    val = float(whole) + 0.5
+                else:
+                    val = float(whole)
 
-            if float(whole) in angles_set:
-                return float(whole)
-            if (float(whole) + 0.5) in angles_set and (float(whole) not in angles_set):
-                return float(whole) + 0.5
+            # exact match is fine
+            if val in angles_set:
+                return val
+
+            # NEW: snap near-misses to nearest expected angle within tolerance
+            nearest = min(angles_set, key=lambda a: abs(a - val))
+            if abs(nearest - val) <= snap_tol_deg:
+                return nearest
+
             return None
 
         # -------- collect candidate folders --------
@@ -2174,7 +2188,8 @@ class BallBearingData:
 
         for folder in cands:
             tok = _parse_after_calib_token(folder.name)
-            if tok is None:
+            # NEW: be robust to (None, None)
+            if tok is None or tok == (None, None):
                 continue
             whole, frac = tok
             ang = _angle_from_tokens(whole, frac)
@@ -2239,6 +2254,7 @@ class BallBearingData:
         df_pts = _pd.DataFrame(rows_points).sort_values(["folder", "angle_deg"]).reset_index(drop=True)
 
         # Assign set indices/labels by blocks of k in sorted order
+        # (This is what makes cam1/cam2 work when you pass a single DataFrame.)
         k = len(angles_expected)
         set_idx = [(i // k) + 1 for i in range(len(df))]  # 1-based
         df["set_idx"] = set_idx
@@ -2320,6 +2336,8 @@ class BallBearingData:
                 ax.legend(title="Set")
 
         return df
+
+
 
     @staticmethod
     def _polyfit_quadratic(x: np.ndarray, y: np.ndarray, robust: bool) -> Tuple[float, float, float]:
