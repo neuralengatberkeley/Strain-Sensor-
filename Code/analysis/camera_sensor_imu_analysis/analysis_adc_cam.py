@@ -1514,20 +1514,26 @@ class ADC_CAM:
         return df_out, best_lag, best_rmse
 
     def refine_alignment_by_rmse_for_set(
-        self,
-        merged_trials: List[pd.DataFrame],
-        *,
-        dlc_col=("metric", "mcp_bend_deg", "deg"),
-        adc_col: str = "theta_cam_cal_adc",
-        max_lag_samples: int = 5,
-        time_col=("_t_cam_td", "", ""),   # or ("cam_timestamp", "", "")
-        plot_indices: Optional[Sequence[int]] = None,
-        set_name: str = "set",
+            self,
+            merged_trials: List[pd.DataFrame],
+            *,
+            dlc_col=("metric", "mcp_bend_deg", "deg"),
+            adc_col: str = "theta_cam_cal_adc",
+            max_lag_samples: int = 5,
+            time_col=("_t_cam_td", "", ""),  # or ("cam_timestamp", "", "")
+            plot_indices: Optional[Sequence[int]] = None,
+            set_name: str = "set",
     ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
         """
         Refine ADC vs DLC alignment for an entire set of merged trials by
         searching over small integer lags (in samples) to minimize RMSE.
         Optionally plots selected trials.
+
+        Plot behavior:
+          - Time axis is always rescaled to 0–10 s (data unchanged).
+          - A black vertical dashed line is drawn at the sample with the
+            largest absolute difference between the two curves, connecting
+            the DLC and ADC values at that time.
 
         Parameters
         ----------
@@ -1599,38 +1605,69 @@ class ADC_CAM:
                 if df_pl is None or df_pl.empty:
                     continue
 
-                # time axis
+                # ----- Build time axis in seconds -----
                 if time_col in df_pl.columns:
                     t_raw = df_pl[time_col]
                     if hasattr(t_raw, "dt"):
-                        t = (
-                            t_raw - t_raw.iloc[0]
-                        ).dt.total_seconds()
+                        t = (t_raw - t_raw.iloc[0]).dt.total_seconds().to_numpy()
                     else:
                         t = t_raw.to_numpy(dtype=float)
                         t = t - t[0]
                 elif ("_t_cam_td", "", "") in df_pl.columns:
                     t_raw = df_pl[("_t_cam_td", "", "")]
-                    t = (
-                        t_raw - t_raw.iloc[0]
-                    ).dt.total_seconds()
+                    t = (t_raw - t_raw.iloc[0]).dt.total_seconds().to_numpy()
                 elif ("cam_timestamp", "", "") in df_pl.columns:
                     t = df_pl[("cam_timestamp", "", "")].to_numpy(dtype=float)
                     t = t - t[0]
                 else:
                     t = np.arange(len(df_pl), dtype=float)
 
+                # ----- Rescale time axis to 0–10 s for plotting -----
+                if len(t) > 1 and np.nanmax(t) > np.nanmin(t):
+                    t_plot = (t - np.nanmin(t)) / (np.nanmax(t) - np.nanmin(t)) * 10.0
+                else:
+                    t_plot = np.zeros_like(t, dtype=float)
+
                 theta_dlc = df_pl[dlc_col]
                 theta_adc_rmse = df_pl[adc_col + "_rmse"]
 
+                # Compute absolute error to find worst point
+                dlc_arr = theta_dlc.to_numpy(dtype=float)
+                adc_arr = theta_adc_rmse.to_numpy(dtype=float)
+                both_valid = np.isfinite(dlc_arr) & np.isfinite(adc_arr)
+
+                idx_max = None
+                if both_valid.sum() > 0:
+                    abs_diff = np.full_like(dlc_arr, np.nan, dtype=float)
+                    abs_diff[both_valid] = np.abs(dlc_arr[both_valid] - adc_arr[both_valid])
+                    idx_max = int(np.nanargmax(abs_diff))
+
+                # ----- Plot -----
                 plt.figure(figsize=(10, 4))
-                plt.plot(t, theta_dlc, label="DLC MCP angle")
-                plt.plot(t, theta_adc_rmse, label="ADC MCP angle (RMSE-aligned)")
-                plt.xlabel("Time (s)")
+                plt.plot(t_plot, theta_dlc, label="DLC MCP angle")
+                plt.plot(t_plot, theta_adc_rmse, label="ADC MCP angle (RMSE-aligned)")
+
+                # Vertical line at max absolute difference
+                if idx_max is not None and np.isfinite(dlc_arr[idx_max]) and np.isfinite(adc_arr[idx_max]):
+                    x0 = t_plot[idx_max]
+                    y1 = dlc_arr[idx_max]
+                    y2 = adc_arr[idx_max]
+                    plt.vlines(
+                        x0,
+                        ymin=min(y1, y2),
+                        ymax=max(y1, y2),
+                        colors="k",
+                        linestyles="--",
+                        linewidth=2,
+                        label="max |Δ|",
+                    )
+
+                plt.xlabel("Scaled time (0–10 s)")
                 plt.ylabel("Angle (deg)")
                 plt.title(
-                    f"{set_name} trial {idx+1}: DLC vs ADC MCP (RMSE-optimal shift)"
+                    f"{set_name} trial {idx + 1}: DLC vs ADC MCP (RMSE-optimal shift)"
                 )
+                plt.xlim(0.0, 10.0)
                 plt.legend()
                 plt.grid(True)
                 plt.tight_layout()
@@ -1782,6 +1819,93 @@ class ADC_CAM:
         plt.grid(axis="y", alpha=0.4)
         plt.tight_layout()
         plt.show()
+
+    def collect_abs_error_for_set(
+            self,
+            refined_trials: List[pd.DataFrame],
+            summary: pd.DataFrame,
+            *,
+            dlc_col=("metric", "mcp_bend_deg", "deg"),
+            adc_rmse_col: str = "theta_cam_cal_adc_rmse",
+            trial_indices: Optional[Sequence[int]] = None,
+            n_best: int = 2,
+    ) -> np.ndarray:
+        """
+        Collect a single concatenated array of |DLC - ADC| errors for one set
+        (FIRST or SECOND), given refined trials + summary.
+
+        You will typically provide trial_indices explicitly, e.g. [0, 1].
+        If trial_indices is None, it falls back to the n_best trials with
+        smallest RMSE.
+
+        Parameters
+        ----------
+        refined_trials : list[pd.DataFrame]
+            Output from refine_alignment_by_rmse_for_set (e.g. refined_first).
+        summary : pd.DataFrame
+            Summary from refine_alignment_by_rmse_for_set, must contain
+            ['trial_index', 'rmse_deg', 'n_points'].
+        dlc_col : column label
+            DLC angle column (MultiIndex or flat).
+        adc_rmse_col : str, default 'theta_cam_cal_adc_rmse'
+            Column name containing RMSE-aligned ADC angle.
+        trial_indices : sequence[int] or None
+            If provided, use exactly these trial indices.
+        n_best : int, default 2
+            If trial_indices is None, choose the n_best trials with
+            smallest RMSE.
+
+        Returns
+        -------
+        abs_err_all : np.ndarray
+            Concatenated absolute errors |DLC - ADC| in degrees.
+            Empty array if nothing valid.
+        """
+        if summary is None or summary.empty:
+            return np.array([])
+
+        valid = summary.dropna(subset=["rmse_deg"])
+        valid = valid[valid["n_points"] > 0]
+        if valid.empty:
+            return np.array([])
+
+        # Decide which trials
+        if trial_indices is not None:
+            idxs = [int(i) for i in trial_indices]
+            chosen = valid[valid["trial_index"].isin(idxs)]
+            if chosen.empty:
+                return np.array([])
+        else:
+            chosen = valid.sort_values("rmse_deg", ascending=True).head(n_best)
+
+        all_errs = []
+
+        for _, row in chosen.iterrows():
+            idx = int(row["trial_index"])
+            if idx < 0 or idx >= len(refined_trials):
+                continue
+
+            df_trial = refined_trials[idx]
+            if df_trial is None or df_trial.empty:
+                continue
+
+            if adc_rmse_col not in df_trial.columns:
+                continue
+
+            theta_dlc = df_trial[dlc_col].to_numpy(dtype=float)
+            theta_adc = df_trial[adc_rmse_col].to_numpy(dtype=float)
+
+            mask = np.isfinite(theta_dlc) & np.isfinite(theta_adc)
+            if mask.sum() < 5:
+                continue
+
+            abs_err = np.abs(theta_dlc[mask] - theta_adc[mask])
+            all_errs.append(abs_err)
+
+        if not all_errs:
+            return np.array([])
+
+        return np.concatenate(all_errs)
 
 
 
