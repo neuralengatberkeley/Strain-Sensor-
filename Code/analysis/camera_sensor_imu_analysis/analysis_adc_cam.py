@@ -1907,6 +1907,189 @@ class ADC_CAM:
 
         return np.concatenate(all_errs)
 
+    def reapply_first_calibration_to_second(
+            self,
+            calib_df: pd.DataFrame,
+            adc_trials_second: List[pd.DataFrame],
+            *,
+            adc_column: str = "adc_ch3",
+            poly_order: int = 2,
+            deg_min: float = 0.0,
+            deg_max: float = 90.0,
+            new_col: str = "theta_cam_cal_xtrained",
+            clamp_theta: bool = True,
+    ) -> dict:
+        """
+        Build a *cross-trained* calibration for the second application (set=2),
+        using the SHAPE of the first application's calibration curve, but
+        re-scaled to the endpoint ADC range of the second calibration data.
+
+        Physical intent
+        ----------------
+        For both applications we want:
+            ADC(0 deg)  = max ADC
+            ADC(90 deg) = min ADC
+
+        Here we:
+          1) Fit an inverse polynomial q1(theta) ~ ADC_1(theta) from set=1.
+          2) Evaluate that on [deg_min, deg_max] to get adc1_grid(theta).
+          3) Normalize adc1_grid using the *endpoint ADCs* at 0° and 90°,
+             so orientation is preserved.
+          4) Rescale this normalized curve to match the 0° and 90° ADC
+             endpoints of set=2, giving adc2_cross_grid(theta).
+          5) Fit p_cross(adc) ~ theta on (adc2_cross_grid, theta_grid).
+          6) Apply p_cross to ALL second-application trials, writing into
+             `new_col` (default 'theta_cam_cal_xtrained').
+
+        Parameters
+        ----------
+        calib_df : pd.DataFrame
+            Output of self.calibrate_trials_with_camera()['calib_df'].
+            Must contain columns 'set', 'angle_snap_deg', 'adc_mean'.
+        adc_trials_second : list[pd.DataFrame]
+            Raw ADC DataFrames for second application (B2_*).
+        adc_column : str, default 'adc_ch3'
+            ADC column name in the trials.
+        poly_order : int, default 2
+            Polynomial order for the inverse and cross fits.
+        deg_min, deg_max : float
+            Angle range (deg) to span when constructing the grid.
+        new_col : str, default 'theta_cam_cal_xtrained'
+            Name of the angle column to add to each second-application trial.
+        clamp_theta : bool, default True
+            If True, clamp angles to [deg_min, deg_max].
+
+        Returns
+        -------
+        result : dict
+            {
+              "coeffs_cross_2_from_1": np.ndarray or None,
+              "adc_trials_second_theta_cross": list[pd.DataFrame],
+            }
+        """
+        import numpy as np
+        import pandas as pd
+
+        if calib_df is None or calib_df.empty:
+            second_out = [df.copy() for df in adc_trials_second]
+            return {
+                "coeffs_cross_2_from_1": None,
+                "adc_trials_second_theta_cross": second_out,
+            }
+
+        # --- Split calib_df into set 1 and set 2 ---
+        sub1 = calib_df[
+            (calib_df["set"] == 1) & calib_df["angle_snap_deg"].notna()
+            ].copy()
+        sub2 = calib_df[
+            (calib_df["set"] == 2) & calib_df["angle_snap_deg"].notna()
+            ].copy()
+
+        if sub1.empty or sub2.empty:
+            second_out = [df.copy() for df in adc_trials_second]
+            return {
+                "coeffs_cross_2_from_1": None,
+                "adc_trials_second_theta_cross": second_out,
+            }
+
+        if len(sub1) < poly_order + 1:
+            second_out = [df.copy() for df in adc_trials_second]
+            return {
+                "coeffs_cross_2_from_1": None,
+                "adc_trials_second_theta_cross": second_out,
+            }
+
+        # --- 1) Fit inverse polynomial for set 1: angle -> ADC_1 ---
+        theta1 = sub1["angle_snap_deg"].to_numpy(dtype=float)
+        adc1 = sub1["adc_mean"].to_numpy(dtype=float)
+
+        coeffs_inv_1 = np.polyfit(theta1, adc1, poly_order)  # q1(theta) -> ADC
+
+        # --- 2) Build angle grid and ADC_1 curve ---
+        theta_grid = np.linspace(deg_min, deg_max, 181)  # e.g., 0..90 in 0.5° steps
+        adc1_grid = np.polyval(coeffs_inv_1, theta_grid)
+
+        # ---------- NORMALIZATION / RESCALING PATCH START ----------
+        # We normalize using endpoint ADCs at 0° and 90°
+        def _angle_specific_adc(sub, angle_target):
+            sub_a = sub[np.isclose(sub["angle_snap_deg"], angle_target)]
+            if not sub_a.empty:
+                return float(sub_a["adc_mean"].mean())
+            return None
+
+        # Endpoint ADCs for set 1
+        adc1_0 = _angle_specific_adc(sub1, deg_min)  # ~ ADC(0°)
+        adc1_90 = _angle_specific_adc(sub1, deg_max)  # ~ ADC(90°)
+
+        # Fallbacks if exact endpoints are missing
+        if adc1_0 is None:
+            # For your sensor, 0° ≈ max ADC
+            adc1_0 = float(sub1["adc_mean"].max())
+        if adc1_90 is None:
+            # For your sensor, 90° ≈ min ADC
+            adc1_90 = float(sub1["adc_mean"].min())
+
+        if adc1_90 == adc1_0:
+            second_out = [df.copy() for df in adc_trials_second]
+            return {
+                "coeffs_cross_2_from_1": None,
+                "adc_trials_second_theta_cross": second_out,
+            }
+
+        # Normalize so that:
+        #   z(theta = 0°)  = 0
+        #   z(theta = 90°) = 1
+        z_grid = (adc1_grid - adc1_0) / (adc1_90 - adc1_0)
+
+        # Endpoint ADCs for set 2 (target range)
+        adc2_0 = _angle_specific_adc(sub2, deg_min)  # ADC_2(0°)
+        adc2_90 = _angle_specific_adc(sub2, deg_max)  # ADC_2(90°)
+
+        if adc2_0 is None:
+            adc2_0 = float(sub2["adc_mean"].max())
+        if adc2_90 is None:
+            adc2_90 = float(sub2["adc_mean"].min())
+
+        if adc2_90 == adc2_0:
+            second_out = [df.copy() for df in adc_trials_second]
+            return {
+                "coeffs_cross_2_from_1": None,
+                "adc_trials_second_theta_cross": second_out,
+            }
+
+        # Rescale normalized shape to set 2 endpoints:
+        #   z=0 -> adc2_0  (0°)
+        #   z=1 -> adc2_90 (90°)
+        adc2_cross_grid = adc2_0 + z_grid * (adc2_90 - adc2_0)
+        # ---------- NORMALIZATION / RESCALING PATCH END ----------
+
+        # --- 3) Fit forward polynomial p_cross(adc) ≈ theta using cross grid ---
+        coeffs_cross = np.polyfit(adc2_cross_grid, theta_grid, poly_order)
+
+        # --- 4) Apply p_cross to ALL second-application ADC trials ---
+        second_out: List[pd.DataFrame] = []
+        for df in adc_trials_second:
+            if df is None or df.empty or adc_column not in df.columns:
+                second_out.append(df.copy())
+                continue
+
+            df2 = df.copy()
+            adc_vals = pd.to_numeric(df2[adc_column], errors="coerce").to_numpy()
+            theta_est = np.polyval(coeffs_cross, adc_vals)
+
+            if clamp_theta:
+                theta_est = np.clip(theta_est, deg_min, deg_max)
+
+            df2[new_col] = theta_est
+            second_out.append(df2)
+
+        return {
+            "coeffs_cross_2_from_1": coeffs_cross,
+            "adc_trials_second_theta_cross": second_out,
+        }
+
+
+
 
 
 
