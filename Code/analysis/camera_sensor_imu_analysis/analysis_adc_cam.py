@@ -244,18 +244,19 @@ class ADC_CAM:
         return dfs
 
     def extract_calib_means_by_set(
-        self,
-        adc_column: Optional[str] = None,
-        *,
-        exclude_name_contains: tuple = (),
-        exclude_sets: tuple = (),
-        make_plot: bool = True,
-        overlay_mean: bool = False,
-        point_alpha: float = 0.25,
-        point_size: float = 10.0,
-        jitter: float = 0.25,
-        snap_tol_deg: float = 4.0,
-        plot_all_data: bool = False,
+            self,
+            adc_column: Optional[str] = None,
+            *,
+            exclude_name_contains: tuple = (),
+            exclude_sets: tuple = (),
+            make_plot: bool = True,
+            overlay_mean: bool = False,
+            point_alpha: float = 0.25,
+            point_size: float = 10.0,
+            jitter: float = 0.25,
+            snap_tol_deg: float = 4.0,
+            plot_all_data: bool = False,
+            canonical_angles: Optional[Sequence[float]] = None,
     ) -> pd.DataFrame:
         """
         Scan root_dir for calibration folders (siblings of B1/B2), read ADC
@@ -263,8 +264,11 @@ class ADC_CAM:
         to sets (1st, 2nd, 3rd, ...) per angle, and optionally plot ADC vs
         angle.
 
-        NEW: if plot_all_data=True, the plot shows ALL ADC samples for each
-        calib folder (scatter cloud) rather than just one point per folder.
+        NEW:
+          * If plot_all_data=True, the plot shows ALL ADC samples for each
+            calib folder (scatter cloud) rather than just one point per folder.
+          * canonical_angles can be specified (e.g., (0, 22, 45, 67) to
+            exclude 90° from snapping).
 
         Example calib folder name:
             2025_11_02_14_06_51_B_calib0
@@ -283,7 +287,7 @@ class ADC_CAM:
         Angle handling
         --------------
         * Extract angle from 'calibXX' in the folder name (XX in degrees).
-        * Snap to nearest canonical angle in [0, 22, 45, 67, 90]
+        * Snap to nearest canonical angle in canonical_angles
           if |raw - canonical| <= snap_tol_deg.
 
         Set assignment (per angle)
@@ -326,6 +330,9 @@ class ADC_CAM:
         plot_all_data : bool, default False
             If True, plot ALL ADC samples (one point per row in each CSV)
             instead of just the per-folder mean.
+        canonical_angles : sequence of float or None, default None
+            Canonical angles (deg) to snap to. If None, defaults to
+            (0, 22, 45, 67, 90).
 
         Returns
         -------
@@ -339,7 +346,10 @@ class ADC_CAM:
               'adc_mean'       (mean ADC for that calib)
               'source_path'
         """
-        canonical_angles = np.array([0, 22, 45, 67, 90], dtype=float)
+        # Default canonical angles if not provided
+        if canonical_angles is None:
+            canonical_angles = (0, 22, 45, 67, 90)
+        canonical_angles_arr = np.array(canonical_angles, dtype=float)
 
         def _extract_angle_from_name(name: str) -> Optional[float]:
             m = re.search(r"calib[_-]?(\d+)", name.lower())
@@ -348,10 +358,10 @@ class ADC_CAM:
             return float(m.group(1))
 
         def _snap_angle(angle: float) -> Optional[float]:
-            diffs = np.abs(canonical_angles - angle)
+            diffs = np.abs(canonical_angles_arr - angle)
             idx = int(np.argmin(diffs))
             if diffs[idx] <= snap_tol_deg:
-                return float(canonical_angles[idx])
+                return float(canonical_angles_arr[idx])
             return None
 
         def _adc_values_from_csv(csv_path: Path) -> tuple[Optional[str], Optional[np.ndarray]]:
@@ -408,7 +418,7 @@ class ADC_CAM:
         for angle_snap, items in by_angle.items():
             items_sorted = sorted(items, key=lambda t: t[1])
             for set_idx, (folder_path, folder_name, angle_raw) in enumerate(
-                items_sorted, start=1
+                    items_sorted, start=1
             ):
                 if set_idx in exclude_sets:
                     continue
@@ -528,13 +538,15 @@ class ADC_CAM:
             ax.set_xlabel("Calibration Angle (deg, snapped)")
             ax.set_ylabel("ADC value" if plot_all_data else "Mean ADC value")
             ax.set_title("ADC Calibration by Set")
+
             present = sorted(
                 a
-                for a in canonical_angles
+                for a in canonical_angles_arr
                 if a in calib_df["angle_snap_deg"].unique()
             )
             if present:
                 ax.set_xticks(present)
+
             ax.grid(True, alpha=0.3)
             ax.legend()
             plt.tight_layout()
@@ -2087,6 +2099,114 @@ class ADC_CAM:
             "coeffs_cross_2_from_1": coeffs_cross,
             "adc_trials_second_theta_cross": second_out,
         }
+
+    def filter_angle_trials_by_likelihood(
+            self,
+            angle_trials: Sequence[pd.DataFrame],
+            *,
+            bodyparts: Sequence[str] = ("MCP", "PIP", "hand"),
+            min_likelihood: float = 0.95,
+            inplace: bool = False,
+    ) -> List[pd.DataFrame]:
+        """
+        Filter each DLC-angle trial DataFrame by DeepLabCut likelihood.
+
+        Any row in which *any* of the specified bodyparts has likelihood
+        < min_likelihood is dropped.
+
+        Works for:
+        - MultiIndex columns (scorer, bodypart, coord) with coord = 'likelihood'
+        - Flat columns like 'MCP_likelihood'
+
+        Parameters
+        ----------
+        angle_trials : sequence of DataFrame
+            Typically the output of compute_dlc3d_angles_by_trial(...)
+            or attach_cam_timestamps_to_angles(...).
+        bodyparts : sequence of str, default ("MCP", "PIP", "hand")
+            Bodyparts whose likelihood columns must exceed the threshold.
+            Matching is case-insensitive.
+        min_likelihood : float, default 0.95
+            Threshold that likelihood values must meet or exceed.
+        inplace : bool, default False
+            If True, returns filtered views of the original DataFrames.
+            If False, returns copies.
+
+        Returns
+        -------
+        out : list[DataFrame]
+            One filtered DataFrame per input trial.
+        """
+        out: List[pd.DataFrame] = []
+
+        # Normalize bodypart names for case-insensitive matching
+        bp_norm = {bp.lower() for bp in bodyparts}
+
+        for df in angle_trials:
+            if df is None or df.empty:
+                out.append(df)
+                continue
+
+            keep_mask = pd.Series(True, index=df.index)
+            cols = df.columns
+
+            # ---------- Case 1: MultiIndex DLC columns ----------
+            if isinstance(cols, pd.MultiIndex):
+                # levels: (scorer, bodypart, coord)
+                level1 = cols.get_level_values(1).to_numpy().astype(str)
+                level2 = cols.get_level_values(2).to_numpy().astype(str)
+
+                for bp in bp_norm:
+                    is_bp = np.char.lower(level1) == bp
+                    is_lik = np.char.lower(level2) == "likelihood"
+                    bp_lik_cols = cols[is_bp & is_lik]
+
+                    if len(bp_lik_cols) == 0:
+                        # This bodypart isn't present; skip
+                        continue
+
+                    # Coerce to numeric in case they're stored as strings
+                    lik_vals = df[bp_lik_cols].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+
+                    lik_ok = (lik_vals >= min_likelihood).all(axis=1)
+                    # treat NaNs as failures (drop those rows)
+                    lik_ok = lik_ok & lik_vals.notna().all(axis=1)
+
+                    keep_mask &= lik_ok
+
+            # ---------- Case 2: flat columns like "MCP_likelihood" ----------
+            else:
+                flat_cols = [str(c) for c in cols]
+                flat_lower = [c.lower() for c in flat_cols]
+
+                for bp in bp_norm:
+                    candidate = None
+                    target = f"{bp}_likelihood"
+                    for name, low in zip(flat_cols, flat_lower):
+                        if low == target:
+                            candidate = name
+                            break
+
+                    if candidate is None:
+                        continue
+
+                    lik_vals = pd.to_numeric(df[candidate], errors="coerce")
+                    lik_ok = lik_vals >= min_likelihood
+                    lik_ok = lik_ok & lik_vals.notna()
+
+                    keep_mask &= lik_ok
+
+            # Apply mask
+            if inplace:
+                out.append(df.loc[keep_mask])
+            else:
+                out.append(df.loc[keep_mask].copy())
+
+        return out
+
+
 
 
 
