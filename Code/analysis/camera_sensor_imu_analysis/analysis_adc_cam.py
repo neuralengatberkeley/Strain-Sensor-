@@ -2338,14 +2338,542 @@ class ADC_CAM:
 
         return out
 
-    
+    @staticmethod
+    def plot_adc_abs_error_summary_grid(
+            results_adc: dict,
+            *,
+            speed_titles: dict | None = None,
+            speed_order: list[str] | None = None,
+            dlc_angle_col=("metric", "mcp_bend_deg", "deg"),
+            adc_angle_col: str = "theta_cam_cal_adc",
+            # Example row metadata (for titles/labels only)
+            example1_participant: str = "P4",
+            example1_speed: str = "slow",
+            example1_trial_idx: int = 0,
+            example2_participant: str = "P3",
+            example2_speed: str = "vfas",
+            example2_trial_idx: int = 0,
+            # NEW: the actual aligned example DataFrames
+            example1_df=None,
+            example2_df=None,
+            example_col_start: int = 1,
+            figsize: tuple[float, float] = (20, 12),
+            title_fontsize: int = 14,
+            label_fontsize: int = 12,
+            tick_fontsize: int = 10,
+            title_weight: str = "bold",
+            label_weight: str = "bold",
+            # global y-limit (fallback)
+            abs_err_ylim: tuple[float, float] | None = None,
+            # separate tuners
+            abs_err_ylim_examples: tuple[float, float] | None = None,
+            abs_err_ylim_summary: tuple[float, float] | None = None,
+            # horizontal spacing for whole grid
+            boxplot_wspace: float = 0.02,
+            # gap between TS and box in rows 0–1
+            example_col_gap_scale: float = 1.0,
+            # fixed gap between AFAP boxplot and summary bar (rows 2–3)
+            bar_gap_from_afap: float = 0.33,
+    ):
+        """
+        Seaborn summary figure for ADC vs DLC abs-error results.
 
+        Rows 1–2 use *explicit* aligned example DataFrames (example1_df, example2_df).
+        Rows 3–4 use abs-error summaries from results_adc.
 
+        Row 1:
+          [0, example_col_start + 1] : DLC vs ADC (0–10 s) example 1
+          [0, example_col_start + 2] : boxplot of |DLC–ADC| example 1
 
+        Row 2:
+          [1, example_col_start + 1] : DLC vs ADC (0–10 s) example 2
+          [1, example_col_start + 2] : boxplot of |DLC–ADC| example 2
 
+        Row 3:
+          FIRST set – per-speed boxplots by participant (cols 0–4),
+          plus mean |error| vs speed bar plot (col 5).
 
+        Row 4:
+          SECOND set – per-speed boxplots by participant with TWO boxes
+          per participant (self blue, cross red) in cols 0–4,
+          plus mean |error| vs speed (self vs cross) bar plot in col 5.
+        """
+        import numpy as np
+        import pandas as pd
+        import seaborn as sns
+        import matplotlib.pyplot as plt
 
+        # -----------------------------
+        # 1) Build tall DataFrame of abs errors (incl. SECOND-cross)
+        # -----------------------------
+        records = []
 
+        for (pname, speed), res in results_adc.items():
+            if res is None:
+                continue
+
+            # FIRST self
+            arr_first = res.get("abs_err_first")
+            if arr_first is not None:
+                vals = np.asarray(arr_first).ravel()
+                vals = vals[~np.isnan(vals)]
+                for v in vals:
+                    records.append(
+                        dict(
+                            participant=pname,
+                            speed=speed,
+                            set="FIRST",
+                            calib="self",
+                            abs_err_deg=float(v),
+                        )
+                    )
+
+            # SECOND self
+            arr_second = res.get("abs_err_second")
+            if arr_second is not None:
+                vals = np.asarray(arr_second).ravel()
+                vals = vals[~np.isnan(vals)]
+                for v in vals:
+                    records.append(
+                        dict(
+                            participant=pname,
+                            speed=speed,
+                            set="SECOND",
+                            calib="self",
+                            abs_err_deg=float(v),
+                        )
+                    )
+
+            # SECOND cross
+            arr_second_cross = res.get("abs_err_second_cross")
+            if arr_second_cross is not None:
+                vals = np.asarray(arr_second_cross).ravel()
+                vals = vals[~np.isnan(vals)]
+                for v in vals:
+                    records.append(
+                        dict(
+                            participant=pname,
+                            speed=speed,
+                            set="SECOND",
+                            calib="cross",
+                            abs_err_deg=float(v),
+                        )
+                    )
+
+        if not records:
+            print("[plot_adc_abs_error_summary_grid] No error data found.")
+            return
+
+        df = pd.DataFrame.from_records(records)
+
+        # Pretty speed labels
+        if speed_titles is not None:
+            df["speed_label"] = df["speed"].map(lambda s: speed_titles.get(s, s))
+        else:
+            df["speed_label"] = df["speed"]
+
+        if speed_order is None:
+            speed_order = sorted(df["speed"].unique())
+
+        # -----------------------------
+        # 2) Seaborn theme & figure
+        # -----------------------------
+        sns.set_theme(style="ticks", context="talk")
+        nrows, ncols = 4, 6
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+
+        def _style_ax(ax):
+            sns.despine(ax=ax, top=True, right=True)
+            ax.grid(False)
+            ax.tick_params(labelsize=tick_fontsize)
+
+        def _hide_y_axis(ax):
+            ax.yaxis.set_visible(False)
+            ax.tick_params(axis="y", left=False, labelleft=False)
+            for side in ("left", "right"):
+                if side in ax.spines:
+                    ax.spines[side].set_visible(False)
+
+        # -----------------------------
+        # Helpers for example rows (use explicit DataFrames)
+        # -----------------------------
+        def _get_example_from_df(df_ex: pd.DataFrame):
+            """
+            Extract DLC + ADC angles and build a 0–10 s time axis.
+            """
+            if df_ex is None or df_ex.empty:
+                return None
+
+            if dlc_angle_col not in df_ex.columns or adc_angle_col not in df_ex.columns:
+                return None
+
+            dlc_angle = df_ex[dlc_angle_col].to_numpy(dtype=float)
+            adc_angle = df_ex[adc_angle_col].to_numpy(dtype=float)
+
+            n = len(df_ex)
+
+            # Build a raw time axis in seconds
+            if "cam_timestamp" in df_ex.columns:
+                # assume nanoseconds
+                t_raw = df_ex["cam_timestamp"].to_numpy(dtype=float)
+                t_sec = (t_raw - t_raw[0]) / 1e9
+            elif "_t_cam_td" in df_ex.columns:
+                t_td = df_ex["_t_cam_td"]
+                t_sec = t_td.dt.total_seconds().to_numpy()
+                t_sec = t_sec - t_sec[0]
+            else:
+                # no timestamp info -> use sample index as a proxy
+                t_sec = np.arange(n, dtype=float)
+
+            # Normalize to 0–10 s ALWAYS
+            if n > 1 and np.nanmax(t_sec) > np.nanmin(t_sec):
+                t_plot = (t_sec - np.nanmin(t_sec)) / (np.nanmax(t_sec) - np.nanmin(t_sec)) * 10.0
+            else:
+                t_plot = np.zeros_like(t_sec)
+
+            abs_err = np.abs(dlc_angle - adc_angle)
+            return t_plot, dlc_angle, adc_angle, abs_err
+
+        def _plot_example_timeseries(
+                ax,
+                df_ex,
+                participant,
+                speed,
+                trial_idx,
+                title_prefix,
+        ):
+            res_ex = _get_example_from_df(df_ex)
+            if res_ex is None:
+                ax.text(0.5, 0.5,
+                        f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
+                        ha="center", va="center", fontsize=10)
+                _style_ax(ax)
+                return
+
+            t_plot, dlc_angle, adc_angle, _ = res_ex
+
+            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="DLC angle", linewidth=2)
+            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="ADC angle", linewidth=2)
+
+            # Always show 0–10 s with ticks every 2 s
+            ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("Angle (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_xlim(0.0, 10.0)
+            ax.set_xticks(np.arange(0, 10.01, 2.0))
+
+            ax.set_title(
+                f"{title_prefix}: {participant} {speed}, trial {trial_idx + 1}",
+                fontsize=title_fontsize,
+                fontweight=title_weight,
+            )
+            _style_ax(ax)
+
+            ax.legend(
+                fontsize=tick_fontsize,
+                frameon=False,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+
+        def _plot_example_box(
+                ax,
+                df_ex,
+                participant,
+                speed,
+                trial_idx,
+                title_prefix,
+        ):
+            res_ex = _get_example_from_df(df_ex)
+            if res_ex is None:
+                ax.text(0.5, 0.5,
+                        f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
+                        ha="center", va="center", fontsize=10)
+                _style_ax(ax)
+                return
+
+            _, _, _, abs_err = res_ex
+            vals = abs_err[np.isfinite(abs_err)]
+            if vals.size == 0:
+                ax.text(0.5, 0.5, "No valid samples",
+                        ha="center", va="center", fontsize=10)
+                _style_ax(ax)
+                return
+
+            df_box = pd.DataFrame({"abs_err_deg": vals})
+            sns.boxplot(
+                data=df_box,
+                y="abs_err_deg",
+                ax=ax,
+                showfliers=False,
+            )
+            ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("|Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_title(
+                f"{title_prefix}: |DLC–ADC|",
+                fontsize=title_fontsize,
+                fontweight=title_weight,
+            )
+
+            ylim_ex = abs_err_ylim_examples or abs_err_ylim
+            if ylim_ex is not None:
+                ax.set_ylim(ylim_ex)
+
+            _style_ax(ax)
+
+        # -----------------------------
+        # 3) Column positions (shift examples right)
+        # -----------------------------
+        if example_col_start < 0:
+            example_col_start = 0
+        if example_col_start > ncols - 3:
+            example_col_start = ncols - 3
+
+        ts_col = example_col_start + 1
+        box_col = example_col_start + 2
+
+        # -----------------------------
+        # 4) Row 1 – example 1 (uses example1_df)
+        # -----------------------------
+        for j in range(ncols):
+            if j not in (ts_col, box_col):
+                axes[0, j].axis("off")
+
+        _plot_example_timeseries(
+            axes[0, ts_col],
+            df_ex=example1_df,
+            participant=example1_participant,
+            speed=example1_speed,
+            trial_idx=example1_trial_idx,
+            title_prefix="Example",
+        )
+
+        _plot_example_box(
+            axes[0, box_col],
+            df_ex=example1_df,
+            participant=example1_participant,
+            speed=example1_speed,
+            trial_idx=example1_trial_idx,
+            title_prefix="Trial 1",
+        )
+
+        # -----------------------------
+        # 5) Row 2 – example 2 (uses example2_df)
+        # -----------------------------
+        for j in range(ncols):
+            if j not in (ts_col, box_col):
+                axes[1, j].axis("off")
+
+        _plot_example_timeseries(
+            axes[1, ts_col],
+            df_ex=example2_df,
+            participant=example2_participant,
+            speed=example2_speed,
+            trial_idx=example2_trial_idx,
+            title_prefix="Example",
+        )
+
+        _plot_example_box(
+            axes[1, box_col],
+            df_ex=example2_df,
+            participant=example2_participant,
+            speed=example2_speed,
+            trial_idx=example2_trial_idx,
+            title_prefix="Trial 2",
+        )
+
+        # -----------------------------
+        # 6) Row 3 – FIRST summary
+        # -----------------------------
+        df_first = df[df["set"] == "FIRST"]
+        ylim_sum = abs_err_ylim_summary or abs_err_ylim
+
+        for i, spd in enumerate(speed_order[:5]):
+            ax = axes[2, i]
+            sub = df_first[df_first["speed"] == spd]
+            if sub.empty:
+                ax.axis("off")
+                continue
+
+            sns.boxplot(
+                data=sub,
+                x="participant",
+                y="abs_err_deg",
+                ax=ax,
+                showfliers=False,
+            )
+
+            label = speed_titles.get(spd, spd) if speed_titles else spd
+            ax.set_title(f"FIRST – {label}",
+                         fontsize=title_fontsize,
+                         fontweight=title_weight)
+            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+
+            if ylim_sum is not None:
+                ax.set_ylim(ylim_sum)
+
+            if i == 0:
+                ax.set_ylabel("|Error| (deg)",
+                              fontsize=label_fontsize,
+                              fontweight=label_weight)
+                _style_ax(ax)
+            else:
+                ax.set_ylabel("")
+                _style_ax(ax)
+                _hide_y_axis(ax)
+
+        ax_bar_first = axes[2, ncols - 1]
+        means_first = []
+        labels_first = []
+        for spd in speed_order:
+            sub = df_first[df_first["speed"] == spd]["abs_err_deg"]
+            means_first.append(sub.mean() if not sub.empty else np.nan)
+            labels_first.append(speed_titles.get(spd, spd) if speed_titles else spd)
+
+        sns.barplot(
+            x=labels_first,
+            y=means_first,
+            ax=ax_bar_first,
+            color="C0",
+            errorbar=None,
+        )
+        ax_bar_first.set_title("FIRST – mean |error| vs speed",
+                               fontsize=title_fontsize,
+                               fontweight=title_weight)
+        ax_bar_first.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_first.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_first.tick_params(axis="x", rotation=30)
+        _style_ax(ax_bar_first)
+
+        # -----------------------------
+        # 7) Row 4 – SECOND summary (self vs cross)
+        # -----------------------------
+        df_second = df[df["set"] == "SECOND"]
+
+        for i, spd in enumerate(speed_order[:5]):
+            ax = axes[3, i]
+            sub = df_second[df_second["speed"] == spd]
+            if sub.empty:
+                ax.axis("off")
+                continue
+
+            sns.boxplot(
+                data=sub,
+                x="participant",
+                y="abs_err_deg",
+                hue="calib",
+                ax=ax,
+                showfliers=False,
+                palette={"self": "C0", "cross": "C3"},
+            )
+
+            if ax.get_legend() is not None:
+                ax.get_legend().remove()
+
+            label = speed_titles.get(spd, spd) if speed_titles else spd
+            ax.set_title(f"SECOND – {label}",
+                         fontsize=title_fontsize,
+                         fontweight=title_weight)
+            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+
+            if ylim_sum is not None:
+                ax.set_ylim(ylim_sum)
+
+            if i == 0:
+                ax.set_ylabel("|Error| (deg)",
+                              fontsize=label_fontsize,
+                              fontweight=label_weight)
+                _style_ax(ax)
+            else:
+                ax.set_ylabel("")
+                _style_ax(ax)
+                _hide_y_axis(ax)
+
+        ax_bar_second = axes[3, ncols - 1]
+        means_second_self = []
+        means_second_cross = []
+        labels_second = []
+
+        for spd in speed_order:
+            sub = df_second[df_second["speed"] == spd]
+            sub_self = sub[sub["calib"] == "self"]["abs_err_deg"]
+            sub_cross = sub[sub["calib"] == "cross"]["abs_err_deg"]
+
+            means_second_self.append(sub_self.mean() if not sub_self.empty else np.nan)
+            means_second_cross.append(sub_cross.mean() if not sub_cross.empty else np.nan)
+            labels_second.append(speed_titles.get(spd, spd) if speed_titles else spd)
+
+        x = np.arange(len(speed_order))
+        width = 0.35
+
+        ax_bar_second.bar(x - width / 2, means_second_self, width=width, color="C0", label="self")
+        ax_bar_second.bar(x + width / 2, means_second_cross, width=width, color="C3", label="xtrain")
+
+        ax_bar_second.set_xticks(x)
+        ax_bar_second.set_xticklabels(labels_second, rotation=30)
+        ax_bar_second.set_title("SECOND – mean |error| vs speed",
+                                fontsize=title_fontsize,
+                                fontweight=title_weight)
+        ax_bar_second.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_second.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_second.tick_params(axis="x", labelsize=tick_fontsize)
+        _style_ax(ax_bar_second)
+        ax_bar_second.legend(fontsize=tick_fontsize, frameon=False)
+
+        # -----------------------------
+        # 8) Layout + base spacing
+        # -----------------------------
+        fig.tight_layout()
+        fig.subplots_adjust(wspace=boxplot_wspace, hspace=1.0)
+
+        # -----------------------------
+        # 9) Extra gap scaling for first two rows (TS vs box)
+        # -----------------------------
+        if example_col_gap_scale != 1.0:
+            ts_ax0 = axes[0, ts_col]
+            box_ax0 = axes[0, box_col]
+
+            ts_pos = ts_ax0.get_position()
+            box_pos = box_ax0.get_position()
+
+            ts_right = ts_pos.x0 + ts_pos.width
+            current_gap = box_pos.x0 - ts_right
+            new_gap = current_gap * example_col_gap_scale
+
+            delta = (ts_right + new_gap) - box_pos.x0
+
+            for row_idx in (0, 1):
+                ax = axes[row_idx, box_col]
+                pos = ax.get_position()
+                ax.set_position([
+                    pos.x0 + delta,
+                    pos.y0,
+                    pos.width,
+                    pos.height,
+                ])
+
+        # -----------------------------
+        # 10) Force bar plots to be bar_gap_from_afap away from AFAP boxplots
+        # -----------------------------
+        for row_idx in (2, 3):
+            afap_ax = axes[row_idx, ncols - 2]
+            bar_ax = axes[row_idx, ncols - 1]
+
+            afap_pos = afap_ax.get_position()
+            bar_pos = bar_ax.get_position()
+
+            afap_right = afap_pos.x0 + afap_pos.width
+            delta = (afap_right + bar_gap_from_afap) - bar_pos.x0
+
+            new_x0 = bar_pos.x0 + delta
+            bar_ax.set_position([
+                new_x0,
+                bar_pos.y0,
+                bar_pos.width,
+                bar_pos.height,
+            ])
+
+        return fig, axes
 
 
 
