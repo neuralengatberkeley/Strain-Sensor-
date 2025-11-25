@@ -1535,11 +1535,17 @@ class ADC_CAM:
             time_col=("_t_cam_td", "", ""),  # or ("cam_timestamp", "", "")
             plot_indices: Optional[Sequence[int]] = None,
             set_name: str = "set",
+            do_refine: bool = True,  # <--- NEW FLAG
     ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
         """
         Refine ADC vs DLC alignment for an entire set of merged trials by
         searching over small integer lags (in samples) to minimize RMSE.
         Optionally plots selected trials.
+
+        do_refine : bool, default True
+            If True, search over ±max_lag_samples to minimize RMSE.
+            If False, no further alignment is done (lag constrained to 0),
+            but the _rmse column is still computed for diagnostics.
 
         Plot behavior:
           - Time axis is always rescaled to 0–10 s (data unchanged).
@@ -1574,6 +1580,9 @@ class ADC_CAM:
             Table with columns:
               ['trial_index', 'best_lag_samples', 'rmse_deg', 'n_points']
         """
+
+        # If do_refine is False, force lag search to be 0 only (no extra alignment)
+        effective_max_lag = max_lag_samples if do_refine else 0
         refined: List[pd.DataFrame] = []
         records = []
 
@@ -1594,7 +1603,7 @@ class ADC_CAM:
                 df,
                 dlc_col=dlc_col,
                 adc_col=adc_col,
-                max_lag_samples=max_lag_samples,
+                max_lag_samples=effective_max_lag,
             )
             refined.append(df_aligned)
             records.append(
@@ -2205,6 +2214,130 @@ class ADC_CAM:
                 out.append(df.loc[keep_mask].copy())
 
         return out
+
+    # ---------- trigger-time CSV per trial ----------
+
+    def extract_trigger_time_dfs_by_trial(
+        self,
+        trials: List[Dict[str, Optional[Path]]],
+        *,
+        add_labels: bool = True,
+        trial_labels: Optional[List[int]] = None,  # else trial_base..N-1
+        trial_base: int = 1,
+        set_label: Optional[str] = None,          # e.g. "first_cam", "second_cam"
+        set_labels: Optional[List[str]] = None,   # per-trial labels
+        include_path: bool = False,
+    ) -> List[pd.DataFrame]:
+        """
+        For each trial dict, load the trigger-time CSV (if present)
+        into a small DataFrame of timestamps.
+
+        Priority (for each trial):
+          1) trial["trig_time_csv"] if present
+          2) any CSV in the folder matching '*data_trigger_time*.csv'
+
+        If a trial has no trigger-time CSV, an empty DataFrame is returned
+        for that trial (optionally with label/path columns).
+        """
+        out: List[pd.DataFrame] = []
+        n = len(trials)
+
+        # ---- build labels ----
+        if trial_labels is None:
+            labels_trial = [trial_base + i for i in range(n)]
+        else:
+            if len(trial_labels) != n:
+                raise ValueError("trial_labels length must match len(trials).")
+            labels_trial = trial_labels
+
+        if set_labels is not None and len(set_labels) != n:
+            raise ValueError("set_labels length must match len(trials).")
+
+        def _label_for(i: int):
+            if not add_labels:
+                return None, None
+            tlabel = labels_trial[i]
+            slabel = set_labels[i] if set_labels is not None else set_label
+            return tlabel, slabel
+
+        # ---- per-trial loop ----
+        for i, trial in enumerate(trials):
+            folder = Path(trial.get("folder", ".")) if trial.get("folder") else None
+            trig_path = trial.get("trig_time_csv", None)
+
+            cands: List[Path] = []
+            if trig_path is not None and Path(trig_path).exists():
+                cands.append(Path(trig_path))
+
+            # Fallback: search in folder if needed
+            if (not cands) and folder is not None and folder.exists():
+                direct = [
+                    p for p in folder.glob("*data_trigger_time*.csv")
+                    if not p.name.startswith("._")
+                ]
+                cands.extend(direct)
+                if not cands:
+                    nested = [
+                        p for p in folder.rglob("*data_trigger_time*.csv")
+                        if not p.name.startswith("._")
+                    ]
+                    cands.extend(nested)
+
+            # If still nothing, return empty df with labels/path (optionally)
+            if not cands:
+                df = pd.DataFrame()
+                tlabel, slabel = _label_for(i)
+                if add_labels:
+                    if tlabel is not None:
+                        df["trial"] = [tlabel]
+                    if slabel is not None:
+                        df["set_label"] = [slabel]
+                if include_path and folder is not None:
+                    df["source_path"] = [str(folder)]
+                out.append(df)
+                continue
+
+            # Use largest CSV candidate
+            cands_sorted = sorted(
+                cands,
+                key=lambda p: p.stat().st_size if p.exists() else 0,
+                reverse=True,
+            )
+            csv_path = cands_sorted[0]
+
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception as e:
+                print(f"[WARN] Skipping unreadable trigger-time CSV: {csv_path} ({e})")
+                df = pd.DataFrame()
+
+            # If there is exactly one column and it looks like time, rename to "timestamp"
+            if not df.empty and df.shape[1] == 1:
+                only = df.columns[0]
+                name_l = str(only).lower()
+                if ("time" in name_l) or ("ts" in name_l):
+                    df = df.rename(columns={only: "timestamp"})
+
+            # Add labels if requested
+            tlabel, slabel = _label_for(i)
+            if add_labels and not df.empty:
+                df = df.copy()
+                if ("trial" not in df.columns) and (tlabel is not None):
+                    df["trial"] = tlabel
+                if ("set_label" not in df.columns) and (slabel is not None):
+                    df["set_label"] = slabel
+            elif add_labels and df.empty:
+                # already handled above in the "no cands" branch
+                pass
+
+            if include_path:
+                df = df.copy()
+                df["source_path"] = str(csv_path)
+
+            out.append(df)
+
+        return out
+
 
 
 
