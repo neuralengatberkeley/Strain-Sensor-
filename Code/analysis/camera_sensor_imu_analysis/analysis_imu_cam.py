@@ -1,14 +1,10 @@
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Sequence, Any
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
 from analysis_adc_cam import ADC_CAM  # or from .analysis_adc_cam import ADC_CAM
-from analysis import BallBearingData      # not used directly here, but kept for context
 from analysis import DLC3DBendAngles      # IMU angle math lives here (old pipeline)
-from analysis import bender_class         # not used here, but imported as in your file
 import seaborn as sns
 
 
@@ -2118,12 +2114,6 @@ class IMU_cam(ADC_CAM):
 
         return out
 
-    import numpy as np
-    import pandas as pd
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-
-    import seaborn as sns  # at top of file with other imports
     @staticmethod
     def plot_imu_abs_error_summary_grid(
             results_imu: dict,
@@ -2152,8 +2142,10 @@ class IMU_cam(ADC_CAM):
             boxplot_wspace: float = 0.02,
             # scale gap between TS and boxplot in first two rows
             example_col_gap_scale: float = 1.0,
-            # NEW: fixed gap between AFAP boxplot and summary bar plots (rows 3–4)
+            # fixed gap between AFAP boxplot and summary bar plots (rows 3–4)
             bar_gap_from_afap: float = 0.33,
+            # NEW: drop specific participant–speed combos from summary
+            exclude_participant_speed_for_summary: list[tuple[str, str]] | None = None,
     ):
         """
         Seaborn summary figure for IMU abs-error results.
@@ -2238,6 +2230,21 @@ class IMU_cam(ADC_CAM):
             )
         else:
             df["speed_label"] = df["speed"]
+
+        # ------------------------------------------------------
+        # Optional: drop specific participant–speed combinations
+        # from the summary (boxplots + bar plots)
+        # ------------------------------------------------------
+        if exclude_participant_speed_for_summary:
+            mask_exclude = pd.Series(False, index=df.index)
+            for pname, spd in exclude_participant_speed_for_summary:
+                mask_exclude |= (
+                    (df["participant"] == pname)
+                    & (df["speed"] == spd)
+                    & df["set"].isin(["FIRST", "SECOND"])
+                )
+            df = df.loc[~mask_exclude].copy()
+
 
         if speed_order is None:
             speed_order = sorted(df["speed"].unique())
