@@ -1,14 +1,12 @@
 from pathlib import Path
-from typing import List, Dict, Optional
 import pandas as pd
 import re
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Sequence
 import matplotlib.pyplot as plt
 from typing import Optional
-from analysis import BallBearingData # class for extracting all data from application and reapplication for ADC, IMU, and Camera Triggers
 from analysis import DLC3DBendAngles # class for taking DLC 3d point data and converting to angles
-from analysis import bender_class # class for normalizing adc data, analyzing autobender tests
+import seaborn as sns
 
 
 class ADC_CAM:
@@ -2374,7 +2372,10 @@ class ADC_CAM:
             example_col_gap_scale: float = 1.0,
             # fixed gap between AFAP boxplot and summary bar (rows 2–3)
             bar_gap_from_afap: float = 0.33,
+            # NEW: drop specific participant–set combos from summary rows
+            exclude_participant_set_for_summary: list[tuple[str, str]] | None = None,
     ):
+
         """
         Seaborn summary figure for ADC vs DLC abs-error results.
 
@@ -2398,10 +2399,7 @@ class ADC_CAM:
           per participant (self blue, cross red) in cols 0–4,
           plus mean |error| vs speed (self vs cross) bar plot in col 5.
         """
-        import numpy as np
-        import pandas as pd
-        import seaborn as sns
-        import matplotlib.pyplot as plt
+
 
         # -----------------------------
         # 1) Build tall DataFrame of abs errors (incl. SECOND-cross)
@@ -2471,6 +2469,31 @@ class ADC_CAM:
             df["speed_label"] = df["speed"].map(lambda s: speed_titles.get(s, s))
         else:
             df["speed_label"] = df["speed"]
+
+        df = pd.DataFrame.from_records(records)
+
+        # Pretty speed labels
+        if speed_titles is not None:
+            df["speed_label"] = df["speed"].map(lambda s: speed_titles.get(s, s))
+        else:
+            df["speed_label"] = df["speed"]
+
+        # ---------------------------------------------
+        # Optional: drop participant–set combos in rows
+        # 3–4 (boxplots + bar plots)
+        # ---------------------------------------------
+        if exclude_participant_set_for_summary:
+            mask_excl = pd.Series(False, index=df.index)
+            for pname, set_label in exclude_participant_set_for_summary:
+                mask_excl |= (
+                    (df["participant"] == pname)
+                    & (df["set"] == set_label)
+                )
+            df = df.loc[~mask_excl].copy()
+
+        if speed_order is None:
+            speed_order = sorted(df["speed"].unique())
+
 
         if speed_order is None:
             speed_order = sorted(df["speed"].unique())
