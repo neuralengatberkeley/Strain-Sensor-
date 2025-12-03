@@ -2658,7 +2658,7 @@ class ADC_CAM:
             if j not in (calib_col, ts_col, box_col):
                 axes[0, j].axis("off")
 
-        # --- calibration panel: SECOND set (orange) from calib_df ---
+        # --- calibration panel: FIRST application set (blue) from calib_df ---
         ax_cal = axes[0, calib_col]
         has_calib = calib_df is not None and not getattr(calib_df, "empty", False)
 
@@ -2666,8 +2666,12 @@ class ADC_CAM:
             sub = calib_df.copy()
 
             # keep only requested set if 'set' column exists
-            if "set" in sub.columns:
+            if "set" in sub.columns and calib_set_label is not None:
                 sub = sub[sub["set"] == calib_set_label]
+
+            # keep only angles up to 67.5 deg
+            if "angle_snap_deg" in sub.columns:
+                sub = sub[sub["angle_snap_deg"] <= 67.5]
 
             if (
                     not sub.empty
@@ -2678,7 +2682,7 @@ class ADC_CAM:
                     sub["angle_snap_deg"].to_numpy(),
                     sub["adc_mean"].to_numpy(),
                     s=30,
-                    color="C1",  # SECOND / orange
+                    color="C0",  # FIRST / blue
                 )
                 ax_cal.set_xlabel(
                     "Calibration angle (deg)",
@@ -2691,7 +2695,7 @@ class ADC_CAM:
                     fontweight=label_weight,
                 )
                 ax_cal.set_title(
-                    "SECOND calib (P2)",
+                    "FIRST application calib (P3)",
                     fontsize=title_fontsize,
                     fontweight=title_weight,
                 )
