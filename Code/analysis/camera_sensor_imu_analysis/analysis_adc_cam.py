@@ -2351,10 +2351,14 @@ class ADC_CAM:
             example2_participant: str = "P3",
             example2_speed: str = "vfas",
             example2_trial_idx: int = 0,
-            # NEW: the actual aligned example DataFrames
+            # explicit aligned example DataFrames
             example1_df=None,
             example2_df=None,
+            # calibration data to show in row 1, col 2
+            calib_df=None,
+            calib_set_label: int = 2,  # 1 = FIRST (blue), 2 = SECOND (orange)
             example_col_start: int = 1,
+            calib_x_shift: float = 0.03,  # shift calib panel to the right
             figsize: tuple[float, float] = (20, 12),
             title_fontsize: int = 14,
             label_fontsize: int = 12,
@@ -2372,10 +2376,9 @@ class ADC_CAM:
             example_col_gap_scale: float = 1.0,
             # fixed gap between AFAP boxplot and summary bar (rows 2–3)
             bar_gap_from_afap: float = 0.33,
-            # NEW: drop specific participant–set combos from summary rows
+            # drop specific participant–set combos from summary rows
             exclude_participant_set_for_summary: list[tuple[str, str]] | None = None,
     ):
-
         """
         Seaborn summary figure for ADC vs DLC abs-error results.
 
@@ -2383,12 +2386,13 @@ class ADC_CAM:
         Rows 3–4 use abs-error summaries from results_adc.
 
         Row 1:
-          [0, example_col_start + 1] : DLC vs ADC (0–10 s) example 1
-          [0, example_col_start + 2] : boxplot of |DLC–ADC| example 1
+          [0, calib_col]          : calibration scatter (SECOND, orange; 11/02/25)
+          [0, example_col_start+1]: DLC vs ADC (0–10 s) example 1
+          [0, example_col_start+2]: boxplot of |DLC–ADC| example 1
 
         Row 2:
-          [1, example_col_start + 1] : DLC vs ADC (0–10 s) example 2
-          [1, example_col_start + 2] : boxplot of |DLC–ADC| example 2
+          [1, example_col_start+1]: DLC vs ADC (0–10 s) example 2
+          [1, example_col_start+2]: boxplot of |DLC–ADC| example 2
 
         Row 3:
           FIRST set – per-speed boxplots by participant (cols 0–4),
@@ -2399,7 +2403,6 @@ class ADC_CAM:
           per participant (self blue, cross red) in cols 0–4,
           plus mean |error| vs speed (self vs cross) bar plot in col 5.
         """
-
 
         # -----------------------------
         # 1) Build tall DataFrame of abs errors (incl. SECOND-cross)
@@ -2470,30 +2473,15 @@ class ADC_CAM:
         else:
             df["speed_label"] = df["speed"]
 
-        df = pd.DataFrame.from_records(records)
-
-        # Pretty speed labels
-        if speed_titles is not None:
-            df["speed_label"] = df["speed"].map(lambda s: speed_titles.get(s, s))
-        else:
-            df["speed_label"] = df["speed"]
-
-        # ---------------------------------------------
-        # Optional: drop participant–set combos in rows
-        # 3–4 (boxplots + bar plots)
-        # ---------------------------------------------
+        # drop participant–set combos from summary rows if requested
         if exclude_participant_set_for_summary:
             mask_excl = pd.Series(False, index=df.index)
             for pname, set_label in exclude_participant_set_for_summary:
                 mask_excl |= (
-                    (df["participant"] == pname)
-                    & (df["set"] == set_label)
+                        (df["participant"] == pname)
+                        & (df["set"] == set_label)
                 )
             df = df.loc[~mask_excl].copy()
-
-        if speed_order is None:
-            speed_order = sorted(df["speed"].unique())
-
 
         if speed_order is None:
             speed_order = sorted(df["speed"].unique())
@@ -2567,9 +2555,11 @@ class ADC_CAM:
         ):
             res_ex = _get_example_from_df(df_ex)
             if res_ex is None:
-                ax.text(0.5, 0.5,
-                        f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
-                        ha="center", va="center", fontsize=10)
+                ax.text(
+                    0.5, 0.5,
+                    f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
+                    ha="center", va="center", fontsize=10,
+                )
                 _style_ax(ax)
                 return
 
@@ -2609,9 +2599,11 @@ class ADC_CAM:
         ):
             res_ex = _get_example_from_df(df_ex)
             if res_ex is None:
-                ax.text(0.5, 0.5,
-                        f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
-                        ha="center", va="center", fontsize=10)
+                ax.text(
+                    0.5, 0.5,
+                    f"No example data\n(participant={participant}, speed={speed}, trial={trial_idx})",
+                    ha="center", va="center", fontsize=10,
+                )
                 _style_ax(ax)
                 return
 
@@ -2655,13 +2647,61 @@ class ADC_CAM:
         ts_col = example_col_start + 1
         box_col = example_col_start + 2
 
+        # fixed calibration panel column in row 1 (0-based: 1 => 2nd column)
+        calib_col = 1
+
         # -----------------------------
-        # 4) Row 1 – example 1 (uses example1_df)
+        # 4) Row 1 – calibration + example 1
         # -----------------------------
         for j in range(ncols):
-            if j not in (ts_col, box_col):
+            # keep the calibration axis, TS axis, and box axis
+            if j not in (calib_col, ts_col, box_col):
                 axes[0, j].axis("off")
 
+        # --- calibration panel: SECOND set (orange) from calib_df ---
+        ax_cal = axes[0, calib_col]
+        has_calib = calib_df is not None and not getattr(calib_df, "empty", False)
+
+        if has_calib:
+            sub = calib_df.copy()
+
+            # keep only requested set if 'set' column exists
+            if "set" in sub.columns:
+                sub = sub[sub["set"] == calib_set_label]
+
+            if (
+                    not sub.empty
+                    and "angle_snap_deg" in sub.columns
+                    and "adc_mean" in sub.columns
+            ):
+                ax_cal.scatter(
+                    sub["angle_snap_deg"].to_numpy(),
+                    sub["adc_mean"].to_numpy(),
+                    s=30,
+                    color="C1",  # SECOND / orange
+                )
+                ax_cal.set_xlabel(
+                    "Calibration angle (deg)",
+                    fontsize=label_fontsize,
+                    fontweight=label_weight,
+                )
+                ax_cal.set_ylabel(
+                    "Mean ADC value",
+                    fontsize=label_fontsize,
+                    fontweight=label_weight,
+                )
+                ax_cal.set_title(
+                    "SECOND calib (P2)",
+                    fontsize=title_fontsize,
+                    fontweight=title_weight,
+                )
+                _style_ax(ax_cal)
+            else:
+                ax_cal.axis("off")
+        else:
+            ax_cal.axis("off")
+
+        # --- Example 1 time-series in shifted column ---
         _plot_example_timeseries(
             axes[0, ts_col],
             df_ex=example1_df,
@@ -2671,6 +2711,7 @@ class ADC_CAM:
             title_prefix="Example",
         )
 
+        # --- Example 1 error boxplot ---
         _plot_example_box(
             axes[0, box_col],
             df_ex=example1_df,
@@ -2727,18 +2768,22 @@ class ADC_CAM:
             )
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
-            ax.set_title(f"FIRST – {label}",
-                         fontsize=title_fontsize,
-                         fontweight=title_weight)
+            ax.set_title(
+                f"FIRST – {label}",
+                fontsize=title_fontsize,
+                fontweight=title_weight,
+            )
             ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
             if i == 0:
-                ax.set_ylabel("|Error| (deg)",
-                              fontsize=label_fontsize,
-                              fontweight=label_weight)
+                ax.set_ylabel(
+                    "|Error| (deg)",
+                    fontsize=label_fontsize,
+                    fontweight=label_weight,
+                )
                 _style_ax(ax)
             else:
                 ax.set_ylabel("")
@@ -2760,11 +2805,17 @@ class ADC_CAM:
             color="C0",
             errorbar=None,
         )
-        ax_bar_first.set_title("FIRST – mean |error| vs speed",
-                               fontsize=title_fontsize,
-                               fontweight=title_weight)
+        ax_bar_first.set_title(
+            "FIRST – mean |error| vs speed",
+            fontsize=title_fontsize,
+            fontweight=title_weight,
+        )
         ax_bar_first.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_first.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_first.set_ylabel(
+            "Mean |Error| (deg)",
+            fontsize=label_fontsize,
+            fontweight=label_weight,
+        )
         ax_bar_first.tick_params(axis="x", rotation=30)
         _style_ax(ax_bar_first)
 
@@ -2794,18 +2845,22 @@ class ADC_CAM:
                 ax.get_legend().remove()
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
-            ax.set_title(f"SECOND – {label}",
-                         fontsize=title_fontsize,
-                         fontweight=title_weight)
+            ax.set_title(
+                f"SECOND – {label}",
+                fontsize=title_fontsize,
+                fontweight=title_weight,
+            )
             ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
             if i == 0:
-                ax.set_ylabel("|Error| (deg)",
-                              fontsize=label_fontsize,
-                              fontweight=label_weight)
+                ax.set_ylabel(
+                    "|Error| (deg)",
+                    fontsize=label_fontsize,
+                    fontweight=label_weight,
+                )
                 _style_ax(ax)
             else:
                 ax.set_ylabel("")
@@ -2829,16 +2884,28 @@ class ADC_CAM:
         x = np.arange(len(speed_order))
         width = 0.35
 
-        ax_bar_second.bar(x - width / 2, means_second_self, width=width, color="C0", label="self")
-        ax_bar_second.bar(x + width / 2, means_second_cross, width=width, color="C3", label="xtrain")
+        ax_bar_second.bar(
+            x - width / 2, means_second_self,
+            width=width, color="C0", label="self",
+        )
+        ax_bar_second.bar(
+            x + width / 2, means_second_cross,
+            width=width, color="C3", label="xtrain",
+        )
 
         ax_bar_second.set_xticks(x)
         ax_bar_second.set_xticklabels(labels_second, rotation=30)
-        ax_bar_second.set_title("SECOND – mean |error| vs speed",
-                                fontsize=title_fontsize,
-                                fontweight=title_weight)
+        ax_bar_second.set_title(
+            "SECOND – mean |error| vs speed",
+            fontsize=title_fontsize,
+            fontweight=title_weight,
+        )
         ax_bar_second.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_second.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_second.set_ylabel(
+            "Mean |Error| (deg)",
+            fontsize=label_fontsize,
+            fontweight=label_weight,
+        )
         ax_bar_second.tick_params(axis="x", labelsize=tick_fontsize)
         _style_ax(ax_bar_second)
         ax_bar_second.legend(fontsize=tick_fontsize, frameon=False)
@@ -2848,6 +2915,19 @@ class ADC_CAM:
         # -----------------------------
         fig.tight_layout()
         fig.subplots_adjust(wspace=boxplot_wspace, hspace=1.0)
+
+        # -----------------------------
+        # 8b) Optional: shift calibration plot to the right
+        # -----------------------------
+        if calib_x_shift != 0.0:
+            ax_cal = axes[0, calib_col]
+            pos = ax_cal.get_position()
+            ax_cal.set_position([
+                pos.x0 + calib_x_shift,
+                pos.y0,
+                pos.width,
+                pos.height,
+            ])
 
         # -----------------------------
         # 9) Extra gap scaling for first two rows (TS vs box)
@@ -2897,6 +2977,7 @@ class ADC_CAM:
             ])
 
         return fig, axes
+
 
 
 
