@@ -2416,7 +2416,7 @@ class ADC_CAM:
         speed_xtick_label_map = {
             "slow": "30",
             "medm": "60",
-            "fast": "180",
+            "fast": "120",
             "vfas": "240",
             "afap": "AFAP",
         }
@@ -2643,7 +2643,7 @@ class ADC_CAM:
                     ax.legend(
                         fontsize=tick_fontsize,
                         frameon=False,
-                        loc="upper left",
+                        loc="upper center",
                         ncol=2,           # horizontal
                         handlelength=0.9, # shorter line segments
                         handletextpad=0.4,
@@ -2765,7 +2765,7 @@ class ADC_CAM:
                     fontweight=label_weight,
                 )
                 ax_cal.set_ylabel(
-                    "Mean ADC value",
+                    "Mean ADC Value",
                     fontsize=label_fontsize,
                     fontweight=label_weight,
                 )
@@ -2805,7 +2805,7 @@ class ADC_CAM:
             participant=example1_participant,
             speed=example1_speed,
             trial_idx=example1_trial_idx,
-            title_prefix="Trial 1",
+            title_prefix="30 BPM",
         )
 
         # layout edit
@@ -2833,7 +2833,7 @@ class ADC_CAM:
             participant=example2_participant,
             speed=example2_speed,
             trial_idx=example2_trial_idx,
-            title_prefix="Trial 2",
+            title_prefix="240 BPM",
         )
 
         # -----------------------------
@@ -2907,7 +2907,6 @@ class ADC_CAM:
             y=means_first,
             ax=ax_bar_first,
             color=COLOR_FIRST,
-            width=0.45,
             alpha = 0.65,
             errorbar=None,
         )
