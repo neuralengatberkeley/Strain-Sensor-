@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="182.74pt" height="29.76pt" viewBox="0 0 182.74 29.76" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="181.06pt" height="28.08pt" viewBox="0 0 181.06 28.08" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2025-12-08T12:38:31.902053</dc:date>
+    <dc:date>2025-12-08T21:25:58.967807</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -21,26 +21,26 @@
  </defs>
  <g id="figure_1">
   <g id="patch_1">
-   <path d="M 0 29.76 
-L 182.74 29.76 
-L 182.74 -0 
-L 0 -0 
+   <path d="M 0 28.08 
+L 181.06 28.08 
+L 181.06 0 
+L 0 0 
 z
 " style="fill: #ffffff"/>
   </g>
   <g id="axes_1">
    <g id="legend_1">
     <g id="patch_2">
-     <path d="M 7.5325 17.465156 
-L 22.5325 17.465156 
-L 22.5325 10.465156 
-L 7.5325 10.465156 
+     <path d="M 6.6925 16.625156 
+L 21.6925 16.625156 
+L 21.6925 9.625156 
+L 6.6925 9.625156 
 z
-" style="fill: #4c72b0; opacity: 0.65; stroke: #ffffff; stroke-width: 0.8; stroke-linejoin: miter"/>
+" style="fill: #4c72b0; opacity: 0.65; stroke: #ffffff; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
     <g id="text_1">
      <!-- Self-Trained Model -->
-     <g style="fill: #262626" transform="translate(26.5325 17.465156) scale(0.1 -0.1)">
+     <g style="fill: #262626" transform="translate(25.6925 16.625156) scale(0.1 -0.1)">
       <defs>
        <path id="ArialMT-53" d="M 288 1472 
 L 859 1522 
@@ -334,16 +334,16 @@ z
      </g>
     </g>
     <g id="patch_3">
-     <path d="M 120.634062 17.465156 
-L 135.634062 17.465156 
-L 135.634062 10.465156 
-L 120.634062 10.465156 
+     <path d="M 119.794063 16.625156 
+L 134.794062 16.625156 
+L 134.794062 9.625156 
+L 119.794063 9.625156 
 z
-" style="fill: #dd8452; opacity: 0.65; stroke: #ffffff; stroke-width: 0.8; stroke-linejoin: miter"/>
+" style="fill: #dd8452; opacity: 0.65; stroke: #ffffff; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
     <g id="text_2">
      <!-- Model 1 -->
-     <g style="fill: #262626" transform="translate(139.634062 17.465156) scale(0.1 -0.1)">
+     <g style="fill: #262626" transform="translate(138.794062 16.625156) scale(0.1 -0.1)">
       <defs>
        <path id="ArialMT-31" d="M 2384 0 
 L 1822 0 
