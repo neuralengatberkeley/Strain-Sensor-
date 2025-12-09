@@ -802,7 +802,7 @@ class IMU_cam(ADC_CAM):
             patch.set_facecolor(c)
             patch.set_alpha(0.5)
 
-        ax.set_ylabel("|DLC – IMU| error (deg)")
+        ax.set_ylabel("|DLC – IMU| error (°)")
         ax.set_title("Absolute error between DLC and IMU bend angles")
 
         for i, med in enumerate([med_first, med_second], start=1):
@@ -1608,7 +1608,7 @@ class IMU_cam(ADC_CAM):
                     )
 
                 plt.xlabel("Scaled time (0–10 s)")
-                plt.ylabel("Angle (deg)")
+                plt.ylabel("Angle (°)")
                 plt.title(
                     f"{set_name} trial {idx + 1}: DLC vs IMU (RMSE column, do_refine={do_refine})"
                 )
@@ -2127,12 +2127,12 @@ class IMU_cam(ADC_CAM):
             example2_speed: str = "vfas",
             example_trial_idx: int = 0,
             example_col_start: int = 1,
-            figsize: tuple[float, float] = (20, 12),
-            title_fontsize: int = 14,
-            label_fontsize: int = 12,
-            tick_fontsize: int = 10,
+            figsize: tuple[float, float] = (8.5, 8),
+            title_fontsize: int = 12,
+            label_fontsize: int = 10,
+            tick_fontsize: int = 9,
             title_weight: str = "bold",
-            label_weight: str = "bold",
+            label_weight: str = "normal",
             # global y-limit (fallback)
             abs_err_ylim: tuple[float, float] | None = None,
             # separate tuners
@@ -2189,6 +2189,15 @@ class IMU_cam(ADC_CAM):
         # 1) Build tall DataFrame of abs errors
         # -----------------------------
         records = []
+        COLOR_FIRST = "#4C72B0"   # blue
+        COLOR_SECOND = "#DD8452"  # orange
+        speed_xtick_label_map = {
+            "slow": "30",
+            "medm": "60",
+            "fast": "120",
+            "vfas": "240",
+            "afap": "AFAP",
+        }
 
         for (pname, speed), res in results_imu.items():
             if res is None:
@@ -2255,7 +2264,45 @@ class IMU_cam(ADC_CAM):
         sns.set_theme(style="ticks", context="talk")
 
         nrows, ncols = 4, 6
-        fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+        fig = plt.figure(figsize=figsize)
+
+        # Outer 2×1 grid: top block (rows 0–1), bottom block (rows 2–3)
+        outer_gs = fig.add_gridspec(
+            2, 1,
+            height_ratios=[1, 1],
+            hspace=0.4,  # vertical space between top and bottom blocks
+        )
+
+        # Top: rows 0–1 with their own width & vertical spacing
+        top_gs = outer_gs[0].subgridspec(
+            2, 6,
+            width_ratios=[0.8, 0.8, 0.8, 0.2, 1.5, 0.4],
+            wspace=boxplot_wspace,
+            hspace=1.6,  # more space between row 0 and row 1
+        )
+
+        # Bottom: rows 2–3 with different width & vertical spacing
+        bottom_gs = outer_gs[1].subgridspec(
+            2, 6,
+            width_ratios=[0.8, 0.8, 0.8, 0.8, 0.8, 1.4],
+            wspace=boxplot_wspace,
+            hspace=1.0,  # space between row 2 and row 3
+        )
+
+        # Build a 4×6 axes array so the rest of the code can stay the same
+        axes = np.empty((4, 6), dtype=object)
+
+        # Fill rows 0–1 from top_gs
+        for r in range(2):
+            for c in range(6):
+                axes[r, c] = fig.add_subplot(top_gs[r, c])
+
+        # Fill rows 2–3 from bottom_gs
+        for r in range(2):
+            for c in range(6):
+                axes[r + 2, c] = fig.add_subplot(bottom_gs[r, c])
+
+
 
         def _style_ax(ax):
             """Base styling: remove top/right spines, no grid, set tick font size."""
@@ -2265,11 +2312,8 @@ class IMU_cam(ADC_CAM):
 
         def _hide_y_axis(ax):
             """Completely hide y-axis (ticks, labels, and vertical spines)."""
-            ax.yaxis.set_visible(False)
-            ax.tick_params(axis="y", left=False, labelleft=False)
-            for side in ("left", "right"):
-                if side in ax.spines:
-                    ax.spines[side].set_visible(False)
+            ax.tick_params(axis="y", labelleft=False)  # hide text
+            ax.tick_params(axis="y", left=False)       # hide tick marks
 
         # -----------------------------
         # Helper: get example trial series and 0–10 s time axis
@@ -2319,7 +2363,7 @@ class IMU_cam(ADC_CAM):
             abs_err = np.abs(dlc_angle - imu_angle)
             return t_plot, dlc_angle, imu_angle, abs_err
 
-        def _plot_example_timeseries(ax, participant, speed, title_prefix):
+        def _plot_example_timeseries(ax, participant, speed, title_prefix, show_legend: bool = True, legend_inside: bool = False,):
             res_ex = _get_example_trial(participant, speed)
             if res_ex is None:
                 ax.text(0.5, 0.5, f"No data for {participant}, {speed}",
@@ -2329,28 +2373,57 @@ class IMU_cam(ADC_CAM):
 
             t_plot, dlc_angle, imu_angle, _ = res_ex
 
-            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="DLC wrist", linewidth=2)
-            sns.lineplot(x=t_plot, y=imu_angle, ax=ax, label="IMU", linewidth=2)
+            sns.lineplot(
+                x=t_plot, y=dlc_angle, ax=ax,
+                label="DLC Wrist",
+                linewidth=2,
+                color=COLOR_FIRST,
+                alpha=0.65,
+            )
+            sns.lineplot(
+                x=t_plot, y=imu_angle, ax=ax,
+                label="IMU",
+                linewidth=2,
+                color=COLOR_SECOND,
+                alpha=0.65,
+            )
 
             ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
-            ax.set_ylabel("Angle (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("Angle (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_xlim(0.0, 10.0)
             ax.set_xticks(np.arange(0, 10.01, 2.0))
 
+            bpm_label = speed_xtick_label_map.get(speed, speed)
+
             ax.set_title(
-                f"{title_prefix}: {participant} {speed}, trial {example_trial_idx + 1}",
+                f"{title_prefix}: {participant}\n{bpm_label} BPM - Trial {example_trial_idx + 1}",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
             _style_ax(ax)
 
-            ax.legend(
-                fontsize=tick_fontsize,
-                frameon=False,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
-            )
+            if show_legend:
+                if legend_inside:
+                    ax.legend(
+                        fontsize=tick_fontsize,
+                        frameon=False,
+                        loc="upper center",
+                        ncol=2,            # single row
+                        handlelength=1.0,  # shorter color lines
+                        borderaxespad=0.2,
+                    )
+                else:
+                    ax.legend(
+                        fontsize=tick_fontsize,
+                        frameon=False,
+                        loc="upper left",
+                        bbox_to_anchor=(1.02, 1.0),
+                        borderaxespad=0.0,
+                    )
+            else:
+                leg = ax.get_legend()
+                if leg is not None:
+                    leg.remove()
 
         def _plot_example_box(ax, participant, speed, title_prefix):
             res_ex = _get_example_trial(participant, speed)
@@ -2374,11 +2447,17 @@ class IMU_cam(ADC_CAM):
                 y="abs_err_deg",
                 ax=ax,
                 showfliers=False,
+                width=0.2,              # much skinnier
+                color=COLOR_FIRST,
+                boxprops=dict(alpha=0.65),
+                whiskerprops=dict(alpha=0.65),
+                capprops=dict(alpha=0.65),
+                medianprops=dict(alpha=0.65),
             )
             ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
-            ax.set_ylabel("|Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("|Error| (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_title(
-                f"{title_prefix}: |DLC–IMU|",
+                f"{title_prefix}: \n|DLC-IMU|",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2392,13 +2471,9 @@ class IMU_cam(ADC_CAM):
         # -----------------------------
         # 4) Column positions (shift first two rows right)
         # -----------------------------
-        if example_col_start < 0:
-            example_col_start = 0
-        if example_col_start > ncols - 3:
-            example_col_start = ncols - 3
-
-        ts_col = example_col_start + 1
-        box_col = example_col_start + 2
+        example_col_start = ncols - 3         # 3 when ncols = 6
+        ts_col = example_col_start + 1        # 4
+        box_col = example_col_start + 2       # 5
 
         # -----------------------------
         # 5) Row 1 – slow example
@@ -2411,14 +2486,17 @@ class IMU_cam(ADC_CAM):
             axes[0, ts_col],
             participant=example1_participant,
             speed=example1_speed,
-            title_prefix="Example (FIRST)",
+            title_prefix="Example",
+            show_legend=True,
+            legend_inside=True,
         )
+        axes[0, ts_col].set_yticks([0, 25, 50, 75])
 
         _plot_example_box(
             axes[0, box_col],
             participant=example1_participant,
             speed=example1_speed,
-            title_prefix="Slow trial",
+            title_prefix="30 BPM", 
         )
 
         # -----------------------------
@@ -2432,14 +2510,16 @@ class IMU_cam(ADC_CAM):
             axes[1, ts_col],
             participant=example2_participant,
             speed=example2_speed,
-            title_prefix="Example (FIRST)",
+            title_prefix="Example",
+            show_legend=False,
         )
+        axes[1, ts_col].set_yticks([0, 25, 50])
 
         _plot_example_box(
             axes[1, box_col],
             participant=example2_participant,
             speed=example2_speed,
-            title_prefix="VFast trial",
+            title_prefix="240 BPM", 
         )
 
         # -----------------------------
@@ -2461,19 +2541,25 @@ class IMU_cam(ADC_CAM):
                 y="abs_err_deg",
                 ax=ax,
                 showfliers=False,
+                width=0.35,
+                color=COLOR_FIRST,
+                boxprops=dict(alpha=0.65),
+                whiskerprops=dict(alpha=0.65),
+                capprops=dict(alpha=0.65),
+                medianprops=dict(alpha=0.65),
             )
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
-            ax.set_title(f"FIRST – {label}",
+            ax.set_title(f"{label}",
                          fontsize=title_fontsize,
                          fontweight=title_weight)
-            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
             if i == 0:
-                ax.set_ylabel("|Error| (deg)",
+                ax.set_ylabel("|Error| (°)",
                               fontsize=label_fontsize,
                               fontweight=label_weight)
                 _style_ax(ax)
@@ -2494,15 +2580,19 @@ class IMU_cam(ADC_CAM):
             x=labels_first,
             y=means_first,
             ax=ax_bar_first,
-            color="C0",
+            color=COLOR_FIRST,
+            alpha=0.65,
             errorbar=None,
         )
-        ax_bar_first.set_title("FIRST – mean |error| vs speed",
+        ax_bar_first.set_title("Mean |Error| vs Speed",
                                fontsize=title_fontsize,
                                fontweight=title_weight)
-        ax_bar_first.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_first.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_first.tick_params(axis="x", rotation=30)
+        bpm_labels = [speed_xtick_label_map.get(spd, spd) for spd in speed_order]
+        ax_bar_first.set_xticklabels(bpm_labels, rotation=0)
+        ax_bar_first.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_first.set_ylim(0, 10)
+        ax_bar_first.set_yticks([0, 5, 10])
+        #ax_bar_first.tick_params(axis="x", rotation=30)
         _style_ax(ax_bar_first)
 
         # -----------------------------
@@ -2523,19 +2613,29 @@ class IMU_cam(ADC_CAM):
                 y="abs_err_deg",
                 ax=ax,
                 showfliers=False,
+                width=0.35,
+                color=COLOR_FIRST,            
+                boxprops=dict(alpha=0.65),
+                whiskerprops=dict(alpha=0.65),
+                capprops=dict(alpha=0.65),
+                medianprops=dict(alpha=0.65),
             )
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
-            ax.set_title(f"SECOND – {label}",
+            ax.set_title(f"{label}",
                          fontsize=title_fontsize,
                          fontweight=title_weight)
-            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            # keep only the center column (i == 2) labeled "Participant"
+            if i == 2:
+                ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            else:
+                ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
             if i == 0:
-                ax.set_ylabel("|Error| (deg)",
+                ax.set_ylabel("|Error| (°)",
                               fontsize=label_fontsize,
                               fontweight=label_weight)
                 _style_ax(ax)
@@ -2556,22 +2656,27 @@ class IMU_cam(ADC_CAM):
             x=labels_second,
             y=means_second,
             ax=ax_bar_second,
-            color="C0",
+            color=COLOR_FIRST,
+            alpha=0.65,
             errorbar=None,
         )
-        ax_bar_second.set_title("SECOND – mean |error| vs speed",
+        ax_bar_second.set_title("Mean |Error| vs Speed",
                                 fontsize=title_fontsize,
                                 fontweight=title_weight)
-        ax_bar_second.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_second.set_ylabel("Mean |Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_second.tick_params(axis="x", rotation=30)
+        bpm_labels = [speed_xtick_label_map.get(spd, spd) for spd in speed_order]
+        ax_bar_second.set_xticklabels(bpm_labels, rotation=0)
+        ax_bar_second.set_xlabel("Speed (BPM)", fontsize=label_fontsize, fontweight=label_weight)
+
+
+        ax_bar_second.set_ylabel("", fontsize=label_fontsize, fontweight=label_weight)
+        ax_bar_second.tick_params(axis="x", rotation=0)
         _style_ax(ax_bar_second)
 
         # -----------------------------
         # 9) Layout + base spacing
         # -----------------------------
         fig.tight_layout()
-        fig.subplots_adjust(wspace=boxplot_wspace, hspace=1.0)
+        #fig.subplots_adjust(hspace=1.0)
 
         # -----------------------------
         # 10) Extra gap scaling for first two rows (TS vs boxplot)
@@ -2624,10 +2729,3 @@ class IMU_cam(ADC_CAM):
             ])
 
         return fig, axes
-
-
-
-
-
-
-
