@@ -2375,7 +2375,7 @@ class IMU_cam(ADC_CAM):
 
             sns.lineplot(
                 x=t_plot, y=dlc_angle, ax=ax,
-                label="DLC Wrist",
+                label="Camera \n(CAM) Angle",
                 linewidth=2,
                 color=COLOR_FIRST,
                 alpha=0.65,
@@ -2396,7 +2396,7 @@ class IMU_cam(ADC_CAM):
             bpm_label = speed_xtick_label_map.get(speed, speed)
 
             ax.set_title(
-                f"{title_prefix}: {participant}\n{bpm_label} BPM - Trial {example_trial_idx + 1}",
+                f"{title_prefix}: {participant}\nTrial {example_trial_idx + 1} - {bpm_label} BPM",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2411,6 +2411,7 @@ class IMU_cam(ADC_CAM):
                         ncol=2,            # single row
                         handlelength=1.0,  # shorter color lines
                         borderaxespad=0.2,
+                        bbox_to_anchor=(0.5, 1.125),
                     )
                 else:
                     ax.legend(
@@ -2457,7 +2458,7 @@ class IMU_cam(ADC_CAM):
             ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_ylabel("|Error| (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_title(
-                f"{title_prefix}: \n|DLC-IMU|",
+                f"{title_prefix}: \n|CAM-IMU|",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2584,7 +2585,7 @@ class IMU_cam(ADC_CAM):
             alpha=0.65,
             errorbar=None,
         )
-        ax_bar_first.set_title("Mean |Error| vs Speed",
+        ax_bar_first.set_title("Mean |Error|",
                                fontsize=title_fontsize,
                                fontweight=title_weight)
         bpm_labels = [speed_xtick_label_map.get(spd, spd) for spd in speed_order]
@@ -2660,7 +2661,7 @@ class IMU_cam(ADC_CAM):
             alpha=0.65,
             errorbar=None,
         )
-        ax_bar_second.set_title("Mean |Error| vs Speed",
+        ax_bar_second.set_title("Mean |Error|",
                                 fontsize=title_fontsize,
                                 fontweight=title_weight)
         bpm_labels = [speed_xtick_label_map.get(spd, spd) for spd in speed_order]

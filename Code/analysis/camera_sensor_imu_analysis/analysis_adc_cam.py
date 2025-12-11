@@ -2617,8 +2617,8 @@ class ADC_CAM:
 
             t_plot, dlc_angle, adc_angle, _ = res_ex
 
-            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="DLC Angle", linewidth=2, color=COLOR_FIRST, alpha=0.65)
-            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="ADC Angle", linewidth=2, color=COLOR_SECOND, alpha=0.65)
+            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera \n(CAM) Angle", linewidth=2, color=COLOR_FIRST, alpha=0.65)
+            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor \n(SS) Angle", linewidth=2, color=COLOR_SECOND, alpha=0.65)
 
             # Always show 0–10 s with ticks every 2 s
             ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
@@ -2631,7 +2631,7 @@ class ADC_CAM:
             bpm_label = speed_xtick_label_map.get(speed, speed)
 
             ax.set_title(
-                f"{title_prefix}: {participant}\n{bpm_label} BPM - Trial {trial_idx + 1}",
+                f"{title_prefix}: {participant}\nTrial {trial_idx + 1} - {bpm_label} BPM",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2641,16 +2641,17 @@ class ADC_CAM:
                 if legend_inside:
                     # inside top-left
                     ax.legend(
-                        fontsize=tick_fontsize,
+                        fontsize=8,
                         frameon=False,
                         loc="upper center",
                         ncol=2,           # horizontal
                         handlelength=0.9, # shorter line segments
                         handletextpad=0.4,
                         borderaxespad=0.2,
+                        bbox_to_anchor=(0.5, 1.125),
                     )
                 else:
-                    # outside to the right (old behavior)
+                    # outside to the right (old version)
                     ax.legend(
                         fontsize=tick_fontsize,
                         frameon=False,
@@ -2703,7 +2704,7 @@ class ADC_CAM:
             ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_ylabel("|Error| (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_title(
-                f"{title_prefix}: \n|DLC-ADC|",
+                f"{title_prefix}: \n|CAM-SS|",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2917,7 +2918,7 @@ class ADC_CAM:
         ax_bar_first.set_xticklabels(xtick_labels_first, rotation=0)
 
         ax_bar_first.set_title(
-            "Mean |Error| vs Speed",
+            "Mean |Error|",
             fontsize=title_fontsize,
             fontweight=title_weight,
         )
@@ -3110,7 +3111,7 @@ class ADC_CAM:
         ax_bar_second.set_xticks(x)
         ax_bar_second.set_xticklabels(xtick_labels_second, rotation=0)
         ax_bar_second.set_title(
-            "Mean |Error| vs Speed",
+            "Mean |Error|",
             fontsize=title_fontsize,
             fontweight=title_weight,
         )
