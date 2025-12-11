@@ -2617,8 +2617,8 @@ class ADC_CAM:
 
             t_plot, dlc_angle, adc_angle, _ = res_ex
 
-            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera \n(CAM) Angle", linewidth=2, color=COLOR_FIRST, alpha=0.65)
-            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor \n(SS) Angle", linewidth=2, color=COLOR_SECOND, alpha=0.65)
+            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera\n(CAM) Angle", linewidth=2, color=COLOR_FIRST, alpha=0.65)
+            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor\n(SS) Angle", linewidth=2, color=COLOR_SECOND, alpha=0.65)
 
             # Always show 0–10 s with ticks every 2 s
             ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
@@ -2645,6 +2645,8 @@ class ADC_CAM:
                         frameon=False,
                         loc="upper center",
                         ncol=2,           # horizontal
+                        #columnspacing=0.4,
+                        #labelspacing=0.1,
                         handlelength=0.9, # shorter line segments
                         handletextpad=0.4,
                         borderaxespad=0.2,
