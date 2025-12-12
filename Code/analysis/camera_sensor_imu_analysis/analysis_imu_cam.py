@@ -2375,7 +2375,7 @@ class IMU_cam(ADC_CAM):
 
             sns.lineplot(
                 x=t_plot, y=dlc_angle, ax=ax,
-                label="Camera \n(CAM) Angle",
+                label="Camera (CAM)",
                 linewidth=2,
                 color=COLOR_FIRST,
                 alpha=0.65,
@@ -2405,13 +2405,14 @@ class IMU_cam(ADC_CAM):
             if show_legend:
                 if legend_inside:
                     ax.legend(
-                        fontsize=tick_fontsize,
+                        fontsize=8,
                         frameon=False,
                         loc="upper center",
-                        ncol=2,            # single row
-                        handlelength=1.0,  # shorter color lines
+                        #ncol=2,            # single row
+                        handlelength=0.9,  # shorter color lines
+                        handletextpad=0.4,
                         borderaxespad=0.2,
-                        bbox_to_anchor=(0.5, 1.125),
+                        bbox_to_anchor=(0.25, 1.125),
                     )
                 else:
                     ax.legend(
