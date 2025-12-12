@@ -2617,8 +2617,8 @@ class ADC_CAM:
 
             t_plot, dlc_angle, adc_angle, _ = res_ex
 
-            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera\n(CAM) Angle", linewidth=2, color=COLOR_FIRST, alpha=0.65)
-            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor\n(SS) Angle", linewidth=2, color=COLOR_SECOND, alpha=0.65)
+            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera (CAM)", linewidth=2, color=COLOR_FIRST, alpha=0.65)
+            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor (SS)", linewidth=2, color=COLOR_SECOND, alpha=0.65)
 
             # Always show 0–10 s with ticks every 2 s
             ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
@@ -2644,13 +2644,13 @@ class ADC_CAM:
                         fontsize=8,
                         frameon=False,
                         loc="upper center",
-                        ncol=2,           # horizontal
+                        #ncol=2,           # horizontal
                         #columnspacing=0.4,
                         #labelspacing=0.1,
                         handlelength=0.9, # shorter line segments
                         handletextpad=0.4,
                         borderaxespad=0.2,
-                        bbox_to_anchor=(0.5, 1.125),
+                        bbox_to_anchor=(0.3, 1.125),
                     )
                 else:
                     # outside to the right (old version)
@@ -2878,7 +2878,10 @@ class ADC_CAM:
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
+            # Fig 2
             ax.set_yticks([0, 10, 20, 30])
+            # SUPP stuff
+            #ax.set_yticks([0, 20, 40, 60])
 
             from matplotlib.patches import Patch
 
@@ -2933,8 +2936,11 @@ class ADC_CAM:
         _style_ax(ax_bar_first)                 # applies tick_params(labelsize=tick_fontsize)
         # (optional, redundant but explicit)
         ax_bar_first.tick_params(axis="both", labelsize=tick_fontsize)
+        # # Fig 2
         ax_bar_first.set_ylim(0, 6)
         ax_bar_first.set_yticks([0, 2, 4, 6, 8])
+        # SUPP stuff
+        # ax_bar_first.set_ylim(0, 30)
 
         # -----------------------------
         # 7) Row 4 – SECOND summary (self vs cross)
@@ -3126,6 +3132,8 @@ class ADC_CAM:
         ax_bar_second.tick_params(axis="x", labelsize=tick_fontsize)
         _style_ax(ax_bar_second)
         # ax_bar_second.legend(fontsize=tick_fontsize, frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.05))
+        # SUPP stuff
+        #ax_bar_second.set_ylim(0, 10)
 
         # -----------------------------
         # 8) Layout + base spacing
