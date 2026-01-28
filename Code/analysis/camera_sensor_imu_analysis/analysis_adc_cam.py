@@ -2501,7 +2501,18 @@ class ADC_CAM:
         # -----------------------------
         # 2) Seaborn theme & figure
         # -----------------------------
-        sns.set_theme(style="ticks", context="talk")
+        sns.set_theme(
+            style="ticks",
+            context="talk",
+            rc={
+                "text.color": "black",
+                "axes.labelcolor": "black",
+                "axes.titlecolor": "black",
+                "xtick.color": "black",
+                "ytick.color": "black",
+                "axes.edgecolor": "black",
+            },
+        )
         nrows, ncols = 4, 6
         fig = plt.figure(figsize=figsize)
 
@@ -3070,13 +3081,14 @@ class ADC_CAM:
                 _style_ax(ax)
                 # Add legend INSIDE slow-speed panel (row 4, col 0)
                 handles = [
-                    Patch(facecolor=COLOR_FIRST, edgecolor=COLOR_FIRST, alpha=0.65, label="self"),
-                    Patch(facecolor=COLOR_SECOND, edgecolor=COLOR_SECOND, alpha=0.65, label="xtrain"),
+                    Patch(facecolor=COLOR_FIRST, edgecolor=COLOR_FIRST, alpha=0.65, label="Self-Trained Model i"),
+                    Patch(facecolor=COLOR_SECOND, edgecolor=COLOR_SECOND, alpha=0.65, label="Model 1"),
                 ]
-                ax.legend(
+                leg = ax.legend(
                     handles=handles,
-                    loc="upper left",   # or "upper left" if you prefer
-                    frameon=False,
+                    loc="upper left",   
+                    bbox_to_anchor=(0.02, 0.98), #maybe 
+                    frameon=True, # white box
                     fontsize=tick_fontsize,
                     handlelength=0.8,   # shorter color blocks
                     handleheight=0.6,   # less tall
@@ -3084,6 +3096,18 @@ class ADC_CAM:
                     labelspacing=0.3,   # less space between entries
                     handletextpad=0.4,  # space between block and text
                 )
+                # style the box
+                frame = leg.get_frame()
+                frame.set_facecolor("white")
+                frame.set_edgecolor("white")   # or "0.8" for a light gray border
+                frame.set_alpha(1.0)           # 1.0 = fully opaque
+
+                leg.set_in_layout(False)   # so tight_layout doesn't try to "fix" it
+                leg.set_clip_on(False)     # allow drawing outside the axes
+
+                # IMPORTANT: ensure this subplot draws above the next one (so the legend can overlap it)
+                ax.set_zorder(10)
+                axes[3, 1].set_zorder(1)   # the neighbor to the right (optional but helps)
             else:
                 ax.set_ylabel("")
                 _style_ax(ax)
@@ -3108,11 +3132,11 @@ class ADC_CAM:
 
         ax_bar_second.bar(
             x - width / 2, means_second_self,
-            width=width, color=COLOR_FIRST, alpha = 0.65, label="self",
+            width=width, color=COLOR_FIRST, alpha = 0.65, label="Self-Trained Model i",
         )
         ax_bar_second.bar(
             x + width / 2, means_second_cross,
-            width=width, color=COLOR_SECOND, alpha = 0.65, label="xtrain",
+            width=width, color=COLOR_SECOND, alpha = 0.65, label="Model 1",
         )
 
         xtick_labels_second = [speed_xtick_label_map[spd] for spd in speed_order]
