@@ -2802,6 +2802,18 @@ class ADC_CAM:
             means_first.append(sub.mean() if not sub.empty else np.nan)
             labels_first.append(speed_titles.get(spd, spd) if speed_titles else spd)
 
+        # ---- NEW: FIRST application bar stats (mean ± std across speeds)
+        first_vals = np.array(means_first, dtype=float)
+        first_vals = first_vals[np.isfinite(first_vals)]
+
+        first_mean = first_vals.mean()
+        first_std = first_vals.std(ddof=1) if len(first_vals) > 1 else 0.0
+
+        print(
+            f"[FIRST application] bar means across speeds: "
+            f"mean = {first_mean:.2f} deg, std = {first_std:.2f} deg"
+        )
+
         sns.barplot(
             x=labels_first,
             y=means_first,
@@ -2884,6 +2896,32 @@ class ADC_CAM:
             means_second_self.append(sub_self.mean() if not sub_self.empty else np.nan)
             means_second_cross.append(sub_cross.mean() if not sub_cross.empty else np.nan)
             labels_second.append(speed_titles.get(spd, spd) if speed_titles else spd)
+
+        # ---- NEW: SECOND application bar stats (mean ± std across speeds)
+
+        # self-trained (blue)
+        second_self_vals = np.array(means_second_self, dtype=float)
+        second_self_vals = second_self_vals[np.isfinite(second_self_vals)]
+
+        second_self_mean = second_self_vals.mean()
+        second_self_std = second_self_vals.std(ddof=1) if len(second_self_vals) > 1 else 0.0
+
+        # cross-trained (red)
+        second_cross_vals = np.array(means_second_cross, dtype=float)
+        second_cross_vals = second_cross_vals[np.isfinite(second_cross_vals)]
+
+        second_cross_mean = second_cross_vals.mean()
+        second_cross_std = second_cross_vals.std(ddof=1) if len(second_cross_vals) > 1 else 0.0
+
+        print(
+            f"[SECOND application – self] bar means across speeds: "
+            f"mean = {second_self_mean:.2f} deg, std = {second_self_std:.2f} deg"
+        )
+
+        print(
+            f"[SECOND application – cross] bar means across speeds: "
+            f"mean = {second_cross_mean:.2f} deg, std = {second_cross_std:.2f} deg"
+        )
 
         x = np.arange(len(speed_order))
         width = 0.35
