@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from typing import Optional
 from analysis import DLC3DBendAngles # class for taking DLC 3d point data and converting to angles
 import seaborn as sns
+COLOR_FIRST = "#4C72B0"   # blue
+COLOR_SECOND = "#DD8452"  # orange
 
 
 class ADC_CAM:
@@ -466,7 +468,7 @@ class ADC_CAM:
 
         # 3. Plot, if requested
         if make_plot and not calib_df.empty:
-            fig, ax = plt.subplots(figsize=(8, 5))
+            fig, ax = plt.subplots(figsize=(8.5, 6))
 
             if plot_all_data and all_samples:
                 # scatter all ADC samples
@@ -534,7 +536,7 @@ class ADC_CAM:
                         )
 
             ax.set_xlabel("Calibration Angle (deg, snapped)")
-            ax.set_ylabel("ADC value" if plot_all_data else "Mean ADC value")
+            ax.set_ylabel("ADC value" if plot_all_data else "Mean ADC Value")
             ax.set_title("ADC Calibration by Set")
 
             present = sorted(
@@ -1681,8 +1683,8 @@ class ADC_CAM:
                         label="max |Δ|",
                     )
 
-                plt.xlabel("Scaled time (0–10 s)")
-                plt.ylabel("Angle (deg)")
+                plt.xlabel("Scaled time (0-10 s)")
+                plt.ylabel("Angle (°)")
                 plt.title(
                     f"{set_name} trial {idx + 1}: DLC vs ADC MCP (RMSE-optimal shift)"
                 )
@@ -1826,14 +1828,16 @@ class ADC_CAM:
             labels=labels,
             showfliers=False,  # no black circles
             patch_artist=True,  # enable facecolor
+            widths=0.3, 
         )
 
         # Color boxes: both blue-ish, slightly different shades
-        colors = ["C0", "C1"]
+        colors = [COLOR_FIRST, COLOR_SECOND]
         for box, color in zip(bp["boxes"], colors[: len(bp["boxes"])]):
             box.set_facecolor(color)
+            box.set_alpha(0.65)
 
-        plt.ylabel("Absolute error |DLC - ADC| (deg)")
+        plt.ylabel("Absolute error |DLC - ADC| (°)")
         plt.title("Absolute error comparison between sets")
         plt.grid(axis="y", alpha=0.4)
         plt.tight_layout()
@@ -2358,13 +2362,13 @@ class ADC_CAM:
             calib_df=None,
             calib_set_label: int = 2,  # 1 = FIRST (blue), 2 = SECOND (orange)
             example_col_start: int = 1,
-            calib_x_shift: float = 0.03,  # shift calib panel to the right
-            figsize: tuple[float, float] = (20, 12),
-            title_fontsize: int = 14,
-            label_fontsize: int = 12,
-            tick_fontsize: int = 10,
+            calib_x_shift: float = 0.0,  # shift calib panel to the right # layout edit
+            figsize: tuple[float, float] = (8.5, 8), # (20,12)
+            title_fontsize: int = 12,
+            label_fontsize: int = 10,
+            tick_fontsize: int = 9,
             title_weight: str = "bold",
-            label_weight: str = "bold",
+            label_weight: str = "normal",
             # global y-limit (fallback)
             abs_err_ylim: tuple[float, float] | None = None,
             # separate tuners
@@ -2408,6 +2412,14 @@ class ADC_CAM:
         # 1) Build tall DataFrame of abs errors (incl. SECOND-cross)
         # -----------------------------
         records = []
+
+        speed_xtick_label_map = {
+            "slow": "30",
+            "medm": "60",
+            "fast": "120",
+            "vfas": "240",
+            "afap": "AFAP",
+        }
 
         for (pname, speed), res in results_adc.items():
             if res is None:
@@ -2489,9 +2501,56 @@ class ADC_CAM:
         # -----------------------------
         # 2) Seaborn theme & figure
         # -----------------------------
-        sns.set_theme(style="ticks", context="talk")
+        sns.set_theme(
+            style="ticks",
+            context="talk",
+            rc={
+                "text.color": "black",
+                "axes.labelcolor": "black",
+                "axes.titlecolor": "black",
+                "xtick.color": "black",
+                "ytick.color": "black",
+                "axes.edgecolor": "black",
+            },
+        )
         nrows, ncols = 4, 6
-        fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+        fig = plt.figure(figsize=figsize)
+
+        # Outer 2×1 grid: top block (rows 0–1), bottom block (rows 2–3)
+        outer_gs = fig.add_gridspec(
+            2, 1,
+            height_ratios=[1, 1],
+            hspace=0.4,  # vertical space between top and bottom blocks
+        )
+
+        # Top: rows 0–1 with their own width_ratios
+        top_gs = outer_gs[0].subgridspec(
+            2, 6,
+            width_ratios=[0.8, 0.8, 0.8, 0.2, 1.5, 0.4],
+            wspace=boxplot_wspace,
+            hspace=1.6,
+        )
+
+        # Bottom: rows 2–3 with different width_ratios
+        bottom_gs = outer_gs[1].subgridspec(
+            2, 6,
+            width_ratios=[0.8, 0.8, 0.8, 0.8, 0.8, 1.4],
+            wspace=boxplot_wspace,
+            hspace=1,
+        )
+
+        # Build a 4×6 axes array to keep the rest of your code unchanged
+        axes = np.empty((4, 6), dtype=object)
+
+        # Fill rows 0–1 from top_gs
+        for r in range(2):
+            for c in range(6):
+                axes[r, c] = fig.add_subplot(top_gs[r, c])
+
+        # Fill rows 2–3 from bottom_gs
+        for r in range(2):
+            for c in range(6):
+                axes[r + 2, c] = fig.add_subplot(bottom_gs[r, c])
 
         def _style_ax(ax):
             sns.despine(ax=ax, top=True, right=True)
@@ -2499,11 +2558,13 @@ class ADC_CAM:
             ax.tick_params(labelsize=tick_fontsize)
 
         def _hide_y_axis(ax):
-            ax.yaxis.set_visible(False)
-            ax.tick_params(axis="y", left=False, labelleft=False)
-            for side in ("left", "right"):
-                if side in ax.spines:
-                    ax.spines[side].set_visible(False)
+            # ax.yaxis.set_visible(False)
+            # ax.tick_params(axis="y", left=False, labelleft=False)
+            # for side in ("left", "right"):
+            #     if side in ax.spines:
+            #         ax.spines[side].set_visible(False)
+            ax.tick_params(axis="y", labelleft=False)  # hide text
+            ax.tick_params(axis="y", left=False)        # keep tick marks
 
         # -----------------------------
         # Helpers for example rows (use explicit DataFrames)
@@ -2552,6 +2613,8 @@ class ADC_CAM:
                 speed,
                 trial_idx,
                 title_prefix,
+                show_legend: bool = True,
+                legend_inside: bool = False,
         ):
             res_ex = _get_example_from_df(df_ex)
             if res_ex is None:
@@ -2565,29 +2628,52 @@ class ADC_CAM:
 
             t_plot, dlc_angle, adc_angle, _ = res_ex
 
-            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="DLC angle", linewidth=2)
-            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="ADC angle", linewidth=2)
+            sns.lineplot(x=t_plot, y=dlc_angle, ax=ax, label="Camera (CAM)", linewidth=2, color=COLOR_FIRST, alpha=0.65)
+            sns.lineplot(x=t_plot, y=adc_angle, ax=ax, label="Strain Sensor (SS)", linewidth=2, color=COLOR_SECOND, alpha=0.65)
 
             # Always show 0–10 s with ticks every 2 s
             ax.set_xlabel("Time (s)", fontsize=label_fontsize, fontweight=label_weight)
-            ax.set_ylabel("Angle (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("Angle (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_xlim(0.0, 10.0)
             ax.set_xticks(np.arange(0, 10.01, 2.0))
 
+            bpm_label = speed_xtick_label_map.get(speed, speed)
+
+            bpm_label = speed_xtick_label_map.get(speed, speed)
+
             ax.set_title(
-                f"{title_prefix}: {participant} {speed}, trial {trial_idx + 1}",
+                f"{title_prefix}: {participant}\nTrial {trial_idx + 1} - {bpm_label} BPM",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
             _style_ax(ax)
 
-            ax.legend(
-                fontsize=tick_fontsize,
-                frameon=False,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
-            )
+            if show_legend:
+                if legend_inside:
+                    # inside top-left
+                    ax.legend(
+                        fontsize=8,
+                        frameon=False,
+                        loc="upper center",
+                        #ncol=2,           # horizontal
+                        #columnspacing=0.4,
+                        #labelspacing=0.1,
+                        handlelength=0.9, # shorter line segments
+                        handletextpad=0.4,
+                        borderaxespad=0.2,
+                        bbox_to_anchor=(0.3, 1.125),
+                    )
+                else:
+                    # outside to the right (old version)
+                    ax.legend(
+                        fontsize=tick_fontsize,
+                        frameon=False,
+                        loc="upper left",
+                        bbox_to_anchor=(1.02, 1.0),
+                        borderaxespad=0.0,
+                    )
+            else: 
+                ax.get_legend().remove()
 
         def _plot_example_box(
                 ax,
@@ -2621,11 +2707,17 @@ class ADC_CAM:
                 y="abs_err_deg",
                 ax=ax,
                 showfliers=False,
+                width=0.2,      # skinnier box
+                color=COLOR_FIRST,
+                boxprops=dict(alpha=0.65),
+                whiskerprops=dict(alpha=0.65),
+                capprops=dict(alpha=0.65),
+                medianprops=dict(alpha=0.65),
             )
             ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
-            ax.set_ylabel("|Error| (deg)", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_ylabel("|Error| (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_title(
-                f"{title_prefix}: |DLC–ADC|",
+                f"{title_prefix}: \n|CAM-SS|",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2639,16 +2731,12 @@ class ADC_CAM:
         # -----------------------------
         # 3) Column positions (shift examples right)
         # -----------------------------
-        if example_col_start < 0:
-            example_col_start = 0
-        if example_col_start > ncols - 3:
-            example_col_start = ncols - 3
+        # layout edit
+        example_col_start = ncols - 4  # this will be 2 when ncols = 6
 
-        ts_col = example_col_start + 1
-        box_col = example_col_start + 2
-
-        # fixed calibration panel column in row 1 (0-based: 1 => 2nd column)
-        calib_col = 1
+        calib_col = example_col_start - 1       # 3
+        ts_col    = example_col_start + 2     # 4
+        box_col   = example_col_start + 3     # 5
 
         # -----------------------------
         # 4) Row 1 – calibration + example 1
@@ -2682,24 +2770,30 @@ class ADC_CAM:
                     sub["angle_snap_deg"].to_numpy(),
                     sub["adc_mean"].to_numpy(),
                     s=30,
-                    color="C0",  # FIRST / blue
+                    color=COLOR_FIRST,  # FIRST / blue
+                    alpha = 0.65
                 )
                 ax_cal.set_xlabel(
-                    "Calibration angle (deg)",
+                    "Calibration Angle (°)",
                     fontsize=label_fontsize,
                     fontweight=label_weight,
                 )
                 ax_cal.set_ylabel(
-                    "Mean ADC value",
+                    "Mean ADC Value",
                     fontsize=label_fontsize,
                     fontweight=label_weight,
                 )
                 ax_cal.set_title(
-                    "FIRST application calib (P3)",
+                    "1st App Calibration (P3)",
                     fontsize=title_fontsize,
                     fontweight=title_weight,
                 )
                 _style_ax(ax_cal)
+
+                # Tweak scientific-notation offset text on y-axis
+                offset = ax_cal.yaxis.get_offset_text()
+                offset.set_fontsize(tick_fontsize)   # match y-tick label size
+                offset.set_x(-0.25)                  # nudge left (tune as needed)
             else:
                 ax_cal.axis("off")
         else:
@@ -2707,24 +2801,28 @@ class ADC_CAM:
 
         # --- Example 1 time-series in shifted column ---
         _plot_example_timeseries(
-            axes[0, ts_col],
+            axes[0, ts_col], # layout edit
             df_ex=example1_df,
             participant=example1_participant,
             speed=example1_speed,
             trial_idx=example1_trial_idx,
             title_prefix="Example",
+            show_legend=True,
+            legend_inside=True, 
         )
+        axes[0, ts_col].set_yticks([0, 30, 60, 90])
 
         # --- Example 1 error boxplot ---
         _plot_example_box(
-            axes[0, box_col],
+            axes[0, box_col], # layout edit
             df_ex=example1_df,
             participant=example1_participant,
             speed=example1_speed,
             trial_idx=example1_trial_idx,
-            title_prefix="Trial 1",
+            title_prefix="30 BPM",
         )
 
+        # layout edit
         # -----------------------------
         # 5) Row 2 – example 2 (uses example2_df)
         # -----------------------------
@@ -2733,21 +2831,23 @@ class ADC_CAM:
                 axes[1, j].axis("off")
 
         _plot_example_timeseries(
-            axes[1, ts_col],
+            axes[1, ts_col], # layout edit
             df_ex=example2_df,
             participant=example2_participant,
             speed=example2_speed,
             trial_idx=example2_trial_idx,
             title_prefix="Example",
+            show_legend=False,
         )
+        axes[1, ts_col].set_yticks([0, 25, 50])
 
         _plot_example_box(
-            axes[1, box_col],
+            axes[1, box_col], # layout edit
             df_ex=example2_df,
             participant=example2_participant,
             speed=example2_speed,
             trial_idx=example2_trial_idx,
-            title_prefix="Trial 2",
+            title_prefix="240 BPM",
         )
 
         # -----------------------------
@@ -2757,7 +2857,7 @@ class ADC_CAM:
         ylim_sum = abs_err_ylim_summary or abs_err_ylim
 
         for i, spd in enumerate(speed_order[:5]):
-            ax = axes[2, i]
+            ax = axes[2, i] # layout edit
             sub = df_first[df_first["speed"] == spd]
             if sub.empty:
                 ax.axis("off")
@@ -2769,38 +2869,55 @@ class ADC_CAM:
                 y="abs_err_deg",
                 ax=ax,
                 showfliers=False,
+                width=0.35,         # skinnier
+                color=COLOR_FIRST,  # blue
+                boxprops=dict(alpha=0.65),
+                whiskerprops=dict(alpha=0.65),
+                capprops=dict(alpha=0.65),
+                medianprops=dict(alpha=0.65),
             )
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
             ax.set_title(
-                f"FIRST – {label}",
+                f"{label}",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
-            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            #ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
+            # Fig 2
+            ax.set_yticks([0, 10, 20, 30])
+            # SUPP stuff
+            #ax.set_yticks([0, 20, 40, 60])
+
+            from matplotlib.patches import Patch
+
             if i == 0:
                 ax.set_ylabel(
-                    "|Error| (deg)",
+                    "|Error| (°)",
                     fontsize=label_fontsize,
                     fontweight=label_weight,
                 )
                 _style_ax(ax)
+
             else:
                 ax.set_ylabel("")
                 _style_ax(ax)
                 _hide_y_axis(ax)
 
-        ax_bar_first = axes[2, ncols - 1]
+        ax_bar_first = axes[2, ncols - 1] # layout edit
         means_first = []
-        labels_first = []
+        #labels_first = []
         for spd in speed_order:
             sub = df_first[df_first["speed"] == spd]["abs_err_deg"]
             means_first.append(sub.mean() if not sub.empty else np.nan)
-            labels_first.append(speed_titles.get(spd, spd) if speed_titles else spd)
+            #labels_first.append(speed_titles.get(spd, spd) if speed_titles else spd)
+
+        x = np.arange(len(speed_order))
 
         # ---- NEW: FIRST application bar stats (mean ± std across speeds)
         first_vals = np.array(means_first, dtype=float)
@@ -2815,75 +2932,200 @@ class ADC_CAM:
         )
 
         sns.barplot(
-            x=labels_first,
+            x=x,
             y=means_first,
             ax=ax_bar_first,
-            color="C0",
+            color=COLOR_FIRST,
+            alpha = 0.65,
             errorbar=None,
         )
+
+        # Map speeds -> desired tick labels
+        xtick_labels_first = [speed_xtick_label_map[spd] for spd in speed_order]
+        ax_bar_first.set_xticks(x)
+        ax_bar_first.set_xticklabels(xtick_labels_first, rotation=0)
+
         ax_bar_first.set_title(
-            "FIRST – mean |error| vs speed",
+            "Mean |Error|",
             fontsize=title_fontsize,
             fontweight=title_weight,
         )
-        ax_bar_first.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_first.set_ylabel(
-            "Mean |Error| (deg)",
-            fontsize=label_fontsize,
-            fontweight=label_weight,
-        )
-        ax_bar_first.tick_params(axis="x", rotation=30)
-        _style_ax(ax_bar_first)
+        ax_bar_first.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
+        # ax_bar_first.set_ylabel(
+        #     "Mean |Error| (°)",
+        #     fontsize=label_fontsize,
+        #     fontweight=label_weight,
+        # )
+        _style_ax(ax_bar_first)                 # applies tick_params(labelsize=tick_fontsize)
+        # (optional, redundant but explicit)
+        ax_bar_first.tick_params(axis="both", labelsize=tick_fontsize)
+        # # Fig 2
+        ax_bar_first.set_ylim(0, 6)
+        ax_bar_first.set_yticks([0, 2, 4, 6, 8])
+        # SUPP stuff
+        # ax_bar_first.set_ylim(0, 30)
 
         # -----------------------------
         # 7) Row 4 – SECOND summary (self vs cross)
         # -----------------------------
         df_second = df[df["set"] == "SECOND"]
 
+        # spacing knobs
+        box_width = 0.25
+        paired_offset = 0.30
+        intra_group_spacing = 0.55
+        gap_between_groups = 0.2
+
         for i, spd in enumerate(speed_order[:5]):
-            ax = axes[3, i]
+            ax = axes[3, i] # layout edit
             sub = df_second[df_second["speed"] == spd]
             if sub.empty:
                 ax.axis("off")
                 continue
 
-            sns.boxplot(
-                data=sub,
-                x="participant",
-                y="abs_err_deg",
-                hue="calib",
-                ax=ax,
+            # participants in this speed, sorted
+            participants = sorted(sub["participant"].unique())
+
+            data_list = []   # one entry per box
+            positions = []   # x-position for each box
+            colors = []      # COLOR_FIRST / COLOR_SECOND for each box
+            centers = []     # center x of each participant group
+
+            for j, p in enumerate(participants):
+                center = j * (intra_group_spacing + gap_between_groups)
+                centers.append(center)
+
+                for calib, sign, color in [
+                    ("self", -1, COLOR_FIRST),
+                    ("cross", +1, COLOR_SECOND),
+                ]:
+                    vals = sub[
+                        (sub["participant"] == p) & (sub["calib"] == calib)
+                    ]["abs_err_deg"].to_numpy()
+
+                    if vals.size == 0:
+                        continue  # skip if no data for this calib/participant
+
+                    pos = center + sign * (paired_offset / 2.0)
+                    positions.append(pos)
+                    data_list.append(vals)
+                    colors.append(color)
+
+            # draw the boxes at explicit positions
+            bp = ax.boxplot(
+                data_list,
+                positions=positions,
+                widths=box_width,
                 showfliers=False,
-                palette={"self": "C0", "cross": "C3"},
+                patch_artist=True,
             )
 
-            if ax.get_legend() is not None:
-                ax.get_legend().remove()
+            # color + alpha
+            for box, color in zip(bp["boxes"], colors):
+                box.set_facecolor(color)
+                box.set_edgecolor(color)
+                box.set_alpha(0.65)
+
+            for item in bp["whiskers"] + bp["caps"]:
+                item.set_alpha(0.65)
+
+            for med in bp["medians"]:
+                med.set_color("black")
+                #med.set_linewidth(1)
+                med.set_alpha(0.65)
+
+            # x-ticks at group centers labeled by participant
+            ax.set_xticks(centers)
+            ax.set_xticklabels(participants, fontsize=tick_fontsize)
+
+            # tighten x-limits around first/last groups
+            if centers:
+                padding = box_width + gap_between_groups / 2.0
+                ax.set_xlim(centers[0] - padding, centers[-1] + padding)
+
+ 
+            # sns.boxplot(
+            #     data=sub,
+            #     x="participant",
+            #     y="abs_err_deg",
+            #     hue="calib",
+            #     ax=ax,
+            #     showfliers=False,
+            #     width=0.35,  # skinnier
+            #     linewidth=1.4,
+            #     palette={"self": COLOR_FIRST, "cross": COLOR_SECOND},
+            #     boxprops=dict(alpha=0.65), 
+            #     whiskerprops=dict(alpha=0.65),
+            #     capprops=dict(alpha=0.65),
+            #     medianprops=dict(alpha=0.65),
+            # )
+
+            # # reduce outer whitespace between the first/last participants and axis edges
+            # ax.margins(x=0.05)
+
+            # if ax.get_legend() is not None:
+            #     ax.get_legend().remove()
 
             label = speed_titles.get(spd, spd) if speed_titles else spd
             ax.set_title(
-                f"SECOND – {label}",
+                f"{label}",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
-            ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            #ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            if i == 2:
+                ax.set_xlabel("Participant", fontsize=label_fontsize, fontweight=label_weight)
+            else:
+                ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
 
             if ylim_sum is not None:
                 ax.set_ylim(ylim_sum)
 
+            ax.set_yticks([0, 10, 20, 30])
+
+
             if i == 0:
                 ax.set_ylabel(
-                    "|Error| (deg)",
+                    "|Error| (°)",
                     fontsize=label_fontsize,
                     fontweight=label_weight,
                 )
                 _style_ax(ax)
+                # Add legend INSIDE slow-speed panel (row 4, col 0)
+                handles = [
+                    Patch(facecolor=COLOR_FIRST, edgecolor=COLOR_FIRST, alpha=0.65, label="Self-Trained Model i"),
+                    Patch(facecolor=COLOR_SECOND, edgecolor=COLOR_SECOND, alpha=0.65, label="Model 1"),
+                ]
+                leg = ax.legend(
+                    handles=handles,
+                    loc="upper left",   
+                    bbox_to_anchor=(0.02, 0.98), #maybe 
+                    frameon=True, # white box
+                    fontsize=tick_fontsize,
+                    handlelength=0.8,   # shorter color blocks
+                    handleheight=0.6,   # less tall
+                    borderpad=0.2,      # tighter box padding
+                    labelspacing=0.3,   # less space between entries
+                    handletextpad=0.4,  # space between block and text
+                )
+                # style the box
+                frame = leg.get_frame()
+                frame.set_facecolor("white")
+                frame.set_edgecolor("white")   # or "0.8" for a light gray border
+                frame.set_alpha(1.0)           # 1.0 = fully opaque
+
+                leg.set_in_layout(False)   # so tight_layout doesn't try to "fix" it
+                leg.set_clip_on(False)     # allow drawing outside the axes
+
+                # IMPORTANT: ensure this subplot draws above the next one (so the legend can overlap it)
+                ax.set_zorder(10)
+                axes[3, 1].set_zorder(1)   # the neighbor to the right (optional but helps)
             else:
                 ax.set_ylabel("")
                 _style_ax(ax)
                 _hide_y_axis(ax)
 
-        ax_bar_second = axes[3, ncols - 1]
+        ax_bar_second = axes[3, ncols - 1] # layout edit
         means_second_self = []
         means_second_cross = []
         labels_second = []
@@ -2928,35 +3170,38 @@ class ADC_CAM:
 
         ax_bar_second.bar(
             x - width / 2, means_second_self,
-            width=width, color="C0", label="self",
+            width=width, color=COLOR_FIRST, alpha = 0.65, label="Self-Trained Model i",
         )
         ax_bar_second.bar(
             x + width / 2, means_second_cross,
-            width=width, color="C3", label="xtrain",
+            width=width, color=COLOR_SECOND, alpha = 0.65, label="Model 1",
         )
 
+        xtick_labels_second = [speed_xtick_label_map[spd] for spd in speed_order]
         ax_bar_second.set_xticks(x)
-        ax_bar_second.set_xticklabels(labels_second, rotation=30)
+        ax_bar_second.set_xticklabels(xtick_labels_second, rotation=0)
         ax_bar_second.set_title(
-            "SECOND – mean |error| vs speed",
+            "Mean |Error|",
             fontsize=title_fontsize,
             fontweight=title_weight,
         )
-        ax_bar_second.set_xlabel("Speed", fontsize=label_fontsize, fontweight=label_weight)
-        ax_bar_second.set_ylabel(
-            "Mean |Error| (deg)",
-            fontsize=label_fontsize,
-            fontweight=label_weight,
-        )
+        ax_bar_second.set_xlabel("Speed (BPM)", fontsize=label_fontsize, fontweight=label_weight)
+        # ax_bar_second.set_ylabel(
+        #     "Mean |Error| (°)",
+        #     fontsize=label_fontsize,
+        #     fontweight=label_weight,
+        # )
         ax_bar_second.tick_params(axis="x", labelsize=tick_fontsize)
         _style_ax(ax_bar_second)
-        ax_bar_second.legend(fontsize=tick_fontsize, frameon=False)
+        # ax_bar_second.legend(fontsize=tick_fontsize, frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.05))
+        # SUPP stuff
+        #ax_bar_second.set_ylim(0, 10)
 
         # -----------------------------
         # 8) Layout + base spacing
         # -----------------------------
         fig.tight_layout()
-        fig.subplots_adjust(wspace=boxplot_wspace, hspace=1.0)
+        fig.subplots_adjust(hspace=0.8) #wspace=boxplot_wspace, 
 
         # -----------------------------
         # 8b) Optional: shift calibration plot to the right
@@ -2971,6 +3216,7 @@ class ADC_CAM:
                 pos.height,
             ])
 
+        # layout edit
         # -----------------------------
         # 9) Extra gap scaling for first two rows (TS vs box)
         # -----------------------------
@@ -3000,7 +3246,7 @@ class ADC_CAM:
         # -----------------------------
         # 10) Force bar plots to be bar_gap_from_afap away from AFAP boxplots
         # -----------------------------
-        for row_idx in (2, 3):
+        for row_idx in (2, 3): # layout edit
             afap_ax = axes[row_idx, ncols - 2]
             bar_ax = axes[row_idx, ncols - 1]
 
@@ -3019,20 +3265,3 @@ class ADC_CAM:
             ])
 
         return fig, axes
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
