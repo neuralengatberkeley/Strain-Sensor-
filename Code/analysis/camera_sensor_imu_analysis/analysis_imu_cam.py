@@ -857,63 +857,41 @@ class IMU_cam(ADC_CAM):
             speed_tag: str,
             *,
             path_to_repo: str,
-            time_unit: str = "ns",  # IMU 'timestamp' in ns, to match DLC side
+            time_unit: str = "ns",
             align_tolerance: str = "200ms",
             max_lag_samples: int = 5,
-            trial_indices_first: Optional[Sequence[int]] = None,
-            trial_indices_second: Optional[Sequence[int]] = None,
+            trial_indices_first=None,
+            trial_indices_second=None,
             min_dlc_likelihood: float = 0.9,
-            dlc_bodyparts: Sequence[str] = ("MCP", "PIP", "hand"),
+            dlc_bodyparts=("MCP", "PIP", "hand"),
 
-            # IMU orientation & angle naming
-            imu_quat_cols: Tuple[str, str] = ("euler1", "euler2"),
+            imu_quat_cols=("euler1", "euler2"),
             imu_fixed_axis: str = "y",
             imu_moving_axis: str = "y",
             imu_quat_order: str = "wxyz",
 
-            # Which scalar IMU angle to use (e.g. 'imu_azimuth_deg' or 'imu_bend_deg')
             imu_angle_col: str = "imu_azimuth_deg",
-
-            # Time column in IMU CSV used for alignment (keep 'timestamp' in ns)
             imu_time_col: str = "timestamp",
 
-            # Windowed zero-baseline options
             imu_zero_window_n: int = 40,
             imu_zero_window_use_median: bool = True,
             imu_zero_window_abs: bool = True,
 
-            # Jump filtering in IMU angle BEFORE alignment (deg). If None, skip.
-            imu_jump_max_delta_deg: Optional[float] = 5.0,
+            imu_jump_max_delta_deg: float | None = 5.0,
+            imu_max_angle_deg: float | None = 90.0,
 
-            # Hard cap on aligned IMU angle (deg). If None, skip.
-            imu_max_angle_deg: Optional[float] = 90.0,
-    ) -> Dict[str, Any]:
-        """
-        IMU↔DLC pipeline for a scalar IMU angle (e.g. wrist azimuth) using the
-        bend/pitch/azimuth computation in the wrist frame.
-
-        Steps
-        -----
-          1. Discover imu1_/imu2_ trials (first/second).
-          2. Compute IMU bend/pitch/azimuth via compute_imu_bend_pitch_azimuth_*.
-             - The column imu_angle_col (e.g. 'imu_azimuth_deg') is filled.
-          3. Optional: filter out big sample-to-sample jumps in imu_angle_col.
-          4. Windowed zero-baseline imu_angle_col + optional abs().
-          5. DLC → wrist bend angles + trigger timestamps.
-          6. Align DLC wrist vs IMU angle using imu_time_col and 'cam_timestamp'.
-          7. Optional: drop aligned IMU samples whose angle exceeds imu_max_angle_deg.
-          8. refine_alignment_by_rmse_for_set with do_refine=False.
-          9. Collect |DLC wrist - IMU angle| distributions.
-
-        Notes
-        -----
-        - Typically imu_angle_col='imu_azimuth_deg' for azimuth, or 'imu_bend_deg'
-          for pure flexion.
-        """
-
-        # ----------------------------------------------------------------
-        # 1) Build IMU_cam + load trials (imu1_/imu2_)
-        # ----------------------------------------------------------------
+            # NEW:
+            motion_only: bool = False,
+            motion_baseline_n: int = 30,
+            motion_std_window: int = 15,
+            motion_std_thresh_deg: float = 0.75,
+            motion_slope_window: int = 7,
+            motion_slope_thresh_deg_per_sample: float = 0.05,
+            motion_consec: int = 5,
+            motion_keep_pre: int = 0,
+            motion_keep_if_no_motion: bool = False,
+    ):
+        # --- everything up through refined_first/refined_second is unchanged ---
         cam = IMU_cam(
             root_dir=root_dir,
             path_to_repo=path_to_repo,
@@ -937,29 +915,9 @@ class IMU_cam(ADC_CAM):
                 "refined_second": [],
             }
 
-        # ----------------------------------------------------------------
-        # 2) IMU bend/pitch/azimuth in wrist frame
-        # ----------------------------------------------------------------
         TRIAL_LEN_SEC = 10.0
 
-        # We compute all three but store the scalar we care about in imu_angle_col.
-        aug_imu_first, imu_tall_first = cam.compute_imu_bend_pitch_azimuth_first(
-            quat_cols=imu_quat_cols,
-            fixed_axis=imu_fixed_axis,
-            moving_axis=imu_moving_axis,
-            plane_normal_axis="z",
-            quat_order=imu_quat_order,
-            bend_col="imu_bend_deg",
-            pitch_col="imu_pitch_deg",
-            azim_col=imu_angle_col,  # <--- this is the one we'll track
-            time_col=imu_time_col,  # <--- keep the IMU's 'timestamp'
-            trial_len_sec=TRIAL_LEN_SEC,
-            zero_baseline_bend=False,
-            zero_baseline_pitch=False,
-            zero_baseline_azim=False,
-        )
-
-        aug_imu_second, imu_tall_second = cam.compute_imu_bend_pitch_azimuth_second(
+        aug_imu_first, _ = cam.compute_imu_bend_pitch_azimuth_first(
             quat_cols=imu_quat_cols,
             fixed_axis=imu_fixed_axis,
             moving_axis=imu_moving_axis,
@@ -975,26 +933,30 @@ class IMU_cam(ADC_CAM):
             zero_baseline_azim=False,
         )
 
-        # ----------------------------------------------------------------
-        # 2b) Optional: filter out large sample-to-sample jumps in imu_angle_col
-        # ----------------------------------------------------------------
+        aug_imu_second, _ = cam.compute_imu_bend_pitch_azimuth_second(
+            quat_cols=imu_quat_cols,
+            fixed_axis=imu_fixed_axis,
+            moving_axis=imu_moving_axis,
+            plane_normal_axis="z",
+            quat_order=imu_quat_order,
+            bend_col="imu_bend_deg",
+            pitch_col="imu_pitch_deg",
+            azim_col=imu_angle_col,
+            time_col=imu_time_col,
+            trial_len_sec=TRIAL_LEN_SEC,
+            zero_baseline_bend=False,
+            zero_baseline_pitch=False,
+            zero_baseline_azim=False,
+        )
+
         if imu_jump_max_delta_deg is not None:
             aug_imu_first = IMU_cam.filter_joint_angle_jumps_in_trials(
-                aug_imu_first,
-                angle_col=imu_angle_col,
-                max_delta_deg=imu_jump_max_delta_deg,
-                verbose=True,
+                aug_imu_first, angle_col=imu_angle_col, max_delta_deg=imu_jump_max_delta_deg, verbose=True
             )
             aug_imu_second = IMU_cam.filter_joint_angle_jumps_in_trials(
-                aug_imu_second,
-                angle_col=imu_angle_col,
-                max_delta_deg=imu_jump_max_delta_deg,
-                verbose=True,
+                aug_imu_second, angle_col=imu_angle_col, max_delta_deg=imu_jump_max_delta_deg, verbose=True
             )
 
-        # ----------------------------------------------------------------
-        # 2c) Windowed zero-baseline + optional abs()
-        # ----------------------------------------------------------------
         aug_imu_first = IMU_cam.zero_baseline_trials_windowed(
             aug_imu_first,
             angle_col=imu_angle_col,
@@ -1002,7 +964,6 @@ class IMU_cam(ADC_CAM):
             use_median=imu_zero_window_use_median,
             abs_values=imu_zero_window_abs,
         )
-
         aug_imu_second = IMU_cam.zero_baseline_trials_windowed(
             aug_imu_second,
             angle_col=imu_angle_col,
@@ -1011,86 +972,46 @@ class IMU_cam(ADC_CAM):
             abs_values=imu_zero_window_abs,
         )
 
-        # ----------------------------------------------------------------
-        # 3) DLC 3D + wrist angles + trigger timestamps
-        # ----------------------------------------------------------------
         cam_trials_first = cam.extract_trigger_time_dfs_by_trial(
-            first_trials,
-            add_labels=True,
-            trial_labels=None,
-            trial_base=1,
-            set_label="first_cam",
-            set_labels=None,
-            include_path=True,
+            first_trials, add_labels=True, trial_labels=None, trial_base=1,
+            set_label="first_cam", set_labels=None, include_path=True
         )
         cam_trials_second = cam.extract_trigger_time_dfs_by_trial(
-            second_trials,
-            add_labels=True,
-            trial_labels=None,
-            trial_base=1,
-            set_label="second_cam",
-            set_labels=None,
-            include_path=True,
+            second_trials, add_labels=True, trial_labels=None, trial_base=1,
+            set_label="second_cam", set_labels=None, include_path=True
         )
 
         dlc3d_trials_first = cam.extract_dlc3d_dfs_by_trial(
-            first_trials,
-            add_labels=True,
-            trial_base=1,
-            set_label="first_cam",
-            include_path=True,
+            first_trials, add_labels=True, trial_base=1, set_label="first_cam", include_path=True
         )
         dlc3d_trials_second = cam.extract_dlc3d_dfs_by_trial(
-            second_trials,
-            add_labels=True,
-            trial_base=1,
-            set_label="second_cam",
-            include_path=True,
+            second_trials, add_labels=True, trial_base=1, set_label="second_cam", include_path=True
         )
 
-        dlc_aug_first, _ = cam.compute_dlc3d_angles_first(
-            dlc3d_trials_first,
-            signed_in_plane=True,
-        )
-        dlc_aug_second, _ = cam.compute_dlc3d_angles_second(
-            dlc3d_trials_second,
-            signed_in_plane=True,
-        )
+        dlc_aug_first, _ = cam.compute_dlc3d_angles_first(dlc3d_trials_first, signed_in_plane=True)
+        dlc_aug_second, _ = cam.compute_dlc3d_angles_second(dlc3d_trials_second, signed_in_plane=True)
 
         dlc_angles_first = cam.attach_cam_timestamps_first(
-            dlc_aug_first,
-            cam_trials=cam_trials_first,
-            time_col_name="timestamp",
-            new_col_name="cam_timestamp",
+            dlc_aug_first, cam_trials=cam_trials_first, time_col_name="timestamp", new_col_name="cam_timestamp"
         )
         dlc_angles_second = cam.attach_cam_timestamps_second(
-            dlc_aug_second,
-            cam_trials=cam_trials_second,
-            time_col_name="timestamp",
-            new_col_name="cam_timestamp",
+            dlc_aug_second, cam_trials=cam_trials_second, time_col_name="timestamp", new_col_name="cam_timestamp"
         )
 
         dlc_angles_first = cam.filter_angle_trials_by_likelihood(
-            dlc_angles_first,
-            bodyparts=dlc_bodyparts,
-            min_likelihood=min_dlc_likelihood,
+            dlc_angles_first, bodyparts=dlc_bodyparts, min_likelihood=min_dlc_likelihood
         )
         dlc_angles_second = cam.filter_angle_trials_by_likelihood(
-            dlc_angles_second,
-            bodyparts=dlc_bodyparts,
-            min_likelihood=min_dlc_likelihood,
+            dlc_angles_second, bodyparts=dlc_bodyparts, min_likelihood=min_dlc_likelihood
         )
 
-        # ----------------------------------------------------------------
-        # 4) ALIGN IMU angle vs DLC wrist angle
-        # ----------------------------------------------------------------
         merged_first = cam.align_adc_theta_to_dlc_angles_for_set(
             dlc_angle_trials=dlc_angles_first,
             adc_theta_trials=aug_imu_first,
             dlc_time_col="cam_timestamp",
-            adc_time_col=imu_time_col,  # <--- use IMU 'timestamp' in ns
+            adc_time_col=imu_time_col,
             adc_cols=[imu_angle_col],
-            time_unit=time_unit,  # 'ns' to match both sides
+            time_unit=time_unit,
             tolerance=align_tolerance,
             direction="nearest",
             suffix="_imu",
@@ -1112,28 +1033,16 @@ class IMU_cam(ADC_CAM):
             drop_unmatched=True,
         )
 
-        imu_aligned_col = f"{imu_angle_col}_imu"  # e.g. "imu_azimuth_deg_imu"
+        imu_aligned_col = f"{imu_angle_col}_imu"
 
-        # ----------------------------------------------------------------
-        # 4b) OPTIONAL: drop impossible IMU angles above imu_max_angle_deg
-        # ----------------------------------------------------------------
         if imu_max_angle_deg is not None:
             merged_first = IMU_cam.drop_angle_above_threshold_in_trials(
-                merged_first,
-                angle_col=imu_aligned_col,
-                max_angle_deg=imu_max_angle_deg,
-                verbose=True,
+                merged_first, angle_col=imu_aligned_col, max_angle_deg=imu_max_angle_deg, verbose=True
             )
             merged_second = IMU_cam.drop_angle_above_threshold_in_trials(
-                merged_second,
-                angle_col=imu_aligned_col,
-                max_angle_deg=imu_max_angle_deg,
-                verbose=True,
+                merged_second, angle_col=imu_aligned_col, max_angle_deg=imu_max_angle_deg, verbose=True
             )
 
-        # ----------------------------------------------------------------
-        # 5) RMSE at lag=0 (do_refine=False), WRIST ONLY (DLC)
-        # ----------------------------------------------------------------
         wrist_col = ("metric", "wrist_bend_deg", "deg")
         time_col = "cam_timestamp"
 
@@ -1159,16 +1068,41 @@ class IMU_cam(ADC_CAM):
             do_refine=False,
         )
 
-        # ----------------------------------------------------------------
-        # 6) Collect abs-error distributions
-        # ----------------------------------------------------------------
-        imu_err_col_for_box = imu_aligned_col
+        # ---------------------------
+        # NEW: motion-only trimming
+        # ---------------------------
+        if motion_only:
+            refined_first = IMU_cam.trim_trials_after_dlc_motion(
+                refined_first,
+                dlc_col=wrist_col,
+                baseline_n=motion_baseline_n,
+                std_window=motion_std_window,
+                std_thresh_deg=motion_std_thresh_deg,
+                slope_window=motion_slope_window,
+                slope_thresh_deg_per_sample=motion_slope_thresh_deg_per_sample,
+                consec=motion_consec,
+                keep_pre=motion_keep_pre,
+                keep_if_no_motion=motion_keep_if_no_motion,
+            )
+            refined_second = IMU_cam.trim_trials_after_dlc_motion(
+                refined_second,
+                dlc_col=wrist_col,
+                baseline_n=motion_baseline_n,
+                std_window=motion_std_window,
+                std_thresh_deg=motion_std_thresh_deg,
+                slope_window=motion_slope_window,
+                slope_thresh_deg_per_sample=motion_slope_thresh_deg_per_sample,
+                consec=motion_consec,
+                keep_pre=motion_keep_pre,
+                keep_if_no_motion=motion_keep_if_no_motion,
+            )
 
+        # 6) Collect abs-error distributions (unchanged)
         abs_err_first = cam.collect_abs_error_for_set(
             refined_trials=refined_first,
             summary=summary_first,
             dlc_col=wrist_col,
-            adc_rmse_col=imu_err_col_for_box,
+            adc_rmse_col=imu_aligned_col,
             trial_indices=trial_indices_first,
             n_best=2,
         )
@@ -1177,7 +1111,7 @@ class IMU_cam(ADC_CAM):
             refined_trials=refined_second,
             summary=summary_second,
             dlc_col=wrist_col,
-            adc_rmse_col=imu_err_col_for_box,
+            adc_rmse_col=imu_aligned_col,
             trial_indices=trial_indices_second,
             n_best=2,
         )
@@ -2731,3 +2665,76 @@ class IMU_cam(ADC_CAM):
             ])
 
         return fig, axes
+
+    @staticmethod
+    def find_motion_onset_idx_from_dlc(
+            y,
+            *,
+            baseline_n: int = 30,
+            std_window: int = 15,
+            std_thresh_deg: float = 0.75,
+            slope_window: int = 7,
+            slope_thresh_deg_per_sample: float = 0.05,
+            consec: int = 5,
+    ):
+        import numpy as np
+        import pandas as pd
+
+        y = np.asarray(y, dtype=float)
+        n = len(y)
+        if n == 0:
+            return None
+
+        s = pd.Series(y).ffill().bfill()
+
+        rstd = s.rolling(std_window, min_periods=max(5, std_window // 2)).std().fillna(0.0)
+        dy = s.diff().abs()
+        rslope = dy.rolling(slope_window, min_periods=max(3, slope_window // 2)).mean().fillna(0.0)
+
+        motion = ((rstd > std_thresh_deg) | (rslope > slope_thresh_deg_per_sample)).to_numpy()
+
+        run = 0
+        for i, m in enumerate(motion):
+            run = run + 1 if m else 0
+            if run >= consec:
+                return int(i - consec + 1)
+
+        return None
+
+    @staticmethod
+    def trim_trials_after_dlc_motion(
+            trials,
+            *,
+            dlc_col,
+            keep_pre: int = 0,
+            keep_if_no_motion: bool = False,
+            **onset_kwargs,
+    ):
+        """
+        Trim each trial so it starts at DLC motion onset.
+        If motion isn't detected:
+          - keep_if_no_motion=True  -> keep original DF
+          - keep_if_no_motion=False -> return empty DF (contributes no error)
+        """
+        out = []
+
+        for df in trials:
+            if df is None or df.empty or dlc_col not in df.columns:
+                out.append(df)
+                continue
+
+            y = df[dlc_col].to_numpy(dtype=float)
+
+            # IMPORTANT: only pass onset_kwargs (NOT keep_if_no_motion)
+            onset = IMU_cam.find_motion_onset_idx_from_dlc(y, **onset_kwargs)
+
+            # If no motion detected, decide behavior
+            if onset is None:
+                out.append(df if keep_if_no_motion else df.iloc[0:0].copy())
+                continue
+
+            start = max(0, int(onset) - int(keep_pre))
+            out.append(df.iloc[start:].reset_index(drop=True))
+
+        return out
+
