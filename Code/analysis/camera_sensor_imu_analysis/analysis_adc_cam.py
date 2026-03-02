@@ -2960,6 +2960,7 @@ class ADC_CAM:
         # (optional, redundant but explicit)
         ax_bar_first.tick_params(axis="both", labelsize=tick_fontsize)
         # # Fig 2
+        
         ax_bar_first.set_ylim(0, 6)
         ax_bar_first.set_yticks([0, 2, 4, 6, 8])
         # SUPP stuff
@@ -3194,6 +3195,7 @@ class ADC_CAM:
         ax_bar_second.tick_params(axis="x", labelsize=tick_fontsize)
         _style_ax(ax_bar_second)
         # ax_bar_second.legend(fontsize=tick_fontsize, frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.05))
+
         # SUPP stuff
         #ax_bar_second.set_ylim(0, 10)
 
