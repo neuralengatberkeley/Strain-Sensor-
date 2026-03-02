@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Sequence, Any
+from typing import List, Dict, Optional, Tuple, Sequence, Any, Union
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,40 +33,102 @@ class IMU_cam(ADC_CAM):
     # IMU CSV extraction
     # ------------------------------------------------------------------
     def extract_imu_dfs_by_trial(
-        self,
-        trials: List[Dict[str, Optional[Path]]],
-        *,
-        add_metadata: bool = True,
-    ) -> List[Optional[pd.DataFrame]]:
+            self,
+            trials: List[Dict[str, Optional[Path]]],
+            *,
+            add_metadata: bool = True,
+            drop_all_none_quats: bool = False,
+            quat_base_names: Sequence[str] = ("euler1", "euler2"),
+            return_stats: bool = False,
+    ) -> Union[
+        List[Optional[pd.DataFrame]],
+        Tuple[List[Optional[pd.DataFrame]], List[Dict[str, Any]]],
+    ]:
         """
-        Given a list of trial dicts (from load_first/load_second),
-        load the IMU CSV for each trial into a pandas DataFrame.
+        Load IMU CSVs per trial.
 
-        IMPORTANT: we preserve list length by appending None when a trial has
-        no IMU CSV, so indices stay aligned with DLC trials.
+        Optionally drops rows where quaternion readouts are entirely None.
+
+        If return_stats=True, also returns per-trial drop statistics.
         """
+
         dfs: List[Optional[pd.DataFrame]] = []
+        stats: List[Dict[str, Any]] = []
 
         for idx, trial in enumerate(trials):
+
             imu_path = trial.get("imu_csv", None)
+
             if imu_path is None:
                 dfs.append(None)
+                if return_stats:
+                    stats.append({
+                        "trial_index": idx,
+                        "n_original": 0,
+                        "n_final": 0,
+                        "n_dropped": 0,
+                        "pct_dropped": float("nan"),
+                    })
                 continue
 
-            # Robust CSV read: try UTF-8, fall back to latin-1
             try:
                 df = pd.read_csv(imu_path)
             except UnicodeDecodeError:
                 df = pd.read_csv(imu_path, encoding="latin-1")
+
+            n_original = len(df)
 
             if add_metadata:
                 df = df.copy()
                 df["trial_index"] = idx
                 df["source_path"] = str(imu_path)
 
+            # ---------------- Drop rows ----------------
+            if drop_all_none_quats and not df.empty:
+
+                keep_mask = np.ones(len(df), dtype=bool)
+
+                for base in quat_base_names:
+
+                    comp_cols = [f"{base}_w", f"{base}_x", f"{base}_y", f"{base}_z"]
+
+                    if all(c in df.columns for c in comp_cols):
+                        all_nan = df[comp_cols].isna().all(axis=1)
+                        keep_mask &= ~all_nan
+
+                    elif base in df.columns:
+                        s = (
+                            df[base]
+                            .astype(str)
+                            .str.lower()
+                            .str.replace(" ", "", regex=False)
+                            .str.strip("()[]")
+                        )
+                        all_none = s.eq("none,none,none,none")
+                        keep_mask &= ~all_none
+
+                df = df.loc[keep_mask].reset_index(drop=True)
+
+            n_final = len(df)
+            n_dropped = n_original - n_final
+            pct_dropped = (100.0 * n_dropped / n_original) if n_original > 0 else float("nan")
+
+            if n_dropped > 0:
+                print(f"[IMU None-drop] trial {idx}: "
+                      f"dropped {n_dropped}/{n_original} ({pct_dropped:.2f}%)")
+
             dfs.append(df)
 
-        return dfs
+            if return_stats:
+                stats.append({
+                    "trial_index": idx,
+                    "n_original": n_original,
+                    "n_final": n_final,
+                    "n_dropped": n_dropped,
+                    "pct_dropped": pct_dropped,
+                })
+
+        return (dfs, stats) if return_stats else dfs
 
     def extract_imu_dfs_first(
         self,
@@ -880,6 +942,10 @@ class IMU_cam(ADC_CAM):
             imu_jump_max_delta_deg: float | None = 5.0,
             imu_max_angle_deg: float | None = 90.0,
 
+            # NEW: drop rows where euler1 or euler2 is (None,None,None,None)
+            imu_drop_all_none_quats: bool = True,
+            imu_quat_base_names: Tuple[str, str] = ("euler1", "euler2"),
+
             # NEW:
             motion_only: bool = False,
             motion_baseline_n: int = 30,
@@ -891,7 +957,6 @@ class IMU_cam(ADC_CAM):
             motion_keep_pre: int = 0,
             motion_keep_if_no_motion: bool = False,
     ):
-        # --- everything up through refined_first/refined_second is unchanged ---
         cam = IMU_cam(
             root_dir=root_dir,
             path_to_repo=path_to_repo,
@@ -917,7 +982,36 @@ class IMU_cam(ADC_CAM):
 
         TRIAL_LEN_SEC = 10.0
 
-        aug_imu_first, _ = cam.compute_imu_bend_pitch_azimuth_first(
+        # =====================================================================
+        # 1) Load raw IMU CSVs + optionally drop rows where any quaternion base
+        #    is entirely missing: (None,None,None,None)
+        # =====================================================================
+        imu_raw_first = cam.extract_imu_dfs_first(add_metadata=False)
+        imu_raw_second = cam.extract_imu_dfs_second(add_metadata=False)
+
+        if imu_drop_all_none_quats:
+            imu_clean_first = [
+                None if (df is None or df.empty)
+                else IMU_cam.drop_all_none_quaternion_rows_df(df, base_names=imu_quat_base_names)
+                for df in imu_raw_first
+            ]
+            imu_clean_second = [
+                None if (df is None or df.empty)
+                else IMU_cam.drop_all_none_quaternion_rows_df(df, base_names=imu_quat_base_names)
+                for df in imu_raw_second
+            ]
+        else:
+            imu_clean_first = imu_raw_first
+            imu_clean_second = imu_raw_second
+
+        # =====================================================================
+        # 2) Compute IMU angles USING THE CLEANED IMU DATAFRAMES
+        #
+        # IMPORTANT: your method requires keyword-only `set_label`
+        # =====================================================================
+        aug_imu_first, _ = cam.compute_imu_bend_pitch_azimuth_by_trial(
+            imu_clean_first,
+            set_label="first_imu",
             quat_cols=imu_quat_cols,
             fixed_axis=imu_fixed_axis,
             moving_axis=imu_moving_axis,
@@ -933,7 +1027,9 @@ class IMU_cam(ADC_CAM):
             zero_baseline_azim=False,
         )
 
-        aug_imu_second, _ = cam.compute_imu_bend_pitch_azimuth_second(
+        aug_imu_second, _ = cam.compute_imu_bend_pitch_azimuth_by_trial(
+            imu_clean_second,
+            set_label="second_imu",
             quat_cols=imu_quat_cols,
             fixed_axis=imu_fixed_axis,
             moving_axis=imu_moving_axis,
@@ -949,6 +1045,54 @@ class IMU_cam(ADC_CAM):
             zero_baseline_azim=False,
         )
 
+        # =====================================================================
+        # 3) Drop statistics helpers
+        # =====================================================================
+        def _lens(trials):
+            return [0 if (df is None or df.empty) else len(df) for df in trials]
+
+        def _drop_stats(before_lens, after_lens):
+            n = max(len(before_lens), len(after_lens))
+            before_lens = (before_lens + [0] * n)[:n]
+            after_lens = (after_lens + [0] * n)[:n]
+
+            removed = [b - a for b, a in zip(before_lens, after_lens)]
+            pct = [(100.0 * (b - a) / b) if b > 0 else float("nan") for b, a in zip(before_lens, after_lens)]
+
+            total_before = sum(before_lens)
+            total_after = sum(after_lens)
+            total_pct = (100.0 * (total_before - total_after) / total_before) if total_before > 0 else float("nan")
+
+            return {
+                "before_len_by_trial": before_lens,
+                "after_len_by_trial": after_lens,
+                "removed_by_trial": removed,
+                "pct_removed_by_trial": pct,
+                "total_before": total_before,
+                "total_after": total_after,
+                "total_pct_removed": total_pct,
+            }
+
+        raw_len_first = _lens(imu_raw_first)
+        raw_len_second = _lens(imu_raw_second)
+        clean_len_first = _lens(imu_clean_first)
+        clean_len_second = _lens(imu_clean_second)
+
+        imu_none_drop_stats_first = _drop_stats(raw_len_first, clean_len_first)
+        imu_none_drop_stats_second = _drop_stats(raw_len_second, clean_len_second)
+
+        print(
+            f"[IMU None-drop] FIRST  removed {imu_none_drop_stats_first['total_pct_removed']:.2f}% "
+            f"({imu_none_drop_stats_first['total_before']} -> {imu_none_drop_stats_first['total_after']})"
+        )
+        print(
+            f"[IMU None-drop] SECOND removed {imu_none_drop_stats_second['total_pct_removed']:.2f}% "
+            f"({imu_none_drop_stats_second['total_before']} -> {imu_none_drop_stats_second['total_after']})"
+        )
+
+        # =====================================================================
+        # 4) Jump-filter (applied AFTER None-drop + angle computation)
+        # =====================================================================
         if imu_jump_max_delta_deg is not None:
             aug_imu_first = IMU_cam.filter_joint_angle_jumps_in_trials(
                 aug_imu_first, angle_col=imu_angle_col, max_delta_deg=imu_jump_max_delta_deg, verbose=True
@@ -957,6 +1101,24 @@ class IMU_cam(ADC_CAM):
                 aug_imu_second, angle_col=imu_angle_col, max_delta_deg=imu_jump_max_delta_deg, verbose=True
             )
 
+        filt_len_first = _lens(aug_imu_first)
+        filt_len_second = _lens(aug_imu_second)
+
+        imu_jump_drop_stats_first = _drop_stats(clean_len_first, filt_len_first)
+        imu_jump_drop_stats_second = _drop_stats(clean_len_second, filt_len_second)
+
+        print(
+            f"[IMU jump-drop] FIRST  removed {imu_jump_drop_stats_first['total_pct_removed']:.2f}% "
+            f"({imu_jump_drop_stats_first['total_before']} -> {imu_jump_drop_stats_first['total_after']})"
+        )
+        print(
+            f"[IMU jump-drop] SECOND removed {imu_jump_drop_stats_second['total_pct_removed']:.2f}% "
+            f"({imu_jump_drop_stats_second['total_before']} -> {imu_jump_drop_stats_second['total_after']})"
+        )
+
+        # =====================================================================
+        # 5) Baseline zeroing (unchanged)
+        # =====================================================================
         aug_imu_first = IMU_cam.zero_baseline_trials_windowed(
             aug_imu_first,
             angle_col=imu_angle_col,
@@ -972,6 +1134,9 @@ class IMU_cam(ADC_CAM):
             abs_values=imu_zero_window_abs,
         )
 
+        # =====================================================================
+        # 6) Camera + DLC extraction (unchanged)
+        # =====================================================================
         cam_trials_first = cam.extract_trigger_time_dfs_by_trial(
             first_trials, add_labels=True, trial_labels=None, trial_base=1,
             set_label="first_cam", set_labels=None, include_path=True
@@ -1005,6 +1170,9 @@ class IMU_cam(ADC_CAM):
             dlc_angles_second, bodyparts=dlc_bodyparts, min_likelihood=min_dlc_likelihood
         )
 
+        # =====================================================================
+        # 7) Align IMU to DLC (unchanged)
+        # =====================================================================
         merged_first = cam.align_adc_theta_to_dlc_angles_for_set(
             dlc_angle_trials=dlc_angles_first,
             adc_theta_trials=aug_imu_first,
@@ -1044,17 +1212,37 @@ class IMU_cam(ADC_CAM):
             )
 
         wrist_col = ("metric", "wrist_bend_deg", "deg")
-        time_col = "cam_timestamp"
+        time_col_local = "cam_timestamp"
+
+        # =====================================================================
+        # 8) Refine + motion-only options (unchanged)
+        # =====================================================================
+        rmse_mode = "motion_only" if motion_only else "all"
+        plot_mode = "motion_only" if motion_only else "all"
+
+        motion_onset_kwargs = dict(
+            baseline_n=motion_baseline_n,
+            std_window=motion_std_window,
+            std_thresh_deg=motion_std_thresh_deg,
+            slope_window=motion_slope_window,
+            slope_thresh_deg_per_sample=motion_slope_thresh_deg_per_sample,
+            consec=motion_consec,
+        )
 
         refined_first, summary_first = cam.refine_alignment_by_rmse_for_set(
             merged_trials=merged_first,
             dlc_col=wrist_col,
             adc_col=imu_aligned_col,
             max_lag_samples=max_lag_samples,
-            time_col=time_col,
+            time_col=time_col_local,
             plot_indices=None,
             set_name=f"{speed_tag.upper()} FIRST (IMU {imu_angle_col})",
             do_refine=False,
+            rmse_mode=rmse_mode,
+            plot_mode=plot_mode,
+            plot_adc_mode="raw",
+            motion_keep_pre=motion_keep_pre,
+            motion_onset_kwargs=motion_onset_kwargs,
         )
 
         refined_second, summary_second = cam.refine_alignment_by_rmse_for_set(
@@ -1062,15 +1250,17 @@ class IMU_cam(ADC_CAM):
             dlc_col=wrist_col,
             adc_col=imu_aligned_col,
             max_lag_samples=max_lag_samples,
-            time_col=time_col,
+            time_col=time_col_local,
             plot_indices=None,
             set_name=f"{speed_tag.upper()} SECOND (IMU {imu_angle_col})",
             do_refine=False,
+            rmse_mode=rmse_mode,
+            plot_mode=plot_mode,
+            plot_adc_mode="raw",
+            motion_keep_pre=motion_keep_pre,
+            motion_onset_kwargs=motion_onset_kwargs,
         )
 
-        # ---------------------------
-        # NEW: motion-only trimming
-        # ---------------------------
         if motion_only:
             refined_first = IMU_cam.trim_trials_after_dlc_motion(
                 refined_first,
@@ -1097,7 +1287,9 @@ class IMU_cam(ADC_CAM):
                 keep_if_no_motion=motion_keep_if_no_motion,
             )
 
-        # 6) Collect abs-error distributions (unchanged)
+        # =====================================================================
+        # 9) Collect abs-error distributions (unchanged)
+        # =====================================================================
         abs_err_first = cam.collect_abs_error_for_set(
             refined_trials=refined_first,
             summary=summary_first,
@@ -1125,83 +1317,13 @@ class IMU_cam(ADC_CAM):
             "merged_second": merged_second,
             "refined_first": refined_first,
             "refined_second": refined_second,
+
+            # NEW:
+            "imu_none_drop_stats_first": imu_none_drop_stats_first,
+            "imu_none_drop_stats_second": imu_none_drop_stats_second,
+            "imu_jump_drop_stats_first": imu_jump_drop_stats_first,
+            "imu_jump_drop_stats_second": imu_jump_drop_stats_second,
         }
-
-    # ------------------------------------------------------------------
-    # New robust IMU bend-angle method using plane normals
-    # ------------------------------------------------------------------
-    def compute_imu_plane_bend_by_trial(
-        self,
-        imu_trials: List[pd.DataFrame],
-        *,
-        set_label: str,
-        quat_cols: Tuple[str, str] = ("euler1", "euler2"),
-        quat_order: str = "wxyz",
-        fixed_axes: Tuple[str, str] = ("x", "y"),
-        moving_axes: Tuple[str, str] = ("x", "y"),
-        out_col: str = "imu_plane_bend_deg",
-        time_col: str = "t_sec",
-        trial_len_sec: float | None = 10.0,
-    ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
-        """
-        New robust IMU bend-angle method using PLANE NORMALS.
-        """
-        base_fix, base_move = quat_cols
-        a_fix, b_fix = fixed_axes
-        a_mov, b_mov = moving_axes
-
-        e = {
-            "x": np.array([1.0, 0.0, 0.0]),
-            "y": np.array([0.0, 1.0, 0.0]),
-            "z": np.array([0.0, 0.0, 1.0]),
-        }
-
-        n_fix_body = np.cross(e[a_fix], e[b_fix])
-        n_move_body = np.cross(e[a_mov], e[b_mov])
-
-        tall_list: List[pd.DataFrame] = []
-        aug_trials: List[pd.DataFrame] = []
-
-        for trial_idx, df in enumerate(imu_trials):
-            if df is None or df.empty:
-                aug_trials.append(df)
-                continue
-
-            self._imu_ensure_time_column(df, time_col=time_col, trial_len_sec=trial_len_sec)
-
-            Q_fix = self._imu_quat_from_cols(df, base_fix, quat_order=quat_order)
-            Q_move = self._imu_quat_from_cols(df, base_move, quat_order=quat_order)
-
-            R_fix = self._imu_quat_to_rotmat(Q_fix)
-            R_move = self._imu_quat_to_rotmat(Q_move)
-
-            nF = R_fix @ n_fix_body
-            nM = R_move @ n_move_body
-
-            R_fix_T = np.transpose(R_fix, (0, 2, 1))
-            nM_in_fix = np.einsum("nij,nj->ni", R_fix_T, nM)
-
-            dot = np.sum(nF * nM_in_fix, axis=1)
-            dot = np.clip(dot, -1.0, 1.0)
-            theta = np.degrees(np.arccos(dot))
-
-            theta = theta - theta[0]
-
-            df2 = df.copy()
-            df2[out_col] = theta
-            aug_trials.append(df2)
-
-            sub = df2[[time_col, out_col]].copy()
-            sub["trial_index"] = trial_idx
-            sub["set_label"] = set_label
-            tall_list.append(sub)
-
-        if tall_list:
-            tall = pd.concat(tall_list, axis=0, ignore_index=True)
-        else:
-            tall = pd.DataFrame(columns=[time_col, out_col, "trial_index", "set_label"])
-
-        return aug_trials, tall
 
     # ------------------------------------------------------------------
     # Low-level IMU helper: relative pitch (wrist→palm) from quaternions
@@ -1406,30 +1528,116 @@ class IMU_cam(ADC_CAM):
         )
 
     # ------------------------------------------------------------------
-    # IMU_cam version of refine_alignment_by_rmse_for_set
-    # ------------------------------------------------------------------
+    from typing import List, Dict, Any, Optional, Sequence, Tuple, Literal
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    from typing import List, Dict, Any, Optional, Sequence, Tuple, Literal
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    from typing import List, Dict, Any, Optional, Sequence, Tuple, Literal
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
     def refine_alignment_by_rmse_for_set(
-        self,
-        merged_trials: List[pd.DataFrame],
-        *,
-        dlc_col=("metric", "mcp_bend_deg", "deg"),
-        adc_col: str = "theta_cam_cal_adc",
-        max_lag_samples: int = 5,
-        time_col=("_t_cam_td", "", ""),  # or "cam_timestamp"
-        plot_indices: Optional[Sequence[int]] = None,
-        set_name: str = "set",
-        do_refine: bool = True,
+            self,
+            merged_trials: List[pd.DataFrame],
+            *,
+            dlc_col=("metric", "mcp_bend_deg", "deg"),
+            adc_col: str = "theta_cam_cal_adc",
+            max_lag_samples: int = 5,
+            time_col=("_t_cam_td", "", ""),  # or "cam_timestamp"
+            plot_indices: Optional[Sequence[int]] = None,
+            set_name: str = "set",
+            do_refine: bool = True,
+
+            # ----------------------------
+            # NEW: what portion to use
+            # ----------------------------
+            rmse_mode: Literal["all", "motion_only"] = "all",  # affects summary rmse_deg
+            plot_mode: Literal["all", "motion_only"] = "all",  # affects plots only
+
+            # ----------------------------
+            # NEW: which ADC series to treat as "main" for plotting
+            # ----------------------------
+            plot_adc_mode: Literal["raw", "rmse"] = "raw",  # raw=adc_col, rmse=adc_col+"_rmse"
+
+            # show the other series as a dashed overlay (compat: alias below)
+            plot_show_secondary_adc: bool = False,
+
+            # Backward-compat alias (your old notebook arg name)
+            plot_show_raw_adc: Optional[bool] = None,
+
+            # ----------------------------
+            # NEW: motion onset trimming knobs
+            # ----------------------------
+            motion_keep_pre: int = 0,
+            motion_onset_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
         """
         Refines ADC/IMU vs DLC alignment by searching over integer lags
         to minimize RMSE between `dlc_col` and `adc_col`, or,
         if do_refine=False, just computes RMSE at lag=0.
+
+        rmse_mode:
+            "all"         -> RMSE computed on full trial
+            "motion_only" -> RMSE computed only after DLC-detected motion onset
+
+        plot_mode:
+            "all"         -> plot full trial
+            "motion_only" -> plot only after DLC-detected motion onset
+
+        plot_adc_mode:
+            "raw"  -> plot adc_col as main signal
+            "rmse" -> plot adc_col+"_rmse" as main signal
+
+        Notes:
+          - Requires self.find_motion_onset_idx_from_dlc(...) to exist.
+          - Motion trimming here is applied consistently (optionally) to both RMSE and plots.
         """
+
+        # ----------------------------
+        # Resolve alias for older notebooks
+        # ----------------------------
+        if plot_show_raw_adc is not None:
+            # Interpret old flag as "show the other series too"
+            plot_show_secondary_adc = bool(plot_show_raw_adc)
+
+        onset_kwargs = motion_onset_kwargs or {}
+
         effective_max_lag = max_lag_samples if do_refine else 0
 
         refined: List[pd.DataFrame] = []
         records: List[Dict[str, Any]] = []
 
+        # ------------------------------------------------------------------
+        # Helper: trim a dataframe to motion-only region (based on DLC)
+        # ------------------------------------------------------------------
+        def _trim_df_motion_only(df_in: pd.DataFrame) -> pd.DataFrame:
+            if df_in is None or df_in.empty:
+                return df_in
+
+            # If DLC column missing, cannot trim; return empty so RMSE becomes NaN
+            if dlc_col not in df_in.columns:
+                return df_in.iloc[0:0].copy()
+
+            y = df_in[dlc_col].to_numpy(dtype=float)
+            onset = self.find_motion_onset_idx_from_dlc(y, **onset_kwargs)
+
+            if onset is None:
+                # No motion detected -> return empty (so it won't contribute)
+                return df_in.iloc[0:0].copy()
+
+            start = max(0, int(onset) - int(motion_keep_pre))
+            return df_in.iloc[start:].reset_index(drop=True)
+
+        # ------------------------------------------------------------------
+        # Main refinement loop (this is what feeds summary box/bar plots)
+        # ------------------------------------------------------------------
         for i, df in enumerate(merged_trials):
             if df is None or df.empty:
                 refined.append(pd.DataFrame())
@@ -1440,12 +1648,32 @@ class IMU_cam(ADC_CAM):
                         rmse_deg=np.nan,
                         n_points=0,
                         set_name=set_name,
+                        rmse_mode=rmse_mode,
+                    )
+                )
+                continue
+
+            # IMPORTANT: choose what data RMSE is computed on
+            df_for_rmse = df
+            if rmse_mode == "motion_only":
+                df_for_rmse = _trim_df_motion_only(df_for_rmse)
+
+            if df_for_rmse is None or df_for_rmse.empty:
+                refined.append(pd.DataFrame())
+                records.append(
+                    dict(
+                        trial_index=i,
+                        best_lag_samples=0,
+                        rmse_deg=np.nan,
+                        n_points=0,
+                        set_name=set_name,
+                        rmse_mode=rmse_mode,
                     )
                 )
                 continue
 
             df_aligned, best_lag, best_rmse = self._refine_alignment_by_rmse_single(
-                df,
+                df_for_rmse,
                 dlc_col=dlc_col,
                 adc_col=adc_col,
                 max_lag_samples=effective_max_lag,
@@ -1459,92 +1687,131 @@ class IMU_cam(ADC_CAM):
                     rmse_deg=best_rmse,
                     n_points=len(df_aligned),
                     set_name=set_name,
+                    rmse_mode=rmse_mode,
                 )
             )
 
         summary = pd.DataFrame.from_records(records)
 
+        # ------------------------------------------------------------------
+        # Plotting (can independently choose all vs motion-only)
+        # ------------------------------------------------------------------
         if plot_indices is not None:
             for idx in plot_indices:
                 if idx < 0 or idx >= len(refined):
                     continue
+
                 df_pl = refined[idx]
                 if df_pl is None or df_pl.empty:
                     continue
 
-                if isinstance(time_col, tuple) and time_col in df_pl.columns:
-                    t_raw = df_pl[time_col]
+                # Choose portion to plot
+                df_plot = df_pl
+                if plot_mode == "motion_only":
+                    df_plot = _trim_df_motion_only(df_plot)
+                    if df_plot is None or df_plot.empty:
+                        continue
+
+                # ----------------------------
+                # Time vector extraction
+                # ----------------------------
+                if isinstance(time_col, tuple) and time_col in df_plot.columns:
+                    t_raw = df_plot[time_col]
                     if hasattr(t_raw, "dt"):
                         t = (t_raw - t_raw.iloc[0]).dt.total_seconds().to_numpy()
                     else:
-                        t = t_raw.to_numpy(dtype=float)
-                        t = t - t[0]
-                elif isinstance(time_col, str) and time_col in df_pl.columns:
-                    t_raw = df_pl[time_col]
+                        t = t_raw.to_numpy(dtype=float) - t_raw.iloc[0]
+                elif isinstance(time_col, str) and time_col in df_plot.columns:
+                    t_raw = df_plot[time_col]
                     if hasattr(t_raw, "dt"):
                         t = (t_raw - t_raw.iloc[0]).dt.total_seconds().to_numpy()
                     else:
-                        t = t_raw.to_numpy(dtype=float)
-                        t = t - t[0]
-                elif ("_t_cam_td", "", "") in df_pl.columns:
-                    t_raw = df_pl[("_t_cam_td", "", "")]
+                        t = t_raw.to_numpy(dtype=float) - t_raw.iloc[0]
+                elif ("_t_cam_td", "", "") in df_plot.columns:
+                    t_raw = df_plot[("_t_cam_td", "", "")]
                     t = (t_raw - t_raw.iloc[0]).dt.total_seconds().to_numpy()
-                elif ("cam_timestamp", "", "") in df_pl.columns:
-                    t = df_pl[("cam_timestamp", "", "")].to_numpy(dtype=float)
+                elif ("cam_timestamp", "", "") in df_plot.columns:
+                    t = df_plot[("cam_timestamp", "", "")].to_numpy(dtype=float)
                     t = t - t[0]
                 else:
-                    t = np.arange(len(df_pl), dtype=float)
+                    t = np.arange(len(df_plot), dtype=float)
 
+                # Scale time to 0–10 for consistent viewing
                 if len(t) > 1 and np.nanmax(t) > np.nanmin(t):
                     t_plot = (t - np.nanmin(t)) / (np.nanmax(t) - np.nanmin(t)) * 10.0
                 else:
                     t_plot = np.zeros_like(t, dtype=float)
 
-                theta_dlc = df_pl[dlc_col]
-                theta_adc_rmse = df_pl[adc_col + "_rmse"]
+                # ----------------------------
+                # Signals: DLC + main ADC
+                # ----------------------------
+                theta_dlc = df_plot[dlc_col]
 
+                adc_raw_name = adc_col
+                adc_rmse_name = adc_col + "_rmse"
+
+                if plot_adc_mode == "raw":
+                    if adc_raw_name not in df_plot.columns:
+                        continue
+                    theta_adc_main = df_plot[adc_raw_name]
+                    main_label = "IMU angle (raw aligned)"
+                    theta_adc_secondary = df_plot[adc_rmse_name] if (
+                                plot_show_secondary_adc and adc_rmse_name in df_plot.columns) else None
+                else:  # "rmse"
+                    if adc_rmse_name not in df_plot.columns:
+                        continue
+                    theta_adc_main = df_plot[adc_rmse_name]
+                    main_label = "IMU angle (RMSE-aligned)"
+                    theta_adc_secondary = df_plot[adc_raw_name] if (
+                                plot_show_secondary_adc and adc_raw_name in df_plot.columns) else None
+
+                # Max |Δ| computed against the *main* ADC signal
                 dlc_arr = theta_dlc.to_numpy(dtype=float)
-                adc_arr = theta_adc_rmse.to_numpy(dtype=float)
+                adc_arr = theta_adc_main.to_numpy(dtype=float)
                 both_valid = np.isfinite(dlc_arr) & np.isfinite(adc_arr)
 
                 idx_max = None
-                if both_valid.sum() > 0:
+                if both_valid.any():
                     abs_diff = np.full_like(dlc_arr, np.nan, dtype=float)
-                    abs_diff[both_valid] = np.abs(
-                        dlc_arr[both_valid] - adc_arr[both_valid]
-                    )
+                    abs_diff[both_valid] = np.abs(dlc_arr[both_valid] - adc_arr[both_valid])
                     idx_max = int(np.nanargmax(abs_diff))
 
+                # ----------------------------
+                # Plot
+                # ----------------------------
                 plt.figure(figsize=(10, 4))
                 plt.plot(t_plot, theta_dlc, label="DLC angle")
-                plt.plot(
-                    t_plot,
-                    theta_adc_rmse,
-                    label="IMU angle (RMSE-aligned)",
-                )
+                plt.plot(t_plot, theta_adc_main, label=main_label)
 
-                if (
-                    idx_max is not None
-                    and np.isfinite(dlc_arr[idx_max])
-                    and np.isfinite(adc_arr[idx_max])
-                ):
+                if theta_adc_secondary is not None:
+                    plt.plot(
+                        t_plot,
+                        theta_adc_secondary,
+                        linestyle="--",
+                        alpha=0.7,
+                        label="IMU (secondary)",
+                    )
+
+                if idx_max is not None:
                     x0 = t_plot[idx_max]
                     y1 = dlc_arr[idx_max]
                     y2 = adc_arr[idx_max]
-                    plt.vlines(
-                        x0,
-                        ymin=min(y1, y2),
-                        ymax=max(y1, y2),
-                        colors="k",
-                        linestyles="--",
-                        linewidth=2,
-                        label="max |Δ|",
-                    )
+                    if np.isfinite(y1) and np.isfinite(y2):
+                        plt.vlines(
+                            x0,
+                            ymin=min(y1, y2),
+                            ymax=max(y1, y2),
+                            colors="k",
+                            linestyles="--",
+                            linewidth=2,
+                            label="max |Δ|",
+                        )
 
                 plt.xlabel("Scaled time (0–10 s)")
                 plt.ylabel("Angle (°)")
                 plt.title(
-                    f"{set_name} trial {idx + 1}: DLC vs IMU (RMSE column, do_refine={do_refine})"
+                    f"{set_name} trial {idx + 1}: "
+                    f"DLC vs IMU ({plot_mode=}, {plot_adc_mode=}, rmse_mode={rmse_mode}, do_refine={do_refine})"
                 )
                 plt.xlim(0.0, 10.0)
                 plt.legend()
@@ -1560,54 +1827,39 @@ class IMU_cam(ADC_CAM):
     def filter_joint_angle_jumps_in_trials(
             trials: List[Optional[pd.DataFrame]],
             angle_col: str,
-            max_delta_deg: float = 60.0,
+            max_delta_deg: float = 20.0,
             verbose: bool = True,
-            max_iters: int = 20,
+            max_iters: int = 1,
+            return_stats: bool = False,  # NEW
     ) -> List[Optional[pd.DataFrame]]:
         """
-        For each trial, iteratively drop rows where the step-to-step change
-        in `angle_col` exceeds `max_delta_deg`.
+        For each trial, iteratively drop rows where |Δangle| > max_delta_deg.
 
-        This fixes plateau-style glitches where a long run of bad values
-        would otherwise leave a large jump after a single-pass filter.
-
-        Algorithm (per trial)
-        ---------------------
-        1) s = angle series
-        2) while True:
-              - compute d = diff(s)
-              - mark the *later* sample of any |d| > max_delta_deg as bad
-              - if no bad samples or we reach max_iters: break
-              - drop bad rows and repeat on the shortened series
-
-        Parameters
-        ----------
-        trials : list[DataFrame | None]
-            List of per-trial DataFrames (e.g. aug_imu_first).
-        angle_col : str
-            Name of the joint-angle column to clean
-            (e.g. 'imu_joint_deg_rx_py').
-        max_delta_deg : float, default 60.0
-            Threshold for |Δangle|; if the jump into row i is larger than
-            this, row i is removed.
-        verbose : bool, default True
-            If True, print how many rows were removed per trial and iteration.
-        max_iters : int, default 20
-            Safety cap to avoid infinite loops in pathological cases.
-
-        Returns
-        -------
-        cleaned_trials : list[DataFrame | None]
-            Same structure as input but with bad rows removed.
+        Now reports per-trial total % removed.
         """
+
         cleaned: List[Optional[pd.DataFrame]] = []
+        stats = []  # NEW: per-trial stats
 
         for trial_idx, df in enumerate(trials):
+
             if df is None or df.empty or angle_col not in df.columns:
                 cleaned.append(df)
+                if return_stats:
+                    stats.append({
+                        "trial_index": trial_idx,
+                        "n_initial": 0 if df is None else len(df),
+                        "n_final": 0 if df is None else len(df),
+                        "total_removed": 0,
+                        "pct_removed": float("nan"),
+                        "iterations_run": 0,
+                    })
                 continue
 
             df_clean = df.copy()
+            n_initial = len(df_clean)
+            total_removed = 0
+            iterations_run = 0
 
             for it in range(max_iters):
                 s = df_clean[angle_col].to_numpy(dtype=float)
@@ -1627,18 +1879,41 @@ class IMU_cam(ADC_CAM):
                         )
                     break
 
+                iterations_run += 1
+                total_removed += n_bad
+
                 if verbose:
                     print(
                         f"[filter_joint_angle_jumps_in_trials] "
                         f"trial {trial_idx}, iter {it}: "
-                        f"dropping {n_bad} rows (|Δ{angle_col}| > {max_delta_deg}°)"
+                        f"dropping {n_bad} rows"
                     )
 
                 df_clean = df_clean.loc[~bad].reset_index(drop=True)
 
+            n_final = len(df_clean)
+            pct_removed = (100.0 * total_removed / n_initial) if n_initial > 0 else float("nan")
+
+            if verbose:
+                print(
+                    f"[filter_joint_angle_jumps_in_trials] "
+                    f"trial {trial_idx}: TOTAL removed {total_removed}/{n_initial} "
+                    f"({pct_removed:.2f}%)\n"
+                )
+
             cleaned.append(df_clean)
 
-        return cleaned
+            if return_stats:
+                stats.append({
+                    "trial_index": trial_idx,
+                    "n_initial": n_initial,
+                    "n_final": n_final,
+                    "total_removed": total_removed,
+                    "pct_removed": pct_removed,
+                    "iterations_run": iterations_run,
+                })
+
+        return (cleaned, stats) if return_stats else cleaned
 
     # ------------------------------------------------------------------
     # Row filter: drop samples where angle_col exceeds a hard threshold
@@ -2606,6 +2881,8 @@ class IMU_cam(ADC_CAM):
 
         ax_bar_second.set_ylabel("", fontsize=label_fontsize, fontweight=label_weight)
         ax_bar_second.tick_params(axis="x", rotation=0)
+        ax_bar_second.set_ylim(0, 10)
+        ax_bar_second.set_yticks([0, 5, 10])
         _style_ax(ax_bar_second)
 
         # -----------------------------
@@ -2737,4 +3014,325 @@ class IMU_cam(ADC_CAM):
             out.append(df.iloc[start:].reset_index(drop=True))
 
         return out
+
+    def augment_imu_euler_angles_by_trial(
+            self,
+            imu_trials: List[Optional[pd.DataFrame]],
+            *,
+            quat_base: str,
+            quat_order: str = "wxyz",
+            time_col: str = "t_sec",
+            trial_len_sec: float | None = None,
+            roll_col: str = "roll_deg",
+            pitch_col: str = "pitch_deg",
+            yaw_col: str = "yaw_deg",
+    ) -> List[Optional[pd.DataFrame]]:
+        """
+        For each trial DF, parse quaternion stream (quat_base), compute roll/pitch/yaw,
+        and add columns {roll_col, pitch_col, yaw_col}. Preserves None/empty trials.
+        """
+        out: List[Optional[pd.DataFrame]] = []
+
+        for df in imu_trials:
+            if df is None or df.empty:
+                out.append(df)
+                continue
+
+            df2 = df.copy()
+            self._imu_ensure_time_column(df2, time_col=time_col, trial_len_sec=trial_len_sec)
+
+            Q = self._imu_quat_from_cols(df2, quat_base, quat_order=quat_order)
+            roll, pitch, yaw = self._quat_to_euler_zyx_deg(Q)
+
+            df2[roll_col] = roll
+            df2[pitch_col] = pitch
+            df2[yaw_col] = yaw
+
+            out.append(df2)
+
+        return out
+
+    def plot_trial_euler_two_imus(
+            self,
+            trial_df: pd.DataFrame,
+            *,
+            quat_cols: Tuple[str, str] = ("euler1", "euler2"),
+            quat_order: str = "wxyz",
+            time_col: str = "t_sec",
+            trial_len_sec: float | None = None,
+            deg_lim: Tuple[float, float] | None = None,
+            title_prefix: str = "",
+    ) -> None:
+        """
+        Make TWO figures:
+          - Figure 1: IMU1 roll/pitch/yaw vs time
+          - Figure 2: IMU2 roll/pitch/yaw vs time
+
+        Each figure overlays the 3 Euler time series.
+        """
+        if trial_df is None or trial_df.empty:
+            print("[plot_trial_euler_two_imus] Empty trial_df.")
+            return
+
+        df = trial_df.copy()
+        self._imu_ensure_time_column(df, time_col=time_col, trial_len_sec=trial_len_sec)
+
+        imu1_base, imu2_base = quat_cols
+
+        # Compute eulers for IMU1
+        Q1 = self._imu_quat_from_cols(df, imu1_base, quat_order=quat_order)
+        r1, p1, y1 = self._quat_to_euler_zyx_deg(Q1)
+
+        # Compute eulers for IMU2
+        Q2 = self._imu_quat_from_cols(df, imu2_base, quat_order=quat_order)
+        r2, p2, y2 = self._quat_to_euler_zyx_deg(Q2)
+
+        t = df[time_col].to_numpy(dtype=float)
+        t = t - t[0]
+
+        def _plot_one(r, p, y, imu_label: str):
+            plt.figure(figsize=(10, 4))
+            plt.plot(t, r, label="roll (X)")
+            plt.plot(t, p, label="pitch (Y)")
+            plt.plot(t, y, label="yaw (Z)")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Angle (deg)")
+            plt.title(f"{title_prefix}{imu_label}: Euler angles (ZYX from quaternions)")
+            if deg_lim is not None:
+                plt.ylim(deg_lim)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+        _plot_one(r1, p1, y1, "IMU1")
+        _plot_one(r2, p2, y2, "IMU2")
+
+    from typing import Sequence, Union, Literal
+
+    def plot_euler_grid_two_trials_two_apps(
+            self,
+            imu_trials_first: List,
+            imu_trials_second: List,
+            *,
+            quat_cols: Tuple[str, str] = ("euler1", "euler2"),
+            quat_order: str = "wxyz",
+            time_col: str = "t_sec",
+            trial_len_sec: float | None = None,
+            deg_lim: Tuple[float, float] | None = None,
+            title: str = "Euler angles from IMU quaternions (ZYX)",
+            which_trials: Union[Literal["both", "first", "second", "all"], Sequence[int]] = "both",
+            unwrap_euler: bool = True,
+            wrap_for_plot: bool = False,
+            euler_axes: Sequence[str] = ("roll", "pitch", "yaw"),  # NEW
+    ) -> None:
+        """
+        2x2 grid:
+          rows = IMU1, IMU2
+          cols = application 1 (first), application 2 (second)
+
+        which_trials:
+          - "both"   : overlay trial 1 and trial 2 (default)
+          - "first"  : only trial 1
+          - "second" : only trial 2
+          - "all"    : include all trials provided (not just first two)
+          - [0,1]    : explicit 0-based indices to include
+        """
+
+        def _select_trials(trials: List):
+            trials = list(trials) if trials else []
+            if not trials:
+                return []
+
+            if isinstance(which_trials, (list, tuple)):
+                idxs = [int(i) for i in which_trials]
+            elif which_trials == "both":
+                idxs = [0, 1]
+            elif which_trials == "first":
+                idxs = [0]
+            elif which_trials == "second":
+                idxs = [1]
+            elif which_trials == "all":
+                idxs = list(range(len(trials)))
+            else:
+                raise ValueError(f"Unknown which_trials={which_trials!r}")
+
+            out = []
+            for i in idxs:
+                if 0 <= i < len(trials):
+                    out.append(trials[i])
+            return out
+
+        app1_trials = _select_trials(imu_trials_first)
+        app2_trials = _select_trials(imu_trials_second)
+
+        if len(app1_trials) == 0 and len(app2_trials) == 0:
+            print("[plot_euler_grid_two_trials_two_apps] No trials selected/provided.")
+            return
+
+        fig, axs = plt.subplots(2, 2, figsize=(14, 7), sharex=False, sharey=False)
+        fig.suptitle(f"{title} — trials={which_trials}")
+
+        imu1_base, imu2_base = quat_cols
+
+        def _plot_panel(ax, trials, imu_base: str, panel_title: str):
+            if not trials:
+                ax.set_title(panel_title + " (no data)")
+                ax.grid(True, alpha=0.3)
+                return
+
+            linestyles = ["-", "--", ":", "-."]  # cycles if >2 trials
+
+            # (optional) validate axes once
+            allowed_axes = {"roll", "pitch", "yaw"}
+            bad = [a for a in euler_axes if a not in allowed_axes]
+            if bad:
+                raise ValueError(f"Unknown euler_axes {bad}. Allowed: {sorted(allowed_axes)}")
+
+            for j, df in enumerate(trials):
+                if df is None or getattr(df, "empty", True):
+                    continue
+
+                d = df.copy()
+                self._imu_ensure_time_column(d, time_col=time_col, trial_len_sec=trial_len_sec)
+
+                # time FIRST
+                t = d[time_col].to_numpy(dtype=float)
+                t = t - t[0]
+
+                # linestyle for this trial
+                ls = linestyles[j % len(linestyles)]
+
+                # quats -> euler
+                Q = self._imu_quat_from_cols(d, imu_base, quat_order=quat_order)
+                roll, pitch, yaw = IMU_cam._quat_to_euler_zyx_deg(Q)
+
+                # unwrap/wrap options
+                if unwrap_euler:
+                    roll = IMU_cam._unwrap_deg(roll)
+                    pitch = IMU_cam._unwrap_deg(pitch)
+                    yaw = IMU_cam._unwrap_deg(yaw)
+
+                if wrap_for_plot:
+                    roll = IMU_cam._wrap180(roll)
+                    pitch = IMU_cam._wrap180(pitch)
+                    yaw = IMU_cam._wrap180(yaw)
+
+                angle_map = {"roll": roll, "pitch": pitch, "yaw": yaw}
+
+                # plot ONLY requested axes
+                for axis_name in euler_axes:
+                    ax.plot(
+                        t,
+                        angle_map[axis_name],
+                        linestyle=ls,
+                        label=f"Trial {j + 1} {axis_name}",
+                    )
+
+            ax.set_title(panel_title)
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Angle (deg)")
+            if deg_lim is not None:
+                ax.set_ylim(deg_lim)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, ncol=2)
+
+        _plot_panel(axs[0, 0], app1_trials, imu1_base, "App 1 (first) – IMU1")
+        _plot_panel(axs[0, 1], app2_trials, imu1_base, "App 2 (second) – IMU1")
+        _plot_panel(axs[1, 0], app1_trials, imu2_base, "App 1 (first) – IMU2")
+        _plot_panel(axs[1, 1], app2_trials, imu2_base, "App 2 (second) – IMU2")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.show()
+
+    @staticmethod
+    def _quat_to_euler_zyx_deg(Q_wxyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Convert quaternions (N,4) in [w,x,y,z] to Euler angles in degrees using ZYX:
+          yaw   = rotation about Z
+          pitch = rotation about Y
+          roll  = rotation about X
+
+        Returns: roll_deg, pitch_deg, yaw_deg arrays length N.
+        """
+        Q = np.asarray(Q_wxyz, dtype=float)
+        if Q.ndim != 2 or Q.shape[1] != 4:
+            raise ValueError(f"Expected Q shape (N,4) [w,x,y,z], got {Q.shape}")
+
+        w, x, y, z = Q[:, 0], Q[:, 1], Q[:, 2], Q[:, 3]
+
+        # roll (x-axis)
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        # pitch (y-axis)
+        sinp = 2.0 * (w * y - z * x)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        pitch = np.arcsin(sinp)
+
+        # yaw (z-axis)
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+    @staticmethod
+    def _unwrap_deg(a_deg: np.ndarray, *, wrap_at: float = 180.0) -> np.ndarray:
+        """
+        Unwrap a degree angle time series to remove jumps at +/-wrap_at.
+        Assumes a_deg is 1D.
+        """
+        a = np.asarray(a_deg, dtype=float)
+        rad = np.deg2rad(a)
+        unwrapped = np.unwrap(rad, discont=np.deg2rad(wrap_at))
+        return np.rad2deg(unwrapped)
+
+    @staticmethod
+    def _wrap180(a_deg: np.ndarray) -> np.ndarray:
+        a = np.asarray(a_deg, dtype=float)
+        return (a + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def drop_all_none_quaternion_rows_df(
+            df: pd.DataFrame,
+            base_names: Sequence[str] = ("euler1", "euler2"),
+    ) -> pd.DataFrame:
+        """
+        Drop rows where ANY quaternion base_name is entirely missing:
+          - tuple-string column equals "(None, None, None, None)" (case/space tolerant)
+          - OR component columns are all-NaN for that base
+
+        This matches your screenshot case: euler2 is (None,None,None,None) while euler1 is valid.
+        """
+        if df is None or df.empty:
+            return df
+
+        df2 = df.copy()
+        keep = np.ones(len(df2), dtype=bool)
+
+        for base in base_names:
+            comp_cols = [f"{base}_w", f"{base}_x", f"{base}_y", f"{base}_z"]
+
+            # ---- Case A: separate component columns ----
+            if all(c in df2.columns for c in comp_cols):
+                all_nan = df2[comp_cols].isna().all(axis=1)
+                keep &= ~all_nan
+
+            # ---- Case B: single tuple / tuple-string column ----
+            elif base in df2.columns:
+                s = df2[base].astype(str).str.lower()
+                s = s.str.replace(" ", "", regex=False).str.strip()
+
+                # Handle both "(none,none,none,none)" and "none,none,none,none"
+                s = s.str.strip("()[]")
+
+                all_none = s.eq("none,none,none,none")
+                keep &= ~all_none
+
+            # else: base not present -> ignore
+
+        return df2.loc[keep].reset_index(drop=True)
+
 
