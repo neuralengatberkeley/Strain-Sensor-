@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
 def mask_to_segments(df, mask, label):
     mask = pd.Series(mask, index=df.index).fillna(False).astype(bool)
     segments = []
@@ -120,6 +119,10 @@ def get_segments_for_column(col, manual_segments, bluetooth_segments, adc_discon
         "IMU2_H", "IMU2_P", "IMU2_R",
         "IMU1_W", "IMU1_X", "IMU1_Y", "IMU1_Z",
         "IMU2_W", "IMU2_X", "IMU2_Y", "IMU2_Z",
+        "wrist_flex_ext_deg",
+        "imu_bend_deg",
+        "imu_pitch_deg",
+        "imu_azimuth_deg",
     ]
     is_adc_plot = col in ["ADC_ch0", "ADC_ch1"]
 
@@ -450,3 +453,106 @@ def keep_min_duration_segments(segments, min_duration_min=0.0083):
         if dur >= min_duration_min:
             out.append(seg)
     return out
+
+
+def add_wrist_flex_ext_from_imus(
+    df,
+    *,
+    quat_order="wxyz",
+    fixed_axis="y",
+    moving_axis="y",
+    plane_normal_axis="z",
+    fe_source_col="imu_azimuth_deg", # or '_bend_' or '_pitch_'
+    out_col="wrist_flex_ext_deg",
+    zero_baseline=True,
+    baseline_window_sec=1.0,
+    baseline_stat="median",   # "median" or "mean" ?
+    abs_value=False,
+    sign=1.0,
+):
+    """
+    Derive a wrist flexion/extension trace from IMU1 + IMU2 quaternions using the same quaternion math as analysis_imu_cam.py.
+
+    Will compute azimuth, bend, and pitch -- can visaully inspect 
+
+    Assumes the unified wear CSV has columns:
+      IMU1_W, IMU1_X, IMU1_Y, IMU1_Z,
+      IMU2_W, IMU2_X, IMU2_Y, IMU2_Z
+
+    Returns a copy of df with:
+      - imu_bend_deg
+      - imu_pitch_deg
+      - imu_azimuth_deg
+      - wrist_flex_ext_deg   (default = signed imu_azimuth_deg)
+    """
+    required = [
+        "IMU1_W", "IMU1_X", "IMU1_Y", "IMU1_Z",
+        "IMU2_W", "IMU2_X", "IMU2_Y", "IMU2_Z",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required IMU quaternion columns: {missing}")
+
+    d = df.copy()
+
+    # Alias wear-file column names to what IMU_cam expects
+    alias_map = {
+        "IMU1_W": "euler1_w",
+        "IMU1_X": "euler1_x",
+        "IMU1_Y": "euler1_y",
+        "IMU1_Z": "euler1_z",
+        "IMU2_W": "euler2_w",
+        "IMU2_X": "euler2_x",
+        "IMU2_Y": "euler2_y",
+        "IMU2_Z": "euler2_z",
+    }
+    for src, dst in alias_map.items():
+        d[dst] = pd.to_numeric(d[src], errors="coerce")
+
+    # use the existing quaternion-angle pipeline
+    from analysis_imu_cam import IMU_cam
+    imu = IMU_cam.__new__(IMU_cam)
+
+    aug_trials, _ = imu.compute_imu_bend_pitch_azimuth_by_trial(
+        [d],
+        set_label="wear",
+        quat_cols=("euler1", "euler2"),
+        fixed_axis=fixed_axis,
+        moving_axis=moving_axis,
+        plane_normal_axis=plane_normal_axis,
+        quat_order=quat_order,
+        bend_col="imu_bend_deg",
+        pitch_col="imu_pitch_deg",
+        azim_col="imu_azimuth_deg",
+        time_col="elapsed_sec",
+        trial_len_sec=None,
+        zero_baseline_bend=False,
+        zero_baseline_pitch=False,
+        zero_baseline_azim=False,
+    )
+
+    d = aug_trials[0]
+
+    # For structured on-hand testing, azimuth was the useful FE-like trace -- not sure now -- manually inspect
+    if fe_source_col not in d.columns:
+        raise KeyError(
+            f"fe_source_col='{fe_source_col}' not found. "
+            f"Valid options: 'imu_bend_deg', 'imu_pitch_deg', 'imu_azimuth_deg'."
+        )
+    d[out_col] = sign * pd.to_numeric(d["imu_azimuth_deg"], errors="coerce")
+
+    if zero_baseline:
+        if "elapsed_sec" in d.columns:
+            mask0 = d["elapsed_sec"] <= (d["elapsed_sec"].min() + baseline_window_sec)
+            base_vals = pd.to_numeric(d.loc[mask0, out_col], errors="coerce").dropna()
+        else:
+            base_vals = pd.to_numeric(d[out_col], errors="coerce").dropna().iloc[:200]
+
+        if len(base_vals) > 0:
+            baseline = base_vals.median() if baseline_stat == "median" else base_vals.mean()
+            d[out_col] = d[out_col] - baseline
+
+    if abs_value:
+        d[out_col] = d[out_col].abs()
+
+    return d
