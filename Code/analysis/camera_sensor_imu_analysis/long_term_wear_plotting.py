@@ -108,10 +108,22 @@ def subtract_blockers(segments, blockers):
     return result
 
 
+# Maps derived angle columns back to their source ADC channel so that
+# ADC disconnect shading is correctly inherited by the angle plots.
+_ADC_DERIVED_CHANNEL_MAP = {
+    "index_mcp_deg": "ADC_ch0",
+    "thumb_mp_deg":  "ADC_ch1",
+}
+
+
 def get_segments_for_column(col, manual_segments, bluetooth_segments, adc_disconnect_segments, imu2_disconnect_segments):
     manual_segments = [s.copy() for s in manual_segments]
     bluetooth_segments = [s.copy() for s in bluetooth_segments]
-    adc_segments = [s.copy() for s in adc_disconnect_segments if s.get("channel") == col]
+
+    # Derived angle columns inherit disconnect shading from their source ADC channel
+    channel_for_adc = _ADC_DERIVED_CHANNEL_MAP.get(col, col)
+    adc_segments = [s.copy() for s in adc_disconnect_segments if s.get("channel") == channel_for_adc]
+
     imu2_segments = [s.copy() for s in imu2_disconnect_segments]
 
     is_imu_plot = col in [
@@ -124,7 +136,7 @@ def get_segments_for_column(col, manual_segments, bluetooth_segments, adc_discon
         "imu_pitch_deg",
         "imu_azimuth_deg",
     ]
-    is_adc_plot = col in ["ADC_ch0", "ADC_ch1"]
+    is_adc_plot = col in ["ADC_ch0", "ADC_ch1"] or col in _ADC_DERIVED_CHANNEL_MAP
 
     blockers = []
     final_segments = []
@@ -539,7 +551,7 @@ def add_wrist_flex_ext_from_imus(
             f"fe_source_col='{fe_source_col}' not found. "
             f"Valid options: 'imu_bend_deg', 'imu_pitch_deg', 'imu_azimuth_deg'."
         )
-    d[out_col] = sign * pd.to_numeric(d["imu_azimuth_deg"], errors="coerce")
+    d[out_col] = sign * pd.to_numeric(d[fe_source_col], errors="coerce")
 
     if zero_baseline:
         if "elapsed_sec" in d.columns:
@@ -556,3 +568,203 @@ def add_wrist_flex_ext_from_imus(
         d[out_col] = d[out_col].abs()
 
     return d
+
+
+def plot_pooled_calibration_fit(
+    pooled_calib_df,
+    *,
+    poly_order=2,
+    clamp_deg=False,
+    adc_scale_factor=1.0,
+    deg_min=0.0,
+    deg_max=90.0,
+    participant_col="participant",
+    title="Pooled ADC calibration — all participants & applications",
+):
+    """
+    Diagnostic plot: scatter of all pooled calibration points colored by
+    participant, with the fitted polynomial overlaid.
+
+    Uses the same np.polyfit / np.poly1d logic as
+    ADC_CAM.calibrate_trials_with_camera(), applied to the concatenated
+    calib_df produced in the notebook.
+
+    Parameters
+    ----------
+    pooled_calib_df : pd.DataFrame
+        Concatenated output of ADC_CAM.extract_calib_means_by_set() across
+        all participants, with an added 'participant' column for color-coding.
+        Must contain columns 'adc_mean' and 'angle_snap_deg'.
+    poly_order : int
+        Polynomial order for the ADC → angle fit (match what you pass to
+        apply_pooled_adc_calibration).
+    deg_min, deg_max : float
+        Angle range used to draw the fitted curve.
+    participant_col : str
+        Column used to color-code scatter points (default 'participant').
+    title : str
+        Figure title.
+    """
+    df = pooled_calib_df.dropna(subset=["adc_mean", "angle_snap_deg"]).copy()
+
+    if df.empty:
+        print("[plot_pooled_calibration_fit] No valid calibration rows — nothing to plot.")
+        return
+
+    x_all = df["adc_mean"].to_numpy(dtype=float)
+    y_all = df["angle_snap_deg"].to_numpy(dtype=float)
+    coeffs = np.polyfit(x_all, y_all, poly_order)
+    poly = np.poly1d(coeffs)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    # Scatter colored by participant
+    if participant_col in df.columns:
+        participants = df[participant_col].unique()
+        colors = plt.cm.tab10(np.linspace(0, 1, len(participants)))
+        for pid, color in zip(participants, colors):
+            sub = df[df[participant_col] == pid]
+            ax.scatter(sub["adc_mean"], sub["angle_snap_deg"],
+                       label=str(pid), alpha=0.6, s=18, color=color, zorder=3)
+    else:
+        ax.scatter(x_all, y_all, alpha=0.6, s=18, zorder=3, label="calibration points")
+
+    # Fitted curve
+    x_curve = np.linspace(x_all.min(), x_all.max(), 300)
+    y_curve = np.clip(poly(x_curve), deg_min, deg_max)
+    if clamp_deg:
+        y_curve = np.clip(y_curve, deg_min, deg_max)
+    ax.plot(x_curve, y_curve, color="black", linewidth=2,
+            label=f"poly order={poly_order}", zorder=4)
+
+    ax.set_xlabel("ADC value" + (f" × {adc_scale_factor:.2e}" if adc_scale_factor != 1.0 else ""))
+    ax.set_ylabel("Angle (°)")
+    ax.set_title(title)
+    ax.legend(fontsize=8, loc="best")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+    n_parts = df[participant_col].nunique() if participant_col in df.columns else "?"
+    print(f"Pooled fit ({len(df)} points, {n_parts} participants)")
+    print(f"Coefficients (scaled): {coeffs}")
+    print(f"Expected angle at wear-data min ADC "
+          f"(inspect x-axis — should overlap the wear ADC range ~1.28-1.38 V)")
+    return coeffs
+
+
+def apply_pooled_adc_calibration(
+    df,
+    pooled_calib_df,
+    *,
+    convert_index_mcp=True,
+    convert_thumb_mp=False,
+    adc_col_index="ADC_ch0",
+    adc_col_thumb="ADC_ch1",
+    out_col_index="index_mcp_deg",
+    out_col_thumb="thumb_mp_deg",
+    poly_order=2,
+    clamp_deg=True,
+    deg_min=0.0,
+    deg_max=90.0,
+    zero_baseline=True,
+    baseline_window_sec=1.0,
+    baseline_stat="median",
+):
+    """
+    Convert raw ADC channels to bend angles (degrees) using a polynomial fit
+    trained on pooled calibration data from multiple participants/applications.
+
+    The polynomial is fit once on all rows of pooled_calib_df
+    (np.polyfit on adc_mean → angle_snap_deg), replicating the logic in
+    ADC_CAM.calibrate_trials_with_camera() but across a pooled dataset.
+
+    Important caveats
+    -----------------
+    - Calibration was collected only for Index MCP (adc_ch3 / ADC_ch0).
+    - Thumb MP (ADC_ch1) has no calibration data.  If convert_thumb_mp=True,
+      the same Index MCP polynomial is applied as a rough proxy — the shape
+      will be meaningful but the absolute values are not validated.
+    - Because individual sensor instances differ in resting ADC value,
+      zero_baseline=True is best: it expresses angles as
+      *degrees of change from the starting posture* rather than absolute angle.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        df_plot with ADC_ch0 / ADC_ch1 already NaN-filled for disconnected rows.
+    pooled_calib_df : pd.DataFrame
+        Concatenated output of ADC_CAM.extract_calib_means_by_set() across
+        all participants.  Must contain 'adc_mean' and 'angle_snap_deg'.
+    convert_index_mcp : bool
+        If True, convert ADC_ch0 → index_mcp_deg.
+    convert_thumb_mp : bool
+        If True, apply the Index MCP polynomial to ADC_ch1 → thumb_mp_deg.
+    poly_order : int
+        Polynomial order for the ADC → angle mapping (default 2).
+    clamp_deg : bool
+        Clamp output to [deg_min, deg_max].
+    zero_baseline : bool
+        Subtract the median (or mean) of the first baseline_window_sec of
+        valid samples so the trace starts near 0.
+    baseline_window_sec : float
+        Duration of the leading window used for baseline estimation.
+    baseline_stat : {"median", "mean"}
+        Statistic for the baseline value.
+
+    Returns
+    -------
+    df : pd.DataFrame (copy) with index_mcp_deg and/or thumb_mp_deg added.
+    """
+    calib = pooled_calib_df.dropna(subset=["adc_mean", "angle_snap_deg"]).copy()
+    if calib.empty:
+        raise ValueError("pooled_calib_df has no valid rows after dropping NaN.")
+
+
+    # Fit polynomial in scaled (volt-equivalent) space
+    # (same np.polyfit / np.poly1d logic as ADC_CAM.calibrate_trials_with_camera)
+    x_cal = calib["adc_mean"].to_numpy(dtype=float)
+    y_cal = calib["angle_snap_deg"].to_numpy(dtype=float)
+    coeffs = np.polyfit(x_cal, y_cal, poly_order)
+    poly = np.poly1d(coeffs)
+
+    df = df.copy()
+
+    def _convert_and_baseline(adc_col, out_col, label):
+        if adc_col not in df.columns:
+            print(f"[apply_pooled_adc_calibration] '{adc_col}' not found — skipping {out_col}.")
+            return
+
+        adc_vals = pd.to_numeric(df[adc_col], errors="coerce").to_numpy(dtype=float)
+        theta = poly(adc_vals)
+
+        if clamp_deg:
+            theta = np.clip(theta, deg_min, deg_max)
+
+        # Propagate NaNs from source ADC column
+        theta[np.isnan(adc_vals)] = np.nan
+        df[out_col] = theta
+
+        if zero_baseline:
+            if "elapsed_sec" in df.columns:
+                t0 = df["elapsed_sec"].min()
+                mask0 = df["elapsed_sec"] <= (t0 + baseline_window_sec)
+                base_vals = pd.to_numeric(df.loc[mask0, out_col], errors="coerce").dropna()
+            else:
+                base_vals = pd.to_numeric(df[out_col], errors="coerce").dropna().iloc[:500]
+
+            if len(base_vals) > 0:
+                baseline = (base_vals.median() if baseline_stat == "median"
+                            else base_vals.mean())
+                df[out_col] = df[out_col] - baseline
+
+        n_valid = int(np.isfinite(df[out_col].to_numpy()).sum())
+
+    if convert_index_mcp:
+        _convert_and_baseline(adc_col_index, out_col_index, "Index MCP")
+    if convert_thumb_mp:
+        _convert_and_baseline(adc_col_thumb, out_col_thumb,
+                               "Thumb MP [proxy — Index MCP curve applied]")
+
+    return df
