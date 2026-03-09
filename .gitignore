@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+/CSV Data/long_term_wear_data/**/*.csv
