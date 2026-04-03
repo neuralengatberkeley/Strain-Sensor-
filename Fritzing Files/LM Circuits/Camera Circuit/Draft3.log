@@ -1,0 +1,14 @@
+LTspice 24.1.9 for Windows
+Circuit: C:\Users\toppe\OneDrive - CSU Maritime Academy\Documents\GitHub\Strain-Sensor-\Fritzing Files\LM Circuits\Camera Circuit\Draft3.net
+Start Time: Fri Mar 27 09:16:27 2026
+solver = Normal
+Maximum thread count: 20
+tnom = 27
+temp = 27
+method = trap
+Direct Newton iteration for .op point succeeded.
+Total elapsed time: 0.152 seconds.
+
+Files loaded:
+C:\Users\toppe\OneDrive - CSU Maritime Academy\Documents\GitHub\Strain-Sensor-\Fritzing Files\LM Circuits\Camera Circuit\Draft3.net
+
