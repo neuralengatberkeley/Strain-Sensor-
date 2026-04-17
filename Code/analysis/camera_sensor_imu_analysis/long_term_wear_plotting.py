@@ -569,202 +569,1109 @@ def add_wrist_flex_ext_from_imus(
 
     return d
 
+from scipy.signal import welch, find_peaks
 
-def plot_pooled_calibration_fit(
-    pooled_calib_df,
-    *,
-    poly_order=2,
-    clamp_deg=False,
-    adc_scale_factor=1.0,
-    deg_min=0.0,
-    deg_max=90.0,
-    participant_col="participant",
-    title="Pooled ADC calibration — all participants & applications",
+def build_activity_segments_df(manual_segments):
+    """Convert manual_segments list-of-dicts → tidy DataFrame with segment_id."""
+    if not manual_segments:
+        return pd.DataFrame(columns=["segment_id", "label", "start_min", "end_min", "duration_sec"])
+    seg_df = pd.DataFrame(manual_segments).copy()
+    seg_df = seg_df.sort_values(["start_min", "end_min"]).reset_index(drop=True)
+    seg_df["segment_id"] = np.arange(1, len(seg_df) + 1)
+    seg_df["duration_sec"] = 60.0 * (seg_df["end_min"] - seg_df["start_min"])
+    return seg_df[["segment_id", "label", "start_min", "end_min", "duration_sec"]]
+
+
+def print_label_table(manual_segments):
+    """
+    Print a readable label table from manual_segments.
+
+    Example output
+    --------------
+    #   label      start (min)   end (min)   duration
+    1   walking       22.44        37.56       15 min 5 s
+    2   eating        37.56        51.32       13 min 45 s
+    ...
+    """
+    if not manual_segments:
+        print("No manual segments defined.")
+        return
+
+    seg_df = build_activity_segments_df(manual_segments)
+
+    header = f"{'#':<4}  {'label':<14}  {'start (min)':>11}  {'end (min)':>9}  {'duration':>12}"
+    print(header)
+    print("-" * len(header))
+
+    for _, row in seg_df.iterrows():
+        dur_s  = row["duration_sec"]
+        mins   = int(dur_s // 60)
+        secs   = int(dur_s % 60)
+        dur_str = f"{mins} min {secs:02d} s" if mins else f"{secs} s"
+        print(
+            f"{int(row['segment_id']):<4}  {row['label']:<14}  "
+            f"{row['start_min']:>11.3f}  {row['end_min']:>9.3f}  {dur_str:>12}"
+        )
+
+def slice_df_by_segment(df, start_min, end_min, pad_sec=0.0):
+    """Return rows of df within [start_min - pad, end_min + pad]."""
+    pad_min = pad_sec / 60.0
+    return df.loc[
+        (df["elapsed_min"] >= start_min - pad_min) &
+        (df["elapsed_min"] <= end_min   + pad_min)
+    ].copy()
+
+
+def _label_for_window(manual_segments, start_min, end_min):
+    """
+    Return a title string describing which activity labels overlap [start_min, end_min].
+
+    If the window sits entirely inside one segment → "walking"
+    If it spans multiple               → "walking / eating"
+    If none overlap                    → "" (empty)
+    """
+    hits = []
+    seen = set()
+    for seg in sorted(manual_segments, key=lambda s: s["start_min"]):
+        # overlap check
+        if seg["end_min"] <= start_min or seg["start_min"] >= end_min:
+            continue
+        lbl = seg["label"]
+        if lbl not in seen:
+            hits.append(lbl)
+            seen.add(lbl)
+    return " / ".join(hits)
+
+
+def plot_time_window(
+    df,
+    start_min,
+    end_min,
+    columns=None,
+    manual_segments=None,
+    label_colors=None,
+    display_name_map=None,
+    xcol="elapsed_min",
 ):
     """
-    Diagnostic plot: scatter of all pooled calibration points colored by
-    participant, with the fitted polynomial overlaid.
+    Plot a specific time window with activity shading and an auto-generated title.
 
-    Uses the same np.polyfit / np.poly1d logic as
-    ADC_CAM.calibrate_trials_with_camera(), applied to the concatenated
-    calib_df produced in the notebook.
+    The title shows which activity label(s) fall within the window, so you can
+    call this repeatedly with different start/end times to inspect each segment.
+
+    Requires ``%matplotlib widget`` (ipympl) in the calling cell for pan/zoom.
 
     Parameters
     ----------
-    pooled_calib_df : pd.DataFrame
-        Concatenated output of ADC_CAM.extract_calib_means_by_set() across
-        all participants, with an added 'participant' column for color-coding.
-        Must contain columns 'adc_mean' and 'angle_snap_deg'.
-    poly_order : int
-        Polynomial order for the ADC → angle fit (match what you pass to
-        apply_pooled_adc_calibration).
-    deg_min, deg_max : float
-        Angle range used to draw the fitted curve.
-    participant_col : str
-        Column used to color-code scatter points (default 'participant').
-    title : str
-        Figure title.
+    df            : DataFrame containing the signals
+    start_min     : window start in minutes
+    end_min       : window end in minutes
+    columns       : list of column names to plot (one subplot each)
+    manual_segments : list-of-dicts used to determine the title label
+    label_colors  : dict label → hex colour for shading
+    display_name_map : dict col → display name for y-axis labels
+    xcol          : x-axis column (default "elapsed_min")
     """
-    df = pooled_calib_df.dropna(subset=["adc_mean", "angle_snap_deg"]).copy()
+    manual_segments  = manual_segments  or []
+    label_colors     = label_colors     or {}
+    display_name_map = display_name_map or {}
 
-    if df.empty:
-        print("[plot_pooled_calibration_fit] No valid calibration rows — nothing to plot.")
-        return
+    if columns is None:
+        columns = [c for c in ["wrist_flex_ext_deg", "index_mcp_deg", "thumb_mp_deg",
+                                "ADC_ch0", "ADC_ch1"] if c in df.columns]
+    columns = [c for c in columns if c in df.columns]
+    if not columns:
+        raise ValueError("No valid columns found in df.")
 
-    x_all = df["adc_mean"].to_numpy(dtype=float)
-    y_all = df["angle_snap_deg"].to_numpy(dtype=float)
-    coeffs = np.polyfit(x_all, y_all, poly_order)
-    poly = np.poly1d(coeffs)
+    df_win = slice_df_by_segment(df, start_min, end_min)
+    activity_label = _label_for_window(manual_segments, start_min, end_min)
+    dur_s  = (end_min - start_min) * 60
+    title  = (
+        f"{activity_label}  |  {start_min:.2f} - {end_min:.2f} min  "
+        f"({dur_s:.0f} s)"
+        if activity_label
+        else f"{start_min:.2f} - {end_min:.2f} min  ({dur_s:.0f} s)"
+    )
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, axes = plt.subplots(len(columns), 1,
+                             figsize=(14, 2.4 * len(columns)),
+                             sharex=True)
+    if len(columns) == 1:
+        axes = [axes]
 
-    # Scatter colored by participant
-    if participant_col in df.columns:
-        participants = df[participant_col].unique()
-        colors = plt.cm.tab10(np.linspace(0, 1, len(participants)))
-        for pid, color in zip(participants, colors):
-            sub = df[df[participant_col] == pid]
-            ax.scatter(sub["adc_mean"], sub["angle_snap_deg"],
-                       label=str(pid), alpha=0.6, s=18, color=color, zorder=3)
-    else:
-        ax.scatter(x_all, y_all, alpha=0.6, s=18, zorder=3, label="calibration points")
+    for ax, col in zip(axes, columns):
+        ax.plot(df_win[xcol], df_win[col], linewidth=0.9, zorder=2)
+        ax.set_ylabel(display_name_map.get(col, col), fontsize=9)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
 
-    # Fitted curve
-    x_curve = np.linspace(x_all.min(), x_all.max(), 300)
-    y_curve = np.clip(poly(x_curve), deg_min, deg_max)
-    if clamp_deg:
-        y_curve = np.clip(y_curve, deg_min, deg_max)
-    ax.plot(x_curve, y_curve, color="black", linewidth=2,
-            label=f"poly order={poly_order}", zorder=4)
+        # shade any segments that overlap this window
+        for seg in manual_segments:
+            x0 = max(seg["start_min"], start_min)
+            x1 = min(seg["end_min"],   end_min)
+            if x1 <= x0:
+                continue
+            color = label_colors.get(seg["label"], "lightgray")
+            ax.axvspan(x0, x1, color=color, alpha=0.30, zorder=0)
 
-    ax.set_xlabel("ADC value" + (f" × {adc_scale_factor:.2e}" if adc_scale_factor != 1.0 else ""))
-    ax.set_ylabel("Angle (°)")
-    ax.set_title(title)
-    ax.legend(fontsize=8, loc="best")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    plt.title(activity_label)
+
+    axes[0].set_title(title, fontsize=11)
+    axes[-1].set_xlabel("Time (min)")
     plt.tight_layout()
     plt.show()
 
-    n_parts = df[participant_col].nunique() if participant_col in df.columns else "?"
-    print(f"Pooled fit ({len(df)} points, {n_parts} participants)")
-    print(f"Coefficients (scaled): {coeffs}")
-    print(f"Expected angle at wear-data min ADC "
-          f"(inspect x-axis — should overlap the wear ADC range ~1.28-1.38 V)")
-    return coeffs
+
+import re
 
 
-def apply_pooled_adc_calibration(
-    df,
-    pooled_calib_df,
+def set_segments_to_fixed_duration(
+    segments,
     *,
-    convert_index_mcp=True,
-    convert_thumb_mp=False,
-    adc_col_index="ADC_ch0",
-    adc_col_thumb="ADC_ch1",
-    out_col_index="index_mcp_deg",
-    out_col_thumb="thumb_mp_deg",
-    poly_order=2,
-    clamp_deg=True,
-    deg_min=0.0,
-    deg_max=90.0,
-    zero_baseline=True,
-    baseline_window_sec=1.0,
-    baseline_stat="median",
+    duration_sec=10.0,
+    end_cap_min=None,
 ):
     """
-    Convert raw ADC channels to bend angles (degrees) using a polynomial fit
-    trained on pooled calibration data from multiple participants/applications.
-
-    The polynomial is fit once on all rows of pooled_calib_df
-    (np.polyfit on adc_mean → angle_snap_deg), replicating the logic in
-    ADC_CAM.calibrate_trials_with_camera() but across a pooled dataset.
-
-    Important caveats
-    -----------------
-    - Calibration was collected only for Index MCP (adc_ch3 / ADC_ch0).
-    - Thumb MP (ADC_ch1) has no calibration data.  If convert_thumb_mp=True,
-      the same Index MCP polynomial is applied as a rough proxy — the shape
-      will be meaningful but the absolute values are not validated.
-    - Because individual sensor instances differ in resting ADC value,
-      zero_baseline=True is best: it expresses angles as
-      *degrees of change from the starting posture* rather than absolute angle.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        df_plot with ADC_ch0 / ADC_ch1 already NaN-filled for disconnected rows.
-    pooled_calib_df : pd.DataFrame
-        Concatenated output of ADC_CAM.extract_calib_means_by_set() across
-        all participants.  Must contain 'adc_mean' and 'angle_snap_deg'.
-    convert_index_mcp : bool
-        If True, convert ADC_ch0 → index_mcp_deg.
-    convert_thumb_mp : bool
-        If True, apply the Index MCP polynomial to ADC_ch1 → thumb_mp_deg.
-    poly_order : int
-        Polynomial order for the ADC → angle mapping (default 2).
-    clamp_deg : bool
-        Clamp output to [deg_min, deg_max].
-    zero_baseline : bool
-        Subtract the median (or mean) of the first baseline_window_sec of
-        valid samples so the trace starts near 0.
-    baseline_window_sec : float
-        Duration of the leading window used for baseline estimation.
-    baseline_stat : {"median", "mean"}
-        Statistic for the baseline value.
-
-    Returns
-    -------
-    df : pd.DataFrame (copy) with index_mcp_deg and/or thumb_mp_deg added.
+    Return a copy of ``segments`` where every segment duration is forced to
+    ``duration_sec`` from its start time.
     """
-    calib = pooled_calib_df.dropna(subset=["adc_mean", "angle_snap_deg"]).copy()
-    if calib.empty:
-        raise ValueError("pooled_calib_df has no valid rows after dropping NaN.")
+    dur_min = float(duration_sec) / 60.0
+    out = []
+
+    for seg in segments:
+        seg2 = dict(seg)
+        start_min = float(seg2["start_min"])
+        end_min = start_min + dur_min
+        if end_cap_min is not None:
+            end_min = min(end_min, float(end_cap_min))
+        seg2["end_min"] = end_min
+        out.append(seg2)
+
+    return out
 
 
-    # Fit polynomial in scaled (volt-equivalent) space
-    # (same np.polyfit / np.poly1d logic as ADC_CAM.calibrate_trials_with_camera)
-    x_cal = calib["adc_mean"].to_numpy(dtype=float)
-    y_cal = calib["angle_snap_deg"].to_numpy(dtype=float)
-    coeffs = np.polyfit(x_cal, y_cal, poly_order)
-    poly = np.poly1d(coeffs)
+def extract_calibration_segments_from_notes(
+    note_rows,
+    *,
+    duration_sec=10.0,
+    end_cap_min=None,
+    time_col="elapsed_min",
+    note_col="Note",
+    sensor_channel_map=None,
+):
+    """
+    Parse note-labeled calibration holds from a unified kinwatch CSV.
 
-    df = df.copy()
+    Expected note styles include:
+      - "channel 0 is index"
+      - "START 0"
+      - "START 22.5"
+      - "Thumb START 45"
+      - "Index START 67.5"
+      - "Above was index"
 
-    def _convert_and_baseline(adc_col, out_col, label):
+    Plain "START X" notes inherit the most recent sensor context.
+    Returned segments are fixed-duration windows starting at each START note.
+    """
+    if sensor_channel_map is None:
+        sensor_channel_map = {"index": "ADC_ch0", "thumb": "ADC_ch1"}
+
+    if note_rows is None or len(note_rows) == 0:
+        return []
+
+    notes = note_rows.copy()
+    notes = notes.sort_values(time_col).reset_index(drop=True)
+
+    current_sensor = "index"
+    out = []
+
+    channel_sensor_pat = re.compile(
+        r"channel\s*(\d+)\s+is\s+(index|thumb)", flags=re.IGNORECASE
+    )
+    explicit_start_pat = re.compile(
+        r"^(index|thumb)\s+start\s+(-?\d+(?:\.\d+)?)$",
+        flags=re.IGNORECASE,
+    )
+    plain_start_pat = re.compile(
+        r"^start\s+(-?\d+(?:\.\d+)?)$",
+        flags=re.IGNORECASE,
+    )
+    above_was_pat = re.compile(r"above\s+was\s+(index|thumb)", flags=re.IGNORECASE)
+
+    for _, row in notes.iterrows():
+        note = str(row.get(note_col, "")).strip()
+        if not note:
+            continue
+
+        m_chan = channel_sensor_pat.search(note)
+        if m_chan:
+            ch_num = int(m_chan.group(1))
+            sensor = m_chan.group(2).lower()
+            sensor_channel_map[sensor] = f"ADC_ch{ch_num}"
+            current_sensor = sensor
+            continue
+
+        m_above = above_was_pat.search(note)
+        if m_above:
+            current_sensor = m_above.group(1).lower()
+            continue
+
+        sensor = None
+        angle_deg = None
+
+        m_explicit = explicit_start_pat.match(note)
+        if m_explicit:
+            sensor = m_explicit.group(1).lower()
+            angle_deg = float(m_explicit.group(2))
+        else:
+            m_plain = plain_start_pat.match(note)
+            if m_plain:
+                sensor = current_sensor
+                angle_deg = float(m_plain.group(1))
+
+        if sensor is None or angle_deg is None:
+            continue
+
+        start_min = float(row[time_col])
+        end_min = start_min + float(duration_sec) / 60.0
+        if end_cap_min is not None:
+            end_min = min(end_min, float(end_cap_min))
+
+        label_angle = int(angle_deg) if float(angle_deg).is_integer() else angle_deg
+        out.append(
+            {
+                "start_min": start_min,
+                "end_min": end_min,
+                "label": f"{sensor} {label_angle}",
+                "sensor": sensor,
+                "channel": sensor_channel_map.get(sensor),
+                "angle_deg": float(angle_deg),
+                "note": note,
+            }
+        )
+
+    return out
+
+
+def build_adc_calibration_table(
+    df,
+    calib_segments,
+    *,
+    time_col="elapsed_min",
+    adc_col_override=None,
+    agg="mean",
+):
+    """
+    Compute one calibration point per labeled hold segment.
+    """
+    if df is None or df.empty or not calib_segments:
+        return pd.DataFrame(
+            columns=[
+                "sensor", "channel", "angle_deg",
+                "start_min", "end_min", "adc_mean", "adc_std", "n", "label",
+            ]
+        )
+
+    rows = []
+    for seg in calib_segments:
+        adc_col = adc_col_override or seg.get("channel")
+        if adc_col is None or adc_col not in df.columns:
+            continue
+
+        start_min = float(seg["start_min"])
+        end_min = float(seg["end_min"])
+
+        mask = (
+            (df[time_col] >= start_min) &
+            (df[time_col] <= end_min)
+        )
+        vals = pd.to_numeric(df.loc[mask, adc_col], errors="coerce").dropna()
+
+        if vals.empty:
+            continue
+
+        if agg == "median":
+            adc_mean = float(vals.median())
+        else:
+            adc_mean = float(vals.mean())
+
+        rows.append(
+            {
+                "sensor": seg.get("sensor"),
+                "channel": adc_col,
+                "angle_deg": float(seg.get("angle_deg")),
+                "start_min": start_min,
+                "end_min": end_min,
+                "adc_mean": adc_mean,
+                "adc_std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+                "n": int(len(vals)),
+                "label": seg.get("label"),
+            }
+        )
+
+    calib_df = pd.DataFrame(rows)
+    if calib_df.empty:
+        return calib_df
+
+    return calib_df.sort_values(["sensor", "angle_deg", "start_min"]).reset_index(drop=True)
+
+
+def build_adc_calibration_table_from_spec(
+    df,
+    calib_spec_df,
+    *,
+    time_col="elapsed_min",
+    agg="mean",
+):
+    rows = []
+
+    if df is None or df.empty or calib_spec_df is None or calib_spec_df.empty:
+        return pd.DataFrame()
+
+    for _, seg in calib_spec_df.iterrows():
+        adc_col = seg["channel"]
+        start_min = float(seg["start_min"])
+        end_min = float(seg["end_min"])
+
         if adc_col not in df.columns:
-            print(f"[apply_pooled_adc_calibration] '{adc_col}' not found — skipping {out_col}.")
-            return
+            continue
 
-        adc_vals = pd.to_numeric(df[adc_col], errors="coerce").to_numpy(dtype=float)
-        theta = poly(adc_vals)
+        mask = (df[time_col] >= start_min) & (df[time_col] <= end_min)
+        vals = pd.to_numeric(df.loc[mask, adc_col], errors="coerce").dropna()
 
-        if clamp_deg:
-            theta = np.clip(theta, deg_min, deg_max)
+        if vals.empty:
+            continue
 
-        # Propagate NaNs from source ADC column
-        theta[np.isnan(adc_vals)] = np.nan
-        df[out_col] = theta
+        if agg == "median":
+            adc_mean = float(vals.median())
+        else:
+            adc_mean = float(vals.mean())
 
-        if zero_baseline:
-            if "elapsed_sec" in df.columns:
-                t0 = df["elapsed_sec"].min()
-                mask0 = df["elapsed_sec"] <= (t0 + baseline_window_sec)
-                base_vals = pd.to_numeric(df.loc[mask0, out_col], errors="coerce").dropna()
+        rows.append({
+            "set_label": seg.get("set_label"),
+            "sensor": seg.get("sensor"),
+            "channel": adc_col,
+            "angle_deg": float(seg.get("angle_deg")),
+            "start_min": start_min,
+            "end_min": end_min,
+            "adc_mean": adc_mean,
+            "adc_std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+            "n": int(len(vals)),
+            "label": seg.get("label"),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    return out.sort_values(["set_label", "sensor", "angle_deg", "start_min"]).reset_index(drop=True)
+
+
+
+def _transform_adc_for_model(
+    adc_vals,
+    model,
+    *,
+    clip_normalized=False,
+):
+    """
+    Convert raw ADC values into the input space expected by ``model``.
+
+    If the model was fit with ``normalize_adc=True``, this maps raw ADC to:
+        (adc - adc_min) / (adc_max - adc_min)
+
+    using the fit-set min/max stored in the model. Optionally clips the
+    normalized values to [0, 1].
+    """
+    vals = np.asarray(adc_vals, dtype=float)
+
+    if model is None or not model.get("normalize_adc", False):
+        return vals
+
+    adc_min = float(model["adc_min"])
+    adc_max = float(model["adc_max"])
+    denom = adc_max - adc_min
+
+    if denom == 0 or not np.isfinite(denom):
+        out = np.full_like(vals, np.nan, dtype=float)
+    else:
+        out = (vals - adc_min) / denom
+        if clip_normalized:
+            out = np.clip(out, 0.0, 1.0)
+
+    out[np.isnan(vals)] = np.nan
+    return out
+
+
+def _evaluate_adc_angle_model(
+    model,
+    adc_vals,
+    *,
+    clip_normalized=False,
+):
+    """
+    Evaluate an ADC -> angle model on raw ADC input values.
+    """
+    adc_vals = np.asarray(adc_vals, dtype=float)
+    x_eval = _transform_adc_for_model(
+        adc_vals,
+        model,
+        clip_normalized=clip_normalized,
+    )
+    theta = np.asarray(model["poly"](x_eval), dtype=float)
+    theta[np.isnan(adc_vals)] = np.nan
+    return theta
+
+
+def fit_adc_angle_models(
+    calib_df,
+    *,
+    poly_order=2,
+    group_col="sensor",
+    normalize_adc=False,
+):
+    """
+    Fit ADC -> angle polynomial models.
+
+    If ``normalize_adc=True``, the model is fit in normalized-ADC space using
+    the fit-set's own raw ADC min/max:
+        adc_norm = (adc - adc_min) / (adc_max - adc_min)
+
+    The raw ``adc_min`` / ``adc_max`` from the chosen fit set are stored in the
+    model and later reused when applying the model to wear data.
+    """
+    models = {}
+    if calib_df is None or calib_df.empty:
+        return models
+
+    for group_value, sub in calib_df.groupby(group_col):
+        sub = sub.dropna(subset=["adc_mean", "angle_deg"]).copy()
+        sub = sub.sort_values("angle_deg")
+
+        if len(sub) < 2:
+            continue
+
+        fit_order = min(int(poly_order), len(sub) - 1)
+        x_raw = sub["adc_mean"].to_numpy(dtype=float)
+        y = sub["angle_deg"].to_numpy(dtype=float)
+
+        adc_min = float(np.nanmin(x_raw))
+        adc_max = float(np.nanmax(x_raw))
+        denom = adc_max - adc_min
+
+        if normalize_adc:
+            if denom == 0 or not np.isfinite(denom):
+                print(
+                    f"Skipping {group_value}: cannot normalize because "
+                    f"adc_max == adc_min."
+                )
+                continue
+            x_fit = (x_raw - adc_min) / denom
+        else:
+            x_fit = x_raw
+
+        coeffs = np.polyfit(x_fit, y, fit_order)
+        models[group_value] = {
+            "coeffs": coeffs,
+            "poly": np.poly1d(coeffs),
+            "fit_order": fit_order,
+            "channel": sub["channel"].iloc[0] if "channel" in sub.columns else None,
+            "adc_min": adc_min,
+            "adc_max": adc_max,
+            "angle_min": float(np.nanmin(y)),
+            "angle_max": float(np.nanmax(y)),
+            "n_points": int(len(sub)),
+            "normalize_adc": bool(normalize_adc),
+            "calib_df": sub.reset_index(drop=True),
+        }
+
+    return models
+
+
+def summarize_adc_angle_models(models):
+    """
+    Convert model dict from ``fit_adc_angle_models`` into a small summary table.
+    """
+    rows = []
+    for sensor, model in (models or {}).items():
+        rows.append(
+            {
+                "sensor": sensor,
+                "channel": model.get("channel"),
+                "fit_order": model.get("fit_order"),
+                "n_points": model.get("n_points"),
+                "normalize_adc": bool(model.get("normalize_adc", False)),
+                "adc_min": model.get("adc_min"),
+                "adc_max": model.get("adc_max"),
+                "angle_min": model.get("angle_min"),
+                "angle_max": model.get("angle_max"),
+                "coeffs": np.array2string(
+                    np.asarray(model.get("coeffs")),
+                    precision=6,
+                    separator=", ",
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def apply_adc_angle_models(
+    df,
+    models,
+    *,
+    source_col_map=None,
+    output_col_map=None,
+    clamp=True,
+    clamp_range_map=None,
+    clip_normalized=True,
+):
+    """
+    Apply fitted ADC -> angle polynomials to a dataframe.
+
+    If a model was fit with ``normalize_adc=True``, raw ADC is first normalized
+    using that model's stored fit-set ``adc_min`` / ``adc_max``. If
+    ``clip_normalized=True``, normalized ADC is clipped to [0, 1] before the
+    polynomial is evaluated.
+    """
+    if output_col_map is None:
+        output_col_map = {"index": "index_mcp_deg", "thumb": "thumb_mp_deg"}
+
+    out = df.copy()
+
+    for sensor, model in (models or {}).items():
+        src_col = (
+            source_col_map.get(sensor)
+            if source_col_map is not None and sensor in source_col_map
+            else model.get("channel")
+        )
+        out_col = output_col_map.get(sensor, f"{sensor}_deg")
+
+        if src_col is None or src_col not in out.columns:
+            continue
+
+        adc_vals = pd.to_numeric(out[src_col], errors="coerce").to_numpy(dtype=float)
+        theta = _evaluate_adc_angle_model(
+            model,
+            adc_vals,
+            clip_normalized=clip_normalized,
+        )
+
+        if clamp:
+            if clamp_range_map is not None and sensor in clamp_range_map:
+                lo, hi = clamp_range_map[sensor]
             else:
-                base_vals = pd.to_numeric(df[out_col], errors="coerce").dropna().iloc[:500]
+                lo = model.get("angle_min", np.nanmin(theta))
+                hi = model.get("angle_max", np.nanmax(theta))
+            theta = np.clip(theta, lo, hi)
 
-            if len(base_vals) > 0:
-                baseline = (base_vals.median() if baseline_stat == "median"
-                            else base_vals.mean())
-                df[out_col] = df[out_col] - baseline
+        theta[np.isnan(adc_vals)] = np.nan
+        out[out_col] = theta
 
-        n_valid = int(np.isfinite(df[out_col].to_numpy()).sum())
+    return out
 
-    if convert_index_mcp:
-        _convert_and_baseline(adc_col_index, out_col_index, "Index MCP")
-    if convert_thumb_mp:
-        _convert_and_baseline(adc_col_thumb, out_col_thumb,
-                               "Thumb MP [proxy — Index MCP curve applied]")
 
-    return df
+def plot_adc_calibration_models(
+    calib_df,
+    models,
+    *,
+    group_col="sensor",
+    figsize=(10, 4),
+    normal=False,
+):
+    """
+    Scatter calibration points and overlay fit with:
+    x-axis = angle (deg)
+    y-axis = ADC value, or normalized ADC if normal=True
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if calib_df is None or calib_df.empty:
+        print("No calibration points to plot.")
+        return
+
+    sensors = list(calib_df[group_col].dropna().unique())
+    if not sensors:
+        print("No calibration groups found.")
+        return
+
+    fig, axes = plt.subplots(1, len(sensors), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+
+    for ax, sensor in zip(axes, sensors):
+        sub = calib_df[calib_df[group_col] == sensor].copy()
+        sub = sub.sort_values("angle_deg")
+
+        model = (models or {}).get(sensor)
+
+        if normal:
+            if model is None:
+                print(f"Skipping normalization for {sensor}: no model found.")
+                y_vals = sub["adc_mean"].to_numpy(dtype=float)
+                y_label = "ADC value"
+            else:
+                adc_min = float(model["adc_min"])
+                adc_max = float(model["adc_max"])
+                denom = adc_max - adc_min
+                if denom == 0:
+                    print(f"Skipping normalization for {sensor}: adc_max == adc_min.")
+                    y_vals = sub["adc_mean"].to_numpy(dtype=float)
+                    y_label = "ADC value"
+                else:
+                    y_vals = (sub["adc_mean"].to_numpy(dtype=float) - adc_min) / denom
+                    y_label = "Normalized ADC"
+        else:
+            y_vals = sub["adc_mean"].to_numpy(dtype=float)
+            y_label = "ADC value"
+
+        ax.scatter(sub["angle_deg"], y_vals, s=35, alpha=0.9)
+
+        for (_, row), y in zip(sub.iterrows(), y_vals):
+            ax.annotate(
+                f"{row['angle_deg']:.1f}°",
+                (row["angle_deg"], y),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=8,
+            )
+
+        if model is not None:
+            adc_grid = np.linspace(
+                min(sub["adc_mean"].min(), model["adc_min"]),
+                max(sub["adc_mean"].max(), model["adc_max"]),
+                300,
+            )
+            angle_grid = _evaluate_adc_angle_model(model, adc_grid, clip_normalized=False)
+
+            if normal:
+                adc_min = float(model["adc_min"])
+                adc_max = float(model["adc_max"])
+                denom = adc_max - adc_min
+                if denom != 0:
+                    y_grid = (adc_grid - adc_min) / denom
+                else:
+                    y_grid = adc_grid
+            else:
+                y_grid = adc_grid
+
+            ax.plot(angle_grid, y_grid, linewidth=2)
+
+        ax.set_title(f"{sensor.capitalize()} calibration")
+        ax.set_xlabel("Angle (°)")
+        ax.set_ylabel(y_label)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_calibration_sets_by_sensor(
+    df_raw,
+    calib_spec_df,
+    calib_summary_df,
+    models,
+    *,
+    time_col="elapsed_min",
+    figsize=(12, 5),
+    normal=False,
+    alpha_raw=0.18,
+    raw_marker_size=10,
+    mean_marker_size=42,
+    line_width=2.0,
+    set_order=None,
+    set_color_map=None,
+):
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    if calib_spec_df is None or len(calib_spec_df) == 0:
+        print("No calibration spec rows to plot.")
+        return
+    if calib_summary_df is None or calib_summary_df.empty:
+        print("No calibration summary table to plot.")
+        return
+
+    spec = calib_spec_df.copy()
+    summ = calib_summary_df.copy()
+
+    if set_order is None:
+        set_order = list(pd.unique(spec["set_label"]))
+
+    if set_color_map is None:
+        default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        set_color_map = {
+            label: default_colors[i % len(default_colors)]
+            for i, label in enumerate(set_order)
+        }
+
+    sensors_present = [s for s in ["index", "thumb"] if s in spec["sensor"].unique()]
+    if not sensors_present:
+        print("No index/thumb sensors found.")
+        return
+
+    fig, axes = plt.subplots(1, len(sensors_present), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+
+    for ax, sensor in zip(axes, sensors_present):
+        spec_sensor = spec[spec["sensor"] == sensor].copy()
+        summ_sensor = summ[summ["sensor"] == sensor].copy()
+
+        sensor_set_labels = [lbl for lbl in set_order if lbl in spec_sensor["set_label"].unique()]
+
+        for set_label in sensor_set_labels:
+            color = set_color_map.get(set_label, None)
+            curve_key = f"{sensor} | {set_label}"
+            model = models.get(curve_key)
+
+            spec_sub = spec_sensor[spec_sensor["set_label"] == set_label].copy()
+            spec_sub = spec_sub.sort_values("angle_deg")
+
+            summ_sub = summ_sensor[summ_sensor["set_label"] == set_label].copy()
+            summ_sub = summ_sub.sort_values("angle_deg")
+
+            # raw points
+            raw_x_all = []
+            raw_y_all = []
+
+            for _, seg in spec_sub.iterrows():
+                adc_col = seg["channel"]
+                if adc_col not in df_raw.columns:
+                    continue
+
+                start_min = float(seg["start_min"])
+                end_min = float(seg["end_min"])
+                angle_deg = float(seg["angle_deg"])
+
+                mask = (df_raw[time_col] >= start_min) & (df_raw[time_col] <= end_min)
+                vals = pd.to_numeric(df_raw.loc[mask, adc_col], errors="coerce").dropna().to_numpy(dtype=float)
+
+                if len(vals) == 0:
+                    continue
+
+                if normal and model is not None:
+                    adc_min = float(model["adc_min"])
+                    adc_max = float(model["adc_max"])
+                    denom = adc_max - adc_min
+                    vals_plot = (vals - adc_min) / denom if denom != 0 else vals
+                else:
+                    vals_plot = vals
+
+                raw_x_all.append(np.full(len(vals_plot), angle_deg))
+                raw_y_all.append(vals_plot)
+
+            if raw_x_all:
+                ax.scatter(
+                    np.concatenate(raw_x_all),
+                    np.concatenate(raw_y_all),
+                    s=raw_marker_size,
+                    alpha=alpha_raw,
+                    color=color,
+                )
+
+            # mean points
+            if not summ_sub.empty:
+                mean_x = summ_sub["angle_deg"].to_numpy(dtype=float)
+                mean_adc = summ_sub["adc_mean"].to_numpy(dtype=float)
+
+                if normal and model is not None:
+                    adc_min = float(model["adc_min"])
+                    adc_max = float(model["adc_max"])
+                    denom = adc_max - adc_min
+                    mean_y = (mean_adc - adc_min) / denom if denom != 0 else mean_adc
+                else:
+                    mean_y = mean_adc
+
+                ax.scatter(
+                    mean_x,
+                    mean_y,
+                    s=mean_marker_size,
+                    alpha=1.0,
+                    color=color,
+                    edgecolor="none",
+                    label=set_label,
+                    zorder=3,
+                )
+
+            # fitted curve
+            if model is not None:
+                adc_grid = np.linspace(float(model["adc_min"]), float(model["adc_max"]), 400)
+                angle_grid = _evaluate_adc_angle_model(model, adc_grid, clip_normalized=False)
+
+                if normal:
+                    adc_min = float(model["adc_min"])
+                    adc_max = float(model["adc_max"])
+                    denom = adc_max - adc_min
+                    y_grid = (adc_grid - adc_min) / denom if denom != 0 else adc_grid
+                else:
+                    y_grid = adc_grid
+
+                #order = np.argsort(angle_grid)
+                ax.plot(
+                    angle_grid,
+                    y_grid,
+                    linewidth=line_width,
+                    color=color,
+                )
+
+        ax.set_title(f"{sensor.capitalize()} calibration")
+        ax.set_xlabel("Angle (°)")
+        ax.set_ylabel("Normalized ADC" if normal else "ADC value")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(title="Calibration set")
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_activity_window(
+    df,
+    *,
+    start_min,
+    window_sec,
+    columns=None,
+    manual_segments=None,
+    label_colors=None,
+    display_name_map=None,
+    ylim_map=None,
+):
+    """
+    Plot a zoomed time window for activity inspection.
+
+    Inputs
+    ------
+    start_min : float
+        Start time of the window, in minutes from beginning of recording.
+    window_sec : float
+        Length of the window to show, in seconds.
+    columns : list[str] or None
+        Signals to plot. If None, uses a default set if present.
+    manual_segments : list[dict]
+        Used to determine overlapping activity labels and shading.
+    label_colors : dict
+        Activity label -> color.
+    display_name_map : dict
+        Column name -> y-axis display label.
+
+    Behavior
+    --------
+    - X-axis is shown in seconds relative to the chosen window start.
+    - Title includes the overlapping activity label(s).
+    """
+    manual_segments = manual_segments or []
+    label_colors = label_colors or {}
+    display_name_map = display_name_map or {}
+    ylim_map = ylim_map or {}
+
+    end_min = start_min + (window_sec / 60.0)
+
+    if columns is None:
+        columns = [
+            c for c in [
+                "wrist_flex_ext_deg",
+                "index_mcp_deg",
+                "thumb_mp_deg",
+                "ADC_ch0",
+                "ADC_ch1",
+                "IMU1_W", "IMU1_X", "IMU1_Y", "IMU1_Z",
+                "IMU2_W", "IMU2_X", "IMU2_Y", "IMU2_Z",
+            ]
+            if c in df.columns
+        ]
+    columns = [c for c in columns if c in df.columns]
+    if not columns:
+        raise ValueError("No valid columns found in df.")
+
+    df_win = df.loc[
+        (df["elapsed_min"] >= start_min) &
+        (df["elapsed_min"] <= end_min)
+    ].copy()
+
+    if df_win.empty:
+        raise ValueError("No rows found in the requested time window.")
+
+    # relative x-axis in seconds
+    df_win["window_sec"] = (df_win["elapsed_min"] - start_min) * 60.0
+
+    # figure out overlapping activity label(s)
+    overlapping_labels = []
+    seen = set()
+    for seg in sorted(manual_segments, key=lambda s: s["start_min"]):
+        if seg["end_min"] <= start_min or seg["start_min"] >= end_min:
+            continue
+        lbl = seg["label"]
+        if lbl not in seen:
+            overlapping_labels.append(lbl)
+            seen.add(lbl)
+
+    activity_str = " / ".join(overlapping_labels) if overlapping_labels else "Unlabeled window"
+    title = f"{activity_str} | start={start_min:.3f} min | window={window_sec:.0f} s"
+
+    fig, axes = plt.subplots(
+        len(columns), 1,
+        figsize=(14, 2.5 * len(columns)),
+        sharex=True
+    )
+    if len(columns) == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, columns):
+        ax.plot(df_win["window_sec"], df_win[col], linewidth=0.9, zorder=2)
+        ax.set_ylabel(display_name_map.get(col, col), fontsize=9)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        if col in ylim_map and ylim_map[col] is not None:
+            ax.set_ylim(*ylim_map[col])
+
+        # shade overlapping manual activity segments, converted into window-relative seconds
+        for seg in manual_segments:
+            seg0 = max(seg["start_min"], start_min)
+            seg1 = min(seg["end_min"], end_min)
+            if seg1 <= seg0:
+                continue
+
+            x0 = (seg0 - start_min) * 60.0
+            x1 = (seg1 - start_min) * 60.0
+            color = label_colors.get(seg["label"], "lightgray")
+            ax.axvspan(x0, x1, color=color, alpha=0.30, zorder=0)
+
+    axes[0].set_title(title, fontsize=11)
+    axes[-1].set_xlabel("Time from chosen start (s)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_adc_calibration_models_with_raw(
+    df,
+    calib_segments,
+    models,
+    *,
+    time_col="elapsed_min",
+    group_key="sensor",
+    figsize=(10, 4),
+    alpha_raw=0.15,
+    alpha_mean=1.0,
+    normal=False,
+):
+    """
+    Plot all raw ADC values used during each calibration hold, plus mean points
+    and fitted curves, with:
+    x-axis = angle (deg)
+    y-axis = ADC value, or normalized ADC if normal=True
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    if df is None or df.empty or not calib_segments:
+        print("No calibration data to plot.")
+        return
+
+    seg_df = pd.DataFrame(calib_segments)
+    if seg_df.empty:
+        print("No calibration segments to plot.")
+        return
+
+    sensors = list(seg_df[group_key].dropna().unique())
+    if not sensors:
+        print("No sensors found in calibration segments.")
+        return
+
+    fig, axes = plt.subplots(1, len(sensors), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+
+    for ax, sensor in zip(axes, sensors):
+        sensor_segments = seg_df[seg_df[group_key] == sensor].copy()
+        sensor_segments = sensor_segments.sort_values("angle_deg")
+
+        model = models.get(sensor)
+
+        mean_x = []
+        mean_y = []
+
+        for _, seg in sensor_segments.iterrows():
+            adc_col = seg["channel"]
+            if adc_col not in df.columns:
+                continue
+
+            start_min = float(seg["start_min"])
+            end_min = float(seg["end_min"])
+            angle_deg = float(seg["angle_deg"])
+
+            mask = (df[time_col] >= start_min) & (df[time_col] <= end_min)
+            vals = pd.to_numeric(df.loc[mask, adc_col], errors="coerce").dropna()
+
+            if vals.empty:
+                continue
+
+            vals = vals.to_numpy(dtype=float)
+
+            if normal and model is not None:
+                adc_min = float(model["adc_min"])
+                adc_max = float(model["adc_max"])
+                denom = adc_max - adc_min
+                if denom != 0:
+                    vals_plot = (vals - adc_min) / denom
+                else:
+                    vals_plot = vals
+            else:
+                vals_plot = vals
+
+            x = np.full(len(vals_plot), angle_deg, dtype=float)
+
+            ax.scatter(
+                x,
+                vals_plot,
+                s=10,
+                alpha=alpha_raw,
+            )
+
+            mean_x.append(angle_deg)
+            mean_y.append(float(np.mean(vals_plot)))
+
+        if mean_x:
+            ax.scatter(
+                mean_x,
+                mean_y,
+                s=45,
+                alpha=alpha_mean,
+                marker="o",
+                label="segment mean",
+            )
+
+            for x, y in zip(mean_x, mean_y):
+                ax.annotate(
+                    f"{x:.1f}°",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                )
+
+        if model is not None:
+            adc_grid = np.linspace(model["adc_min"], model["adc_max"], 400)
+            angle_grid = _evaluate_adc_angle_model(model, adc_grid, clip_normalized=False)
+
+            if normal:
+                adc_min = float(model["adc_min"])
+                adc_max = float(model["adc_max"])
+                denom = adc_max - adc_min
+                if denom != 0:
+                    y_grid = (adc_grid - adc_min) / denom
+                else:
+                    y_grid = adc_grid
+            else:
+                y_grid = adc_grid
+
+            ax.plot(angle_grid, y_grid, linewidth=2, label="fit")
+
+        ax.set_title(f"{sensor.capitalize()} calibration")
+        ax.set_xlabel("Angle (°)")
+        ax.set_ylabel("Normalized ADC" if normal else "ADC value")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend()
+
+    plt.tight_layout()
+    plt.show()

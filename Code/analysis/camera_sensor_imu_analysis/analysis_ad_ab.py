@@ -217,6 +217,15 @@ def load_adab_participant(
     if not calib_df.empty:
         calib_df["participant"] = participant
         calib_df["application"] = calib_df["set"].map({1: "app1", 2: "app2"}).fillna("extra")
+        calib_df["calibration_id"] = (
+            calib_df["participant"].astype(str) + "_" + calib_df["application"].astype(str)
+        )
+
+    coeffs = out_cam["coeffs"]
+    coeffs_labeled = {
+        "app1": coeffs.get(1, None),
+        "app2": coeffs.get(2, None),
+    }
 
     return {
         "participant": participant,
@@ -229,7 +238,8 @@ def load_adab_participant(
         "adc_first_theta": adc_first_theta,
         "adc_second_theta": adc_second_theta,
         "calib_df": calib_df,
-        "coeffs": out_cam["coeffs"],
+        "coeffs": coeffs,
+        "coeffs_labeled": coeffs_labeled,
     }
 
 # trial summaries 
