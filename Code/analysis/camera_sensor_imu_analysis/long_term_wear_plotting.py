@@ -172,7 +172,7 @@ def add_segment_shading(ax, segments, label_colors=None, x_units="elapsed_min"):
         color = label_colors.get(label, "lightgray")
 
         if label in ["sensor disconnected", "IMU2 disconnected"]:
-            alpha = 0.70
+            alpha = 0.40
         elif label == "bluetooth down":
             alpha = 0.40
         else:
