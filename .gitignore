@@ -2,4 +2,4 @@
 __pycache__/
 *.pyc
 
-/CSV Data/long_term_wear_data/**/*.csv
+/CSV Data/long_term_wear_data/**/*.csv.DS_Store
