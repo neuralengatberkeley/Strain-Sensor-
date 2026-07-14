@@ -2605,7 +2605,7 @@ class IMU_cam(ADC_CAM):
             bpm_label = speed_xtick_label_map.get(speed, speed)
 
             ax.set_title(
-                f"{title_prefix}: {participant}\nTrial {example_trial_idx + 1} - {bpm_label} BPM",
+                f"{title_prefix}: {participant}\nTrial {example_trial_idx + 1} – {bpm_label} BPM",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
@@ -2668,7 +2668,7 @@ class IMU_cam(ADC_CAM):
             ax.set_xlabel("", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_ylabel("|Error| (°)", fontsize=label_fontsize, fontweight=label_weight)
             ax.set_title(
-                f"{title_prefix}: \n|CAM-IMU|",
+                f"{title_prefix}: \n|CAM–IMU|",
                 fontsize=title_fontsize,
                 fontweight=title_weight,
             )
